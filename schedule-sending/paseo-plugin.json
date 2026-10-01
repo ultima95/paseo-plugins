@@ -1,0 +1,7 @@
+{
+  "id": "schedule-sending",
+  "description": "Schedule a message into an existing agent chat",
+  "requirements": {
+    "paseo": ">=0.10.1"
+  }
+}
