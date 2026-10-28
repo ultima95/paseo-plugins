@@ -24,8 +24,10 @@ export type SeatApplication = {
  *
  * The seat owns routing, so provider-specific controls the seat leaves unset
  * (`modeId`, `thinkingOptionId`, `featureValues`) are dropped rather than
- * carried over from the caller's request. Everything else on the config and the
- * env survive untouched.
+ * carried over from the caller's request. When the seat also changes the
+ * provider, `providerOptions` is dropped too because it is provider-specific;
+ * it survives a same-provider override. The provider-agnostic `mcpServers` and
+ * `toolPolicy` are always left alone, as is the env.
  */
 export function applySeat(
   request: AgentCreateRequest,
@@ -41,6 +43,7 @@ export function applySeat(
   delete config.modeId;
   delete config.thinkingOptionId;
   delete config.featureValues;
+  if (request.config.provider !== seat.provider) delete config.providerOptions;
 
   config.provider = seat.provider;
   config.model = seat.model;

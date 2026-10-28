@@ -43,6 +43,33 @@ describe("applySeat", () => {
     expect(r.request.config.featureValues).toBeUndefined();
   });
 
+  it("drops providerOptions when the override changes provider", () => {
+    // base() asks for opencode; the lead seat is claude, so this is a cross-provider flip.
+    const r = applySeat(
+      base("[room:lead] x", { providerOptions: { reasoningEffort: "high", sandbox: "workspace-write" } }),
+      DEFAULT_SETTINGS,
+    )!;
+    expect(r.request.config.provider).toBe("claude");
+    expect(r.request.config.providerOptions).toBeUndefined();
+  });
+
+  it("keeps providerOptions when the override stays on the same provider", () => {
+    const settings = { ...DEFAULT_SETTINGS, lead: { provider: "opencode", model: "m" } };
+    const providerOptions = { reasoningEffort: "high" };
+    const r = applySeat(base("[room:lead] x", { providerOptions }), settings)!;
+    expect(r.request.config.provider).toBe("opencode");
+    expect(r.request.config.providerOptions).toEqual(providerOptions);
+  });
+
+  it("leaves provider-agnostic mcpServers and toolPolicy alone across a provider flip", () => {
+    const mcpServers = { room: { type: "stdio" as const, command: "room" } };
+    const toolPolicy = { preapproved: [{ kind: "mcp" as const, server: "room", tool: "send" }] };
+    const r = applySeat(base("[room:lead] x", { mcpServers, toolPolicy }), DEFAULT_SETTINGS)!;
+    expect(r.request.config.provider).toBe("claude");
+    expect(r.request.config.mcpServers).toEqual(mcpServers);
+    expect(r.request.config.toolPolicy).toEqual(toolPolicy);
+  });
+
   it("appends the role prompt to an existing systemPrompt", () => {
     const r = applySeat(base("[room:lead] x", { systemPrompt: "BASE" }), DEFAULT_SETTINGS)!;
     expect(r.request.config.systemPrompt).toBe(renderSystemPrompt({ seat: "lead" }, DEFAULT_SETTINGS, "BASE"));

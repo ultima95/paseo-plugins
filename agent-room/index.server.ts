@@ -12,13 +12,23 @@ const log = consoleLogger;
 
 async function readSeats(read: SettingsReader): Promise<RoomSettings> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
   const timeout = new Promise<RoomSettings>((resolve) => {
-    timer = setTimeout(() => resolve(DEFAULT_SETTINGS), SETTINGS_TIMEOUT_MS);
+    timer = setTimeout(() => {
+      timedOut = true;
+      resolve(DEFAULT_SETTINGS);
+    }, SETTINGS_TIMEOUT_MS);
     timer.unref?.();
   });
 
   try {
-    return await Promise.race([read(), timeout]);
+    const settings = await Promise.race([read(), timeout]);
+    if (timedOut) {
+      log.warn("seat settings read timed out; using default seats", {
+        timeoutMs: SETTINGS_TIMEOUT_MS,
+      });
+    }
+    return settings;
   } catch (error) {
     // `createSettingsReader` never rejects; this is the belt to its braces so a
     // future reader cannot fail agent creation.
