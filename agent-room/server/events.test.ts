@@ -17,7 +17,11 @@ type FakeHandle = {
   timeline: { append: ReturnType<typeof vi.fn>; refetch: ReturnType<typeof vi.fn> };
 };
 
-function fakePaseo(titles: Record<string, string> = {}, timeline: unknown[] = []) {
+function fakePaseo(
+  titles: Record<string, string> = {},
+  timeline: unknown[] = [],
+  parents: Record<string, string> = {},
+) {
   const handles = new Map<string, FakeHandle>();
 
   const handleFor = (id: string): FakeHandle => {
@@ -26,7 +30,7 @@ function fakePaseo(titles: Record<string, string> = {}, timeline: unknown[] = []
     const handle: FakeHandle = {
       id,
       refresh: vi.fn(async () => null),
-      current: vi.fn(() => ({ id, title: titles[id] ?? null })),
+      current: vi.fn(() => ({ id, title: titles[id] ?? null, parentAgentId: parents[id] ?? null })),
       send: vi.fn(async () => undefined),
       archive: vi.fn(async () => ({ archivedAt: "2026-10-28T10:00:00.000Z" })),
       timeline: {
@@ -470,9 +474,68 @@ describe("onCreated — guard", () => {
     expect(addSeat).not.toHaveBeenCalled();
     // The peer's room is unknown, so there is nowhere to put the feed event.
     expect(appendFeed).not.toHaveBeenCalled();
+    // Its parent is unknown too, so there is no Lead to append the row to either.
+    expect(handleFor("P5").timeline.append).not.toHaveBeenCalled();
     expect(log.warn).toHaveBeenCalledWith(
       "guard violation outside a known room",
       expect.objectContaining({ childId: "X9", violatorId: "P5" }),
+    );
+  });
+
+  it("appends the room-guard row to the lead an unstored peer names as its parent", async () => {
+    const { store, appendFeed } = fakeStore();
+    // P5 is a Peer the store never saw; the daemon still knows its Lead is L5.
+    const { paseo, handleFor } = fakePaseo({ P5: "[room:peer:cheap] logs" }, [], { P5: "L5" });
+    const { created, ctx } = eventsWith(paseo, store, lookupTitle);
+
+    await created.onCreated(
+      { agent: agent({ id: "X9", parentAgentId: "P5", title: "nested unmarked work" }) },
+      ctx,
+    );
+
+    expect(handleFor("X9").archive).toHaveBeenCalledTimes(1);
+    expect(handleFor("P5").send).toHaveBeenCalledTimes(1);
+    expect(handleFor("L5").timeline.append).toHaveBeenCalledTimes(1);
+    expect(handleFor("L5").timeline.append).toHaveBeenCalledWith({
+      type: "plugin",
+      id: "room-guard-X9",
+      kind: "room-guard",
+      version: 1,
+      data: {
+        childId: "X9",
+        childTitle: "nested unmarked work",
+        violatorId: "P5",
+        rule: expect.stringContaining("[room:peer"),
+      },
+    });
+    // The room is still unknown, so the feed keeps nothing and warns.
+    expect(appendFeed).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith(
+      "guard violation outside a known room",
+      expect.objectContaining({ childId: "X9", violatorId: "P5" }),
+    );
+  });
+
+  it("records nothing and tells nobody when the archive fails", async () => {
+    const { store, addSeat, appendFeed } = storedRoom();
+    const { paseo, handleFor } = fakePaseo();
+    handleFor("X9").archive.mockRejectedValueOnce(new Error("daemon refused the archive"));
+    const { created, ctx } = eventsWith(paseo, store);
+
+    await expect(
+      created.onCreated({ agent: agent({ id: "X9", parentAgentId: "L1", title: "format the logs" }) }, ctx),
+    ).resolves.toBeUndefined();
+
+    expect(handleFor("X9").archive).toHaveBeenCalledTimes(1);
+    for (const handle of [handleFor("X9"), handleFor("L1"), handleFor("S1")]) {
+      expect(handle.send).not.toHaveBeenCalled();
+      expect(handle.timeline.append).not.toHaveBeenCalled();
+    }
+    expect(appendFeed).not.toHaveBeenCalled();
+    expect(addSeat).not.toHaveBeenCalled();
+    expect(log.error).toHaveBeenCalledWith(
+      "guard: could not archive the violating agent",
+      expect.objectContaining({ childId: "X9", violatorId: "L1" }),
     );
   });
 

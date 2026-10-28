@@ -1,4 +1,4 @@
-import type { PaseoApi } from "@getpaseo/client";
+import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import type {
   PluginHookAgent,
   PluginHookContext,
@@ -17,6 +17,13 @@ export const FEED_TAIL_LIMIT = 40;
 
 /** A guard row is also rendered inside the agent timeline (renderer in Task 8). */
 export const GUARD_KIND = "room-guard";
+
+/**
+ * The daemon records an agent's parent as a label on the agent
+ * (`PARENT_AGENT_ID_LABEL` in `@getpaseo/protocol/agent-labels`), and repeats it
+ * as `parentAgentId` in the snapshot it sends.
+ */
+const PARENT_AGENT_LABEL = "paseo.parent-agent-id";
 
 export type TitleLookup = (paseo: PaseoApi, agentId: string) => Promise<string | null>;
 
@@ -151,7 +158,42 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
     title: agent.title ?? "",
   });
 
-  /** Archive the child, tell the violator why, and leave a trail in the room. */
+  /**
+   * The parent the daemon holds for an agent the store never recorded. The
+   * client types do not declare `parentAgentId` on a snapshot (0.13.1), so the
+   * handle is refreshed and the field read off it, with the label the daemon
+   * derives that field from as the fallback. Never throws: an unreadable agent
+   * reads as "no known parent".
+   */
+  const parentIdOf = async (paseo: PaseoApi, agentId: string): Promise<string | null> => {
+    try {
+      const handle = paseo.agents.ref(agentId);
+      await handle.refresh();
+      const snapshot = handle.current() as (PaseoAgent & { parentAgentId?: string | null }) | null;
+      if (snapshot === null) return null;
+      return snapshot.parentAgentId ?? snapshot.labels?.[PARENT_AGENT_LABEL] ?? null;
+    } catch (error) {
+      log.warn("guard: could not read the violator's parent", {
+        agentId,
+        error: reason(error),
+      });
+      return null;
+    }
+  };
+
+  /**
+   * The agent that should see a guard row for this violation. Only a Peer's
+   * mistake is its Lead's to notice, and a stored Peer names its Lead directly;
+   * a Peer whose seat is missing from the store can still supply its own parent
+   * id, which is the Lead. A Lead or Supervisor violator gets no row.
+   */
+  const leadFor = async (paseo: PaseoApi, parent: ParentContext): Promise<string | null> => {
+    if (parent.marker?.seat !== "peer" || parent.id === null) return null;
+    if (parent.seat !== undefined) return parent.seat.parentId;
+    return parentIdOf(paseo, parent.id);
+  };
+
+  /** Archive the child, then tell the violator why and leave a trail in the room. */
   const deny = async (
     agent: PluginHookAgent,
     parent: ParentContext,
@@ -168,17 +210,20 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
       return;
     }
 
-    const roomId = roomFor(parent);
-    const message = violationMessage(childId, childTitle, rule, parent.marker);
-
+    // Archive first: the message, the feed event and the room-guard row all say
+    // the child is gone, so none of them may happen when it is not.
     try {
       await paseo.agents.ref(childId).archive();
     } catch (error) {
       log.error("guard: could not archive the violating agent", {
         childId,
+        violatorId,
         error: reason(error),
       });
+      return;
     }
+
+    const message = violationMessage(childId, childTitle, rule, parent.marker);
 
     try {
       await paseo.agents.ref(violatorId).send(message);
@@ -189,7 +234,10 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
       });
     }
 
+    const roomId = roomFor(parent);
     if (roomId === undefined) {
+      // Without a room id there is no feed to append to: the stored seat that
+      // would name the room is exactly what this parent is missing.
       log.warn("guard violation outside a known room", { childId, violatorId });
     } else {
       store.appendFeed({
@@ -203,7 +251,7 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
     }
 
     // A Peer's mistake is its Lead's to notice, so the row lands on the Lead.
-    const leadId = parent.seat?.marker.seat === "peer" ? parent.seat.parentId : null;
+    const leadId = await leadFor(paseo, parent);
     if (leadId !== null) {
       try {
         await paseo.agents.ref(leadId).timeline.append({
