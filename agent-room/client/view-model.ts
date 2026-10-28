@@ -111,8 +111,11 @@ export function buildTree(seats: SeatRecord[]): TreeNode[] {
   return rows;
 }
 
-/** Local 24-hour `HH:MM`, padded. A runtime without locale data is irrelevant. */
-function timeOfDay(at: string): string {
+/**
+ * Local 24-hour `HH:MM`, padded. A runtime without locale data is irrelevant.
+ * Exported because the rooms popover stamps its rows with the same clock.
+ */
+export function timeOfDay(at: string): string {
   const parsed = new Date(at);
   if (Number.isNaN(parsed.getTime())) return at;
   const hours = String(parsed.getHours()).padStart(2, "0");

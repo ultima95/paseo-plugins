@@ -6,7 +6,7 @@ import type {
 } from "@getpaseo/plugin/server";
 
 import type { SeatRecord } from "../shared/room";
-import { GUARD_ROW_KIND } from "../shared/room";
+import { GUARD_ROW_KIND, GUARD_ROW_VERSION } from "../shared/room";
 import { parseSeatMarker, seatConfigFor, type RoomSettings, type SeatMarker } from "../shared/seats";
 import { feedFromTurn } from "./feed";
 import { checkSpawn } from "./guard";
@@ -259,7 +259,7 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
           type: "plugin",
           id: `room-guard-${childId}`,
           kind: GUARD_KIND,
-          version: 1,
+          version: GUARD_ROW_VERSION,
           data: { childId, childTitle, violatorId, rule },
         });
       } catch (error) {

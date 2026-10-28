@@ -1,14 +1,21 @@
 import type { PluginClientContext, PluginSidebarItemProps } from "@getpaseo/plugin/client";
-import { SidebarRow } from "@getpaseo/plugin/client/ui";
+import { Icon, SidebarRow } from "@getpaseo/plugin/client/ui";
+import { Pressable } from "react-native";
 
 import { GuardRow, guardRowSchema } from "./client/guard-row";
 import { RoomScreen } from "./client/room-screen";
+import { RoomsPopover } from "./client/rooms-popover";
 import { RoomsScreen } from "./client/rooms-screen";
 import { describeError } from "./client/seat-editor";
 import { GUARD_ROW_KIND, GUARD_ROW_VERSION } from "./shared/room";
 import { launchRoomRpc } from "./shared/rpc";
 
-/** The sidebar row: a navigation entry with the Lucide `Users` icon. */
+/**
+ * The sidebar row: a navigation entry with the Lucide `Users` icon.
+ *
+ * The row itself opens the Rooms screen; the trailing button opens a popover of
+ * recent rooms, which is the one surface that can navigate to a live room.
+ */
 function RoomsSidebarItem(props: PluginSidebarItemProps) {
   const screenId = props.currentScreen?.screenId;
   return (
@@ -18,6 +25,17 @@ function RoomsSidebarItem(props: PluginSidebarItemProps) {
       // row highlighted rather than making the live view look like another screen.
       active={screenId === "rooms" || screenId === "room"}
       onPress={() => props.openScreen({ screenId: "rooms" })}
+      trailing={
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Open recent rooms"
+          hitSlop={8}
+          onPress={() => props.openPopover(RoomsPopover)}
+          style={{ padding: 4 }}
+        >
+          <Icon name="ChevronDown" size={14} color={props.theme.colors.foregroundMuted} />
+        </Pressable>
+      }
     />
   );
 }
