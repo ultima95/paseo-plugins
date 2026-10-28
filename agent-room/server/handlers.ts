@@ -32,6 +32,10 @@ function seatAgentConfig(seat: SeatConfig): PaseoAgentConfig {
   return config;
 }
 
+function trimTrailingSlash(path: string): string {
+  return path.length > 1 ? path.replace(/\/+$/, "") : path;
+}
+
 /**
  * The RPC surface. `launch` only creates the Supervisor agent: `agent.created`
  * writes the room record, the seat and the feed when the agent shows up, so a
@@ -62,7 +66,18 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
       }
 
       if (input.cwd !== undefined) {
-        const handle = await paseo.agents.create({ ...options, cwd: input.cwd });
+        // A bare create makes a new workspace even when the directory already
+        // has one, so reuse the workspace that owns this directory instead.
+        const cwd = trimTrailingSlash(input.cwd);
+        const owns = (path: string | undefined): boolean =>
+          path !== undefined && trimTrailingSlash(path) === cwd;
+        const existing = (await paseo.workspaces.list({})).entries.find(
+          (workspace) =>
+            owns(workspace.workspaceDirectory) || owns(workspace.projectRootPath),
+        );
+        const handle = existing
+          ? await paseo.workspaces.ref(existing.id).agents.create(options)
+          : await paseo.agents.create({ ...options, cwd: input.cwd });
         return { roomId: handle.id };
       }
 

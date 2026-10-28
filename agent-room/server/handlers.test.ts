@@ -17,7 +17,7 @@ interface CreateCall {
 }
 
 /** A daemon stub that records every create and hands back sequential agent ids. */
-function fakePaseo() {
+function fakePaseo(workspaceEntries: Array<{ id: string; workspaceDirectory: string }> = []) {
   const created: CreateCall[] = [];
   const refs: string[] = [];
   let next = 0;
@@ -31,6 +31,7 @@ function fakePaseo() {
       }),
     },
     workspaces: {
+      list: vi.fn(async () => ({ entries: workspaceEntries })),
       ref: vi.fn((workspaceId: string) => {
         refs.push(workspaceId);
         return {
@@ -107,6 +108,19 @@ describe("launch", () => {
     expect(created).toHaveLength(1);
     expect(created[0]?.via).toBe("agents");
     expect(created[0]?.options).toMatchObject({ cwd: "/repo", prompt: "Fix the room" });
+    expect(out).toEqual({ roomId: "A1" });
+  });
+
+  it("reuses the workspace that already owns the cwd", async () => {
+    const { paseo, created, refs } = fakePaseo([{ id: "W9", workspaceDirectory: "/repo/" }]);
+    const { handlers } = handlersFor();
+
+    const out = await handlers.launch({ task: "Fix the room", cwd: "/repo" }, paseo);
+
+    expect(refs).toEqual(["W9"]);
+    expect(created).toHaveLength(1);
+    expect(created[0]?.via).toBe("workspace");
+    expect(created[0]?.workspaceId).toBe("W9");
     expect(out).toEqual({ roomId: "A1" });
   });
 
