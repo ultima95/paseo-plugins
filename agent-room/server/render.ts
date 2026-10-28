@@ -42,7 +42,7 @@ export function renderSeatTable(marker: SeatMarker, settings: RoomSettings): str
         "|---|---|---|",
         `| Lead | ${code(formatMarker({ seat: "lead" }))} | ${providerModel(lead.provider, lead.model)} |`,
         "",
-        "Never launch a Peer directly, and never launch an agent whose title carries no marker: the room archives it.",
+        "Never launch a Peer directly, and never launch an agent whose title carries no marker: an unmarked child of a room seat is archived by the room guard.",
       ].join("\n");
     }
     case "lead": {
