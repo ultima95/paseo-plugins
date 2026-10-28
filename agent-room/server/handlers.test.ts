@@ -2,7 +2,7 @@ import type { PaseoAgentCreateOptions, PaseoApi } from "@getpaseo/client";
 import { describe, expect, it, vi } from "vitest";
 
 import type { FeedEvent, RoomRecord, SeatRecord } from "../shared/room";
-import { getRoomRpc, launchRoomRpc, listRoomsRpc } from "../shared/rpc";
+import { adoptRoomRpc, getRoomRpc, launchRoomRpc, listRoomsRpc } from "../shared/rpc";
 import { DEFAULT_SETTINGS, seatTitle, type RoomSettings } from "../shared/seats";
 import { createHandlers } from "./handlers";
 import { PROMPTS } from "./prompts/generated";
@@ -17,9 +17,13 @@ interface CreateCall {
 }
 
 /** A daemon stub that records every create and hands back sequential agent ids. */
-function fakePaseo(workspaceEntries: Array<{ id: string; workspaceDirectory: string }> = []) {
+function fakePaseo(
+  workspaceEntries: Array<{ id: string; workspaceDirectory: string }> = [],
+  adoptAgent: unknown = null,
+) {
   const created: CreateCall[] = [];
   const refs: string[] = [];
+  const sent: string[] = [];
   let next = 0;
   const newHandle = () => ({ id: `A${(next += 1)}` });
 
@@ -29,6 +33,14 @@ function fakePaseo(workspaceEntries: Array<{ id: string; workspaceDirectory: str
         created.push({ via: "agents", options });
         return newHandle();
       }),
+      ref: vi.fn((agentId: string) => ({
+        id: agentId,
+        refresh: vi.fn(async () => adoptAgent),
+        current: () => adoptAgent,
+        send: vi.fn(async (text: string) => {
+          sent.push(text);
+        }),
+      })),
     },
     workspaces: {
       list: vi.fn(async () => ({ entries: workspaceEntries })),
@@ -47,15 +59,29 @@ function fakePaseo(workspaceEntries: Array<{ id: string; workspaceDirectory: str
     },
   } as unknown as PaseoApi;
 
-  return { paseo, created, refs };
+  return { paseo, created, refs, sent };
 }
 
 type RoomDetail = { room: RoomRecord; seats: SeatRecord[]; feed: FeedEvent[] };
 
-function fakeStore(deps: { rooms?: RoomRecord[]; found?: RoomDetail } = {}) {
+function fakeStore(deps: { rooms?: RoomRecord[]; found?: RoomDetail; seat?: SeatRecord } = {}) {
   const listRooms = vi.fn(() => deps.rooms ?? []);
   const room = vi.fn((_roomId: string) => deps.found);
-  return { store: { listRooms, room } as unknown as RoomStore, listRooms, room };
+  const seat = vi.fn((_agentId: string) => deps.seat);
+  const addRoom = vi.fn();
+  const addSeat = vi.fn();
+  const appendFeed = vi.fn();
+  const flush = vi.fn(async () => undefined);
+  return {
+    store: { listRooms, room, seat, addRoom, addSeat, appendFeed, flush } as unknown as RoomStore,
+    listRooms,
+    room,
+    seat,
+    addRoom,
+    addSeat,
+    appendFeed,
+    flush,
+  };
 }
 
 function handlersFor(settings: RoomSettings = DEFAULT_SETTINGS, storeDeps: Parameters<typeof fakeStore>[0] = {}) {
@@ -267,9 +293,91 @@ describe("list", () => {
   });
 });
 
+describe("adopt", () => {
+  const chat = {
+    id: "S1",
+    title: "New chat",
+    provider: "claude",
+    model: "claude-opus-5-5",
+    cwd: "/repo",
+    workspaceId: "W1",
+    createdAt: "2026-10-28T10:00:00.000Z",
+  };
+
+  it("records the chat as the Supervisor and sends the protocol", async () => {
+    const { paseo, sent } = fakePaseo([], chat);
+    const { handlers, addRoom, addSeat, appendFeed, flush } = handlersFor();
+
+    const out = await handlers.adopt({ agentId: "S1" }, paseo);
+
+    expect(out).toEqual({ roomId: "S1" });
+    expect(addRoom).toHaveBeenCalledWith({
+      id: "S1",
+      task: "New chat",
+      cwd: "/repo",
+      workspaceId: "W1",
+      createdAt: "2026-10-28T10:00:00.000Z",
+    });
+    expect(addSeat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "S1",
+        roomId: "S1",
+        parentId: null,
+        marker: { seat: "supervisor" },
+        provider: "claude",
+        model: "claude-opus-5-5",
+      }),
+    );
+    expect(appendFeed).toHaveBeenCalledWith(expect.objectContaining({ kind: "note", label: "adopted" }));
+    expect(flush).toHaveBeenCalledTimes(1);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain(PROMPTS.protocol);
+    expect(sent[0]).toContain("[room:lead]");
+  });
+
+  it("returns the recorded room without sending again", async () => {
+    const found = { room: roomRecord("S1", "2026-10-28T10:00:00.000Z"), seats: [], feed: [] };
+    const { paseo, sent } = fakePaseo([], chat);
+    const { handlers, addRoom } = handlersFor(DEFAULT_SETTINGS, { found });
+
+    expect(await handlers.adopt({ agentId: "S1" }, paseo)).toEqual({ roomId: "S1" });
+    expect(addRoom).not.toHaveBeenCalled();
+    expect(sent).toEqual([]);
+  });
+
+  it("refuses an agent that already holds a seat", async () => {
+    const { paseo, sent } = fakePaseo([], chat);
+    const seat: SeatRecord = {
+      agentId: "S1",
+      roomId: "R1",
+      parentId: "P1",
+      marker: { seat: "peer", tier: "default" },
+      provider: "claude",
+      model: "claude-sonnet-5-5",
+      title: "[room:peer:default] work",
+    };
+    const { handlers } = handlersFor(DEFAULT_SETTINGS, { seat });
+
+    await expect(handlers.adopt({ agentId: "S1" }, paseo)).rejects.toThrow(/already holds a room seat/);
+    expect(sent).toEqual([]);
+  });
+
+  it("refuses when the agent is not in the daemon", async () => {
+    const { paseo } = fakePaseo([], null);
+    const { handlers } = handlersFor();
+
+    await expect(handlers.adopt({ agentId: "missing" }, paseo)).rejects.toThrow(/agent not found/);
+  });
+});
+
 describe("contracts", () => {
   it("names the RPCs the client calls", () => {
-    expect([launchRoomRpc.name, listRoomsRpc.name, getRoomRpc.name]).toEqual(["room.launch", "room.list", "room.get"]);
+    expect([launchRoomRpc.name, adoptRoomRpc.name, listRoomsRpc.name, getRoomRpc.name]).toEqual([
+      "room.launch",
+      "room.adopt",
+      "room.list",
+      "room.get",
+    ]);
   });
 
   it("requires one of workspaceId or cwd on launch", () => {
