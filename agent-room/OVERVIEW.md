@@ -10,19 +10,19 @@ A seat is a provider, a model, and optionally a mode, a thinking level, and prov
 
 ## Titles decide seats
 
-Every room agent carries its seat in the first token of its title: `[room:supervisor] <task>`, `[room:lead] <workstream>`, `[room:peer:<tier>] <bounded outcome>`. The marker selects the seat. The plugin forces that seat's provider, model, mode, and thinking level onto the create request, and a provider or model named anywhere else in the request is ignored. An unknown peer tier runs on the `default` tier and the room feed records the fallback.
+Every room agent carries its seat in the first token of its title: `[room:supervisor] <task>`, `[room:lead] <workstream>`, `[room:peer:<tier>] <bounded outcome>`. The marker selects the seat. The plugin forces that seat's provider, model, mode, thinking level, and feature values onto the create request, and a provider or model named anywhere else in the request is ignored. A control the seat leaves unset is removed from the request rather than taken from the caller, along with the caller's provider-specific options when the seat changes provider. An unknown peer tier runs on the `default` tier and the room feed records the fallback.
 
-An agent whose title carries no marker is not in a room. The plugin never modifies, records, or steers it, whatever its parent or its task looks like.
+An agent whose title carries no marker takes no seat: the plugin never modifies, records, or steers it, whatever its parent or its task looks like. The one exception is a child created by a room seat, which the guard treats as a violation and archives, as described under The guard.
 
 ## Prompt delivery
 
-Every seat gets its role through `config.systemPrompt`: the shared protocol, that seat's role, and a seat table rendered from the saved seats, in front of any system prompt the caller already set. Turn reports are not relayed by the plugin. A child's report reaches its parent through Paseo's native `notifyOnFinish` completion notification.
+Every seat gets its role through `config.systemPrompt`: any system prompt the caller already set is kept first, and the shared protocol, that seat's role, and a seat table rendered from the saved seats are appended after it. Turn reports are not relayed by the plugin. A child's report reaches its parent through Paseo's native `notifyOnFinish` completion notification.
 
-The bundled command-code plugin carries the same prompt to Command Code seats. Command Code has no ACP field for a session system prompt, so that plugin stages the prompt in a per-connection file and ships a small Command Code mod that appends it.
+The separate `command-code` plugin carries the same prompt to Command Code seats. It is not bundled with agent-room. Command Code has no ACP field for a session system prompt, so that plugin stages the prompt in a per-connection file and ships a small Command Code mod that appends it.
 
 ## The guard
 
-A Supervisor may create only Leads, a Lead only Peers, and a Peer nothing. When a room agent breaks that rule, the new child is archived, the violator is told which rule it broke and which marker to use instead, the room feed gets a guard row, and a Peer's Lead also gets a `room-guard` row in its timeline. An unmarked child of a room seat counts as a violation and is archived the same way.
+A Supervisor may create only Leads, a Lead only Peers, and a Peer nothing. When a room agent breaks that rule, the new child is archived, the violator is told which rule it broke and which marker to use instead, the room feed gets a guard row, and a Peer's Lead also gets a `room-guard` row in its timeline. An unmarked child of a room seat carries no role, so it counts as the same kind of violation and is archived the same way: that is the only case in which an agent with no marker is touched.
 
 ## Room screen and live view
 
@@ -32,7 +32,7 @@ The live view of one room shows the seat tree depth first from the Supervisor, w
 
 ## Setup
 
-A room uses the providers you have already signed in on the daemon machine, so set each seat to a provider, model, mode, and thinking level that is available there. The plugin needs no account, token, or API key of its own, and Paseo 0.13.1 or newer.
+A room uses the providers you have already signed in on the daemon machine, so set each seat to a provider, model, mode, and thinking level that is available there. The plugin needs no account, token, or API key of its own, and Paseo 0.13.1 or newer. A Command Code seat also requires the separate `command-code` plugin installed and enabled on the daemon alongside agent-room, because that plugin is what delivers the seat's role prompt; without it the seat starts but arrives with no room prompt.
 
 Room state is one `rooms.json` under the daemon's plugin data directory (`$PASEO_HOME/plugin-data/agent-room`, or `~/.paseo/plugin-data/agent-room` when `PASEO_HOME` is unset). It holds rooms, seats, and each room's newest 500 feed events, and it is the plugin's only store.
 
