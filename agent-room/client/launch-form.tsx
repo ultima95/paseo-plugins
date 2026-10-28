@@ -151,6 +151,7 @@ export function LaunchForm(props: LaunchFormProps) {
           surface={surface}
           value={target.cwd}
           placeholder="/absolute/path/to/the/project"
+          disabled={props.launching}
           onChangeText={target.setCwd}
         />
       </Field>
@@ -161,6 +162,7 @@ export function LaunchForm(props: LaunchFormProps) {
           value={props.task}
           placeholder="What should the room do?"
           multiline
+          disabled={props.launching}
           onChangeText={props.onTaskChange}
         />
       </Field>

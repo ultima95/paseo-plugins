@@ -200,6 +200,12 @@ export function TextEntry(props: {
   value: string;
   placeholder: string;
   multiline?: boolean;
+  /**
+   * Locks the field. Typed text that the caller will discard (a draft made
+   * while the stored document is still loading or a save is in flight) must
+   * not be typeable in the first place.
+   */
+  disabled?: boolean;
   onChangeText(text: string): void;
 }) {
   const { theme, layout } = props.surface;
@@ -212,6 +218,7 @@ export function TextEntry(props: {
       multiline={props.multiline}
       autoCapitalize="none"
       autoCorrect={false}
+      editable={props.disabled !== true}
       onChangeText={props.onChangeText}
       style={{
         backgroundColor: theme.colors.surface2,
@@ -223,6 +230,7 @@ export function TextEntry(props: {
         padding: pad,
         minHeight: props.multiline ? pad * 6 : undefined,
         textAlignVertical: props.multiline ? "top" : "center",
+        opacity: props.disabled ? 0.5 : 1,
       }}
     />
   );
@@ -273,9 +281,15 @@ export function SeatEditor(props: SeatEditorProps) {
   const model = seat.model;
 
   useEffect(() => {
+    // The model and mode lists belong to one provider. They are cleared before
+    // the new fetch, not after it: leaving the previous provider's catalog on
+    // screen keeps its chips pressable while the new lists load, which is how a
+    // Claude model ends up written onto a codex seat.
+    setModels([]);
+    setModes([]);
     if (!provider) {
-      setModels([]);
-      setModes([]);
+      setError("");
+      setLoading(false);
       return;
     }
     let cancelled = false;
@@ -314,10 +328,13 @@ export function SeatEditor(props: SeatEditorProps) {
   const featureCwd = props.cwd.trim();
 
   useEffect(() => {
+    // Feature ids are declared per provider and model. The previous pair's
+    // features are dropped before the new lookup, so a stale toggle can never be
+    // pressed against the seat's new provider or model.
+    setFeatures([]);
     // `listFeatures` needs a directory; an empty one is not a provider call, so
     // nothing loads until the launch target names a workspace or a cwd.
     if (!provider || !model || featureCwd.length === 0) {
-      setFeatures([]);
       return;
     }
     let cancelled = false;
@@ -490,6 +507,7 @@ export function SeatEditor(props: SeatEditorProps) {
             surface={surface}
             value={props.useFor ?? ""}
             placeholder="What this tier is for"
+            disabled={props.disabled}
             onChangeText={props.onUseForChange}
           />
         </Field>

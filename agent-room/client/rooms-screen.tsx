@@ -115,6 +115,19 @@ export function RoomsScreen(props: PluginScreenProps) {
   const draft: RoomDraft = edited ?? stored;
   const validation = validateDraft(draft);
 
+  // A draft is only derived from the document a save would overwrite, so the
+  // seats are editable only once the stored values are in hand and no save is
+  // in flight. Typing before that would seed `edited` from `DEFAULT_SETTINGS`.
+  const editable = settings.status === "ready" && !settings.saving;
+
+  useEffect(() => {
+    // A draft belongs to the revision it was made against. When the revision
+    // changes (a save landed, or the store reloaded) or the status stops being
+    // `ready`, the draft no longer describes the document it would overwrite, so
+    // it is dropped rather than carried across.
+    setEdited(null);
+  }, [settings.status, revision]);
+
   const refreshRooms = useCallback(async () => {
     setRoomsLoading(true);
     try {
@@ -166,14 +179,22 @@ export function RoomsScreen(props: PluginScreenProps) {
   }
 
   function changeSeat(key: SeatKey, patch: SeatPatch) {
+    if (!editable) return;
     setEdited(setSeat(draft, key, patch));
   }
 
   function changeTier(id: string, patch: TierPatch) {
+    if (!editable) return;
     setEdited(setTier(draft, id, patch));
   }
 
+  function removeTierRow(id: string) {
+    if (!editable) return;
+    setEdited(removeTier(draft, id));
+  }
+
   function addTierRow() {
+    if (!editable) return;
     const id = newTierId.trim();
     if (id.length === 0) return;
     const next = addTier(draft, id);
@@ -186,8 +207,9 @@ export function RoomsScreen(props: PluginScreenProps) {
     setTierError("");
   }
 
-  const editing = revision !== null && !settings.saving;
-  const canSave = editing && validation.ok;
+  // The save gate is unchanged: a revision to write against and a schema-valid
+  // draft. Only the editors are gated on `editable`, above.
+  const canSave = revision !== null && !settings.saving && validation.ok;
 
   const muted = { color: theme.colors.foregroundMuted, fontSize: 12 };
   const warning = { color: theme.colors.statusWarning, fontSize: 12 };
@@ -204,11 +226,11 @@ export function RoomsScreen(props: PluginScreenProps) {
         label={`Peer · ${tier.id}`}
         seat={tier}
         providers={catalog.providers}
-        disabled={!editing}
+        disabled={!editable}
         onChange={(patch) => changeTier(tier.id, patch)}
         useFor={tier.useFor}
         onUseForChange={(text) => changeTier(tier.id, { useFor: text })}
-        onRemove={tier.id === "default" ? undefined : () => setEdited(removeTier(draft, tier.id))}
+        onRemove={tier.id === "default" ? undefined : () => removeTierRow(tier.id)}
       />,
     );
   }
@@ -243,7 +265,7 @@ export function RoomsScreen(props: PluginScreenProps) {
           label="Supervisor"
           seat={draft.supervisor}
           providers={catalog.providers}
-          disabled={!editing}
+          disabled={!editable}
           onChange={(patch) => changeSeat("supervisor", patch)}
         />
         <SeatEditor
@@ -253,7 +275,7 @@ export function RoomsScreen(props: PluginScreenProps) {
           label="Lead"
           seat={draft.lead}
           providers={catalog.providers}
-          disabled={!editing}
+          disabled={!editable}
           onChange={(patch) => changeSeat("lead", patch)}
         />
         {seats}
@@ -265,13 +287,14 @@ export function RoomsScreen(props: PluginScreenProps) {
                 surface={surface}
                 value={newTierId}
                 placeholder="e.g. triage"
+                disabled={!editable}
                 onChangeText={setNewTierId}
               />
             </View>
             <ActionButton
               surface={surface}
               label="Add tier"
-              disabled={!editing || newTierId.trim().length === 0}
+              disabled={!editable || newTierId.trim().length === 0}
               onPress={addTierRow}
             />
           </View>
