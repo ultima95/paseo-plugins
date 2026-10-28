@@ -1,0 +1,7 @@
+{
+  "id": "agent-room",
+  "description": "Run a Supervisor, Lead and Peer agent room on any provider",
+  "requirements": {
+    "paseo": ">=0.13.1"
+  }
+}
