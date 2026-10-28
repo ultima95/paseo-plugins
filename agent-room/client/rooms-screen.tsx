@@ -116,9 +116,10 @@ export function RoomsScreen(props: PluginScreenProps) {
   const validation = validateDraft(draft);
 
   // A draft is only derived from the document a save would overwrite, so the
-  // seats are editable only once the stored values are in hand and no save is
-  // in flight. Typing before that would seed `edited` from `DEFAULT_SETTINGS`.
-  const editable = settings.status === "ready" && !settings.saving;
+  // seats are editable once the store has a revision to save against and no
+  // save is in flight. An invalid document supplies a revision too: its draft is
+  // the defaults shown on screen, and saving replaces the broken settings.
+  const editable = revision !== null && !settings.saving;
 
   useEffect(() => {
     // A draft belongs to the revision it was made against. When the revision
@@ -252,7 +253,8 @@ export function RoomsScreen(props: PluginScreenProps) {
         ) : null}
         {settings.status === "invalid" ? (
           <Text style={warning}>
-            The saved seats do not match the schema; the defaults are shown, and saving replaces them.
+            The saved seats do not match the schema; the defaults are shown. Edit them and save, or save
+            them as they are.
           </Text>
         ) : null}
         {catalog.loading ? <Text style={muted}>Loading providers…</Text> : null}
