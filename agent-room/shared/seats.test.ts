@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  AGENT_TITLE_MAX_LENGTH,
   DEFAULT_SETTINGS,
+  PEER_TIER_ID_MAX_LENGTH,
+  formatMarker,
   parseSeatMarker,
+  peerTierIdSchema,
   roomSettingsSchema,
   seatConfigFor,
   seatTitle,
@@ -33,6 +37,47 @@ describe("seatTitle", () => {
       .toEqual({ seat: "peer", tier: "review" });
   });
 });
+describe("peerTierIdSchema", () => {
+  it("accepts the longest allowed tier id", () => {
+    const id = "a".repeat(PEER_TIER_ID_MAX_LENGTH);
+    expect(peerTierIdSchema.safeParse(id).success).toBe(true);
+  });
+
+  it("round-trips the longest allowed id through seatTitle and parseSeatMarker", () => {
+    const id = "a".repeat(PEER_TIER_ID_MAX_LENGTH);
+    // The cap exists so the closing bracket survives the 60-character slice.
+    expect(formatMarker({ seat: "peer", tier: id }).length + 1).toBeLessThanOrEqual(
+      AGENT_TITLE_MAX_LENGTH,
+    );
+
+    const title = seatTitle({ seat: "peer", tier: id }, "probe");
+    expect(parseSeatMarker(title)).toEqual({ marker: { seat: "peer", tier: id }, rest: "probe" });
+
+    // A padded title is truncated as designed, and the marker still parses: this
+    // is the case that used to lose the closing bracket.
+    const long = seatTitle({ seat: "peer", tier: id }, "bounded outcome");
+    expect(long).toHaveLength(AGENT_TITLE_MAX_LENGTH);
+    expect(parseSeatMarker(long)?.marker).toEqual({ seat: "peer", tier: id });
+  });
+
+  it("rejects an id one character past the cap", () => {
+    const id = "a".repeat(PEER_TIER_ID_MAX_LENGTH + 1);
+    expect(peerTierIdSchema.safeParse(id).success).toBe(false);
+  });
+
+  it("fails the settings schema for an over-long tier id", () => {
+    const peerTiers = DEFAULT_SETTINGS.peerTiers.map((tier) =>
+      tier.id === "default" ? { ...tier, id: "a".repeat(PEER_TIER_ID_MAX_LENGTH + 1) } : tier,
+    );
+    expect(roomSettingsSchema.safeParse({ ...DEFAULT_SETTINGS, peerTiers }).success).toBe(false);
+  });
+
+  it("still enforces kebab-case", () => {
+    expect(peerTierIdSchema.safeParse("Cross_Family").success).toBe(false);
+    expect(peerTierIdSchema.safeParse("cross-family").success).toBe(true);
+  });
+});
+
 describe("seatConfigFor", () => {
   it("returns the tier config", () => {
     expect(seatConfigFor({ seat: "peer", tier: "cheap" }, DEFAULT_SETTINGS).config.model).toBe("claude-haiku-4-5");

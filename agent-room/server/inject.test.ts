@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { DEFAULT_SETTINGS } from "../shared/seats";
 import { applySeat, type AgentCreateRequest } from "./inject";
+import { PROMPTS } from "./prompts/generated";
 import { renderSystemPrompt } from "./render";
 
 const base = (
@@ -73,6 +74,30 @@ describe("applySeat", () => {
   it("appends the role prompt to an existing systemPrompt", () => {
     const r = applySeat(base("[room:lead] x", { systemPrompt: "BASE" }), DEFAULT_SETTINGS)!;
     expect(r.request.config.systemPrompt).toBe(renderSystemPrompt({ seat: "lead" }, DEFAULT_SETTINGS, "BASE"));
+  });
+
+  it("does not append the room prompt twice when the protocol is already there", () => {
+    // The launch path renders the whole Supervisor prompt into the create, then
+    // the `agent.create` hook may run `applySeat` on that same request.
+    const launched = renderSystemPrompt({ seat: "supervisor" }, DEFAULT_SETTINGS);
+    const r = applySeat(base("[room:supervisor] plan", { systemPrompt: launched }), DEFAULT_SETTINGS)!;
+
+    expect(r.request.config.systemPrompt).toBe(launched);
+    expect(r.request.config.systemPrompt?.split(PROMPTS.protocol)).toHaveLength(2);
+    // …while the seat override still lands.
+    expect(r.marker).toEqual({ seat: "supervisor" });
+    expect(r.request.config).toMatchObject({
+      provider: "claude",
+      model: "claude-opus-5-5",
+      modeId: "bypassPermissions",
+      thinkingOptionId: "xhigh",
+    });
+  });
+
+  it("is stable across repeated applications", () => {
+    const once = applySeat(base("[room:lead] x"), DEFAULT_SETTINGS)!;
+    const twice = applySeat(once.request, DEFAULT_SETTINGS)!;
+    expect(twice.request.config.systemPrompt).toBe(once.request.config.systemPrompt);
   });
 
   it("reports an unknown tier fallback", () => {

@@ -66,13 +66,29 @@ function childNamedIn(text: string, childIds: readonly string[]): string | null 
 }
 
 /**
+ * The Supervisor protocol mandates a 2-minute heartbeat named `supervisor: room`,
+ * whose prompt opens with this tag. A long room writes hundreds of those prompt
+ * turns, and each one is a `user_message` in the timeline: emitted as feed rows
+ * they would evict the room's real history at the 500-row cap, so a heartbeat
+ * wake is not a room turn and contributes no user row.
+ */
+const HEARTBEAT_TAG = "[supervisor-heartbeat]";
+
+/** True for the synthetic user message a scheduled heartbeat delivers. */
+function isHeartbeatWake(item: AgentTimelineItem): boolean {
+  if (item.type !== "user_message") return false;
+  return item.text.trimStart().startsWith(HEARTBEAT_TAG);
+}
+
+/**
  * Strip a 40-item tail down to the current turn. The last `user_message` marks
  * the turn's instruction, so anything up to and including the `assistant_message`
  * before it is history. With no user message the tail holds only the final
- * reply, and only the last `assistant_message` is news.
+ * reply, and only the last `assistant_message` is news. Heartbeat wakes are
+ * dropped first, so a turn woken by one keeps only its reply.
  */
 function currentTurn(timeline: readonly AgentTimelineItem[]): AgentTimelineItem[] {
-  const items = [...timeline];
+  const items = timeline.filter((item) => !isHeartbeatWake(item));
   const isUser = (item: AgentTimelineItem): boolean => item.type === "user_message";
   const isAssistant = (item: AgentTimelineItem): boolean => item.type === "assistant_message";
 

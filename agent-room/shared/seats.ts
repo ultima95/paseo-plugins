@@ -20,8 +20,22 @@ export const seatConfigSchema = z.object({
 
 export type SeatConfig = z.infer<typeof seatConfigSchema>;
 
+/**
+ * Longest tier id that keeps a `[room:peer:<id>] <title>` title parseable. The
+ * marker plus its trailing space is 13 characters (`[room:peer:` is 11, then the
+ * id, then `] `), so the id must stay under `AGENT_TITLE_MAX_LENGTH - 13` for the
+ * closing bracket to survive `seatTitle`'s slice — an id past that leaves
+ * `parseSeatMarker` seeing no marker at all, and the guard then treats the Peer
+ * as unmanaged. Capped at 40, well inside the limit, so a real title still fits
+ * after the marker.
+ */
+export const PEER_TIER_ID_MAX_LENGTH = AGENT_TITLE_MAX_LENGTH - 20;
+
 /** Tier ids are lowercase kebab-case so they survive the seat marker grammar. */
-export const peerTierIdSchema = z.string().regex(/^[a-z][a-z0-9-]*$/, "tier id must be lowercase kebab-case");
+export const peerTierIdSchema = z
+  .string()
+  .regex(/^[a-z][a-z0-9-]*$/, "tier id must be lowercase kebab-case")
+  .max(PEER_TIER_ID_MAX_LENGTH, `tier id must be at most ${PEER_TIER_ID_MAX_LENGTH} characters`);
 
 export const peerTierSchema = seatConfigSchema.extend({
   id: peerTierIdSchema,

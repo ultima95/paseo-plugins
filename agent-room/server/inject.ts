@@ -8,6 +8,7 @@ import {
   type SeatMarker,
 } from "../shared/seats";
 import { renderSystemPrompt } from "./render";
+import { PROMPTS } from "./prompts/generated";
 
 export type AgentCreateRequest = PluginBeforeRequests["agent.create"];
 
@@ -17,6 +18,15 @@ export type SeatApplication = {
   /** Set when the title asked for a peer tier that is not configured. */
   fallbackFrom?: string;
 };
+
+/**
+ * True when the request already carries the room prompt: `room.launch` and the
+ * `agent.create` hook can both run for the same agent, and a prompt injected
+ * twice would be paid for on every turn of the session.
+ */
+function carriesRoomPrompt(systemPrompt: string | undefined): boolean {
+  return systemPrompt !== undefined && systemPrompt.includes(PROMPTS.protocol);
+}
 
 /**
  * Overlay a seat onto a create request. Returns `null` for an agent whose title
@@ -48,7 +58,12 @@ export function applySeat(
   config.provider = seat.provider;
   config.model = seat.model;
   applySeatControls(config, seat);
-  config.systemPrompt = renderSystemPrompt(marker, settings, config.systemPrompt);
+  // Idempotent: a request that already carries the room prompt (a launched
+  // Supervisor, or a create that passed the hook twice) keeps it as it is. The
+  // seat override above still applies — only the text is left alone.
+  if (!carriesRoomPrompt(config.systemPrompt)) {
+    config.systemPrompt = renderSystemPrompt(marker, settings, config.systemPrompt);
+  }
 
   const applied: SeatApplication = { request: { ...request, config }, marker };
   if (fallbackFrom !== undefined) applied.fallbackFrom = fallbackFrom;

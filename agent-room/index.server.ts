@@ -9,7 +9,7 @@ import type {
 } from "@getpaseo/plugin/server";
 
 import { getRoomRpc, launchRoomRpc, listRoomsRpc } from "./shared/rpc";
-import { roomSettings } from "./shared/seats";
+import { parseSeatMarker, roomSettings } from "./shared/seats";
 import { createRoomEvents, lookupTitle } from "./server/events";
 import { createHandlers } from "./server/handlers";
 import { applySeat } from "./server/inject";
@@ -87,6 +87,10 @@ export default function contribute(server: PluginServerContext): () => Promise<v
   server.on("agent.archived", afterLoad("agent.archived", events.onArchived));
 
   server.before("agent.create", async ({ request }) => {
+    // Parse the seat off the title before anything awaits: an unmarked agent —
+    // which is most agents on the daemon — must not pay a settings round-trip
+    // that can stall for up to 2 s.
+    if (!parseSeatMarker(request.config.title)) return;
     try {
       const applied = applySeat(request, await readSettings());
       if (!applied) return;

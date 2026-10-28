@@ -224,4 +224,73 @@ describe("feedFromTurn", () => {
       { kind: "message", from: "P1", to: "L1", label: "CANDIDATE", text: "CANDIDATE abc123" },
     ]);
   });
+
+  it("emits no row for a supervisor heartbeat wake", () => {
+    const events = feedFromTurn({
+      agent: supervisor,
+      childIds: ["L1"],
+      timeline: [
+        {
+          type: "user_message",
+          text: "[supervisor-heartbeat] Inspect changed room state since your last checkpoint…",
+        },
+        { type: "assistant_message", text: "⏳ Working:\n◉ auth · running" },
+      ],
+    });
+
+    // The heartbeat prompt is synthetic: it is not a room message, so it gets no
+    // row — and the reply that ends the turn still does.
+    expect(events).toEqual([
+      {
+        kind: "message",
+        from: "S1",
+        to: null,
+        label: "reply",
+        text: "⏳ Working:\n◉ auth · running",
+      },
+    ]);
+  });
+
+  it("keeps a real instruction in the same tail as a heartbeat, still without the heartbeat row", () => {
+    const events = feedFromTurn({
+      agent: supervisor,
+      childIds: ["L1"],
+      timeline: [
+        { type: "user_message", text: "[supervisor-heartbeat] Inspect changed room state" },
+        { type: "assistant_message", text: "⏳ Working:\n◉ auth · running" },
+        { type: "user_message", text: "  [supervisor-heartbeat] again, with leading space" },
+        { type: "assistant_message", text: "✅ Done: nothing changed" },
+        { type: "user_message", text: "now check the billing export" },
+        { type: "assistant_message", text: "✅ Done: billing checked" },
+      ],
+    });
+
+    // Both heartbeat wakes are gone; the person's message and the turn's reply remain.
+    expect(events).toEqual([
+      {
+        kind: "message",
+        from: null,
+        to: "S1",
+        label: "task",
+        text: "now check the billing export",
+      },
+      {
+        kind: "message",
+        from: "S1",
+        to: null,
+        label: "reply",
+        text: "✅ Done: billing checked",
+      },
+    ]);
+  });
+
+  it("does not treat a heartbeat tag anywhere but the first line as synthetic", () => {
+    const events = feedFromTurn({
+      agent: supervisor,
+      childIds: [],
+      timeline: [{ type: "user_message", text: "keep going\n[supervisor-heartbeat] was handled" }],
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ label: "task" });
+  });
 });

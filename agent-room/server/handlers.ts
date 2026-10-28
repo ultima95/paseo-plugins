@@ -3,6 +3,7 @@ import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 
 import { getRoomRpc, launchRoomRpc, listRoomsRpc } from "../shared/rpc";
 import { seatTitle, type RoomSettings, type SeatConfig } from "../shared/seats";
+import { renderSystemPrompt } from "./render";
 import type { RoomStore } from "./store";
 
 export interface HandlerDeps {
@@ -43,9 +44,14 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
   return {
     async launch(input, paseo) {
       const settings = await deps.readSettings();
+      // The Supervisor carries its own prompt: role delivery must not depend on
+      // the `agent.create` hook firing for a plugin-originated create. If the
+      // hook does run, `applySeat` sees the prompt already there and leaves it.
+      const config = seatAgentConfig(settings.supervisor);
+      config.systemPrompt = renderSystemPrompt({ seat: "supervisor" }, settings);
       // A workspace owns the directory, so `cwd` belongs only on a bare create.
       const options: PaseoWorkspaceAgentCreateOptions = {
-        config: seatAgentConfig(settings.supervisor),
+        config,
         title: seatTitle({ seat: "supervisor" }, input.task),
         prompt: input.task,
       };

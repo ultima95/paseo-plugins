@@ -273,11 +273,13 @@ describe("agent-room server contribution", () => {
     await invoke("room.launch")({ task: "Fix the room", cwd: "/repo" }, { paseo });
 
     expect(created).toHaveLength(1);
-    expect(created[0]?.config).toEqual({
+    expect(created[0]?.config).toMatchObject({
       provider: "claude/claude-opus-5-5",
       modeId: "bypassPermissions",
       thinkingOptionId: "xhigh",
     });
+    // The launch carries the Supervisor's prompt itself (I4), not only the hook.
+    expect(created[0]?.config.systemPrompt).toContain("## Room seats");
   });
 
   it("swallows lifecycle failures instead of throwing at the daemon", async () => {
@@ -302,6 +304,42 @@ describe("agent-room server contribution", () => {
     await expect(create(request("Fix it"))).resolves.toBeUndefined();
     await expect(create(request("[Lead] old room"))).resolves.toBeUndefined();
     await expect(create(request(null))).resolves.toBeUndefined();
+  });
+
+  it("does not read the seat settings for an agent with no marker", async () => {
+    const read = readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS });
+    const { create } = contributeWith(read);
+
+    await create(request("Fix it"));
+    await create(request("[Lead] old room"));
+    await create(request(null));
+
+    // An unmarked create is the daemon's common case; a settings round-trip
+    // there can stall for 2 s and must never happen.
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("does not wait on a stalled settings read for an unmarked agent", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const { create } = contributeWith(stallingState());
+
+      // The read never answers: this only settles because it is never awaited.
+      await expect(create(request("Fix it"))).resolves.toBeUndefined();
+      await expect(create(request(null))).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still reads the settings for a marked agent", async () => {
+    const read = readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS });
+    const { create } = contributeWith(read);
+
+    await create(request("[room:lead] x"));
+
+    expect(read).toHaveBeenCalledTimes(1);
   });
 
   it("returns the seat's request for a marked agent", async () => {

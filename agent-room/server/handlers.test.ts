@@ -5,6 +5,8 @@ import type { FeedEvent, RoomRecord, SeatRecord } from "../shared/room";
 import { getRoomRpc, launchRoomRpc, listRoomsRpc } from "../shared/rpc";
 import { DEFAULT_SETTINGS, seatTitle, type RoomSettings } from "../shared/seats";
 import { createHandlers } from "./handlers";
+import { PROMPTS } from "./prompts/generated";
+import { renderSystemPrompt } from "./render";
 import { SEAT_SETTINGS_UNLOADED } from "./settings";
 import type { RoomStore } from "./store";
 
@@ -138,7 +140,7 @@ describe("launch", () => {
 
     await handlers.launch({ task: "Fix the room", cwd: "/repo" }, paseo);
 
-    expect(created[0]?.options.config).toEqual({
+    expect(created[0]?.options.config).toMatchObject({
       provider: "codex/gpt-5.6-sol",
       modeId: "full-access",
       thinkingOptionId: "medium",
@@ -152,7 +154,25 @@ describe("launch", () => {
 
     await handlers.launch({ task: "Fix the room", cwd: "/repo" }, paseo);
 
-    expect(created[0]?.options.config).toEqual({ provider: "claude/claude-opus-5-5" });
+    const config = created[0]!.options.config;
+    expect(config.provider).toBe("claude/claude-opus-5-5");
+    expect(config.modeId).toBeUndefined();
+    expect(config.thinkingOptionId).toBeUndefined();
+    expect(config.featureValues).toBeUndefined();
+  });
+
+  it("gives the Supervisor its role prompt instead of relying on the create hook", async () => {
+    const { paseo, created } = fakePaseo();
+    const { handlers } = handlersFor();
+
+    await handlers.launch({ task: "Fix the room", cwd: "/repo" }, paseo);
+
+    // The whole supervisor prompt: protocol, then role, then the seat table.
+    expect(created[0]?.options.config.systemPrompt).toBe(
+      renderSystemPrompt({ seat: "supervisor" }, DEFAULT_SETTINGS),
+    );
+    expect(created[0]?.options.config.systemPrompt).toContain(PROMPTS.protocol);
+    expect(created[0]?.options.config.systemPrompt).toContain("## Room seats");
   });
 
   it("refuses to launch without a workspace or a cwd", async () => {
