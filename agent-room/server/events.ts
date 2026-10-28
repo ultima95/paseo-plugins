@@ -6,6 +6,7 @@ import type {
 } from "@getpaseo/plugin/server";
 
 import type { SeatRecord } from "../shared/room";
+import { GUARD_ROW_KIND } from "../shared/room";
 import { parseSeatMarker, seatConfigFor, type RoomSettings, type SeatMarker } from "../shared/seats";
 import { feedFromTurn } from "./feed";
 import { checkSpawn } from "./guard";
@@ -16,7 +17,7 @@ import type { RoomStore } from "./store";
 export const FEED_TAIL_LIMIT = 40;
 
 /** A guard row is also rendered inside the agent timeline (renderer in Task 8). */
-export const GUARD_KIND = "room-guard";
+export const GUARD_KIND = GUARD_ROW_KIND;
 
 /**
  * The daemon records an agent's parent as a label on the agent

@@ -9,6 +9,15 @@ export const FEED_TEXT_CAP = 4000;
 /** Schema version of `rooms.json`; any other version is treated as corrupt. */
 export const ROOMS_FILE_VERSION = 1;
 
+/**
+ * The timeline row the guard appends to a violator's parent, and the version of
+ * its `data`. Both sides read them from here: the server writes the row and the
+ * client registers a renderer for it, so a rename on one side must not leave the
+ * other silently rendering nothing.
+ */
+export const GUARD_ROW_KIND = "room-guard";
+export const GUARD_ROW_VERSION = 1;
+
 const nonEmptyText = z.string().min(1);
 
 /**
