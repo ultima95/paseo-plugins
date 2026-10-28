@@ -5,7 +5,11 @@ import {
   FEED_CAP_PER_ROOM,
   FEED_TEXT_CAP,
   ROOMS_FILE_VERSION,
+  feedEventSchema,
+  roomRecordSchema,
   roomsFileSchema,
+  seatRecordSchema,
+  timestampSchema,
   truncateFeedText,
   type FeedEvent,
   type RoomRecord,
@@ -14,12 +18,23 @@ import {
 import type { Logger } from "./logger";
 
 export interface RoomStore {
-  /** Read `rooms.json`; a missing file is empty, a corrupt one is empty plus one warn. */
+  /**
+   * Read `rooms.json`; a missing file is empty, a corrupt one is empty plus one
+   * warn. Pending writes land first, and a load that would replace newer
+   * in-memory state is refused with one warn instead of clobbering it.
+   */
   load(): Promise<void>;
+  /** Invalid records are rejected with `log.error` and never reach the store. */
   addRoom(room: RoomRecord): void;
+  /** Invalid records are rejected with `log.error` and never reach the store. */
   addSeat(seat: SeatRecord): void;
   seat(agentId: string): SeatRecord | undefined;
   children(agentId: string): SeatRecord[];
+  /**
+   * Invalid events are rejected with `log.error` and not stored; the returned
+   * event is the rejected candidate, not a stored record. An invalid `at` is
+   * replaced with `now()` plus one warn, so the event is still stored.
+   */
   appendFeed(event: Omit<FeedEvent, "id" | "at"> & { at?: string }): FeedEvent;
   endRoom(roomId: string): void;
   /** Newest first by `createdAt`. */
@@ -119,20 +134,44 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
     for (const roomId of new Set(feed.map((event) => event.roomId))) trimRoomFeed(roomId);
   };
 
+  const hasState = (): boolean => rooms.length > 0 || seats.length > 0 || feed.length > 0;
+
+  /**
+   * Refuse to replace state a mutation produced, warning once with the counts.
+   * Returns true when memory was kept, so the caller returns without touching it.
+   */
+  const keepInMemoryState = (): boolean => {
+    if (!hasState()) return false;
+    log.warn("load after mutation; keeping in-memory state", {
+      rooms: rooms.length,
+      seats: seats.length,
+      feed: feed.length,
+    });
+    return true;
+  };
+
   const load = async (): Promise<void> => {
+    // Anything already scheduled must land before we read, otherwise we would
+    // read a file that predates the mutation and then overwrite memory with it.
+    await writing;
+
     let raw: string;
     try {
       raw = await readFile(file, "utf8");
     } catch (error) {
+      // A mutation can also land while the read is failing; memory still wins.
+      if (keepInMemoryState()) return;
       // A fresh install has no file yet; that is not a fault worth warning about.
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        reset();
-        return;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        log.warn("room store unreadable; starting empty", { error: reason(error) });
       }
-      log.warn("room store unreadable; starting empty", { error: reason(error) });
       reset();
       return;
     }
+
+    // The read finished after a mutation: the contents predate it, so applying
+    // them would silently drop newer records and clear `dirty`.
+    if (keepInMemoryState()) return;
 
     let parsed: unknown;
     try {
@@ -160,16 +199,28 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
   };
 
   const addRoom = (room: RoomRecord): void => {
-    const index = rooms.findIndex((candidate) => candidate.id === room.id);
-    if (index === -1) rooms.push(room);
-    else rooms[index] = room;
+    const parsed = roomRecordSchema.safeParse(room);
+    if (!parsed.success) {
+      log.error("rejected invalid room", { error: reason(parsed.error) });
+      return;
+    }
+    const record = parsed.data;
+    const index = rooms.findIndex((candidate) => candidate.id === record.id);
+    if (index === -1) rooms.push(record);
+    else rooms[index] = record;
     scheduleWrite();
   };
 
   const addSeat = (seat: SeatRecord): void => {
-    const index = seats.findIndex((candidate) => candidate.agentId === seat.agentId);
-    if (index === -1) seats.push(seat);
-    else seats[index] = seat;
+    const parsed = seatRecordSchema.safeParse(seat);
+    if (!parsed.success) {
+      log.error("rejected invalid seat", { error: reason(parsed.error) });
+      return;
+    }
+    const record = parsed.data;
+    const index = seats.findIndex((candidate) => candidate.agentId === record.agentId);
+    if (index === -1) seats.push(record);
+    else seats[index] = record;
     scheduleWrite();
   };
 
@@ -179,13 +230,33 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
   const children = (agentId: string): SeatRecord[] =>
     seats.filter((candidate) => candidate.parentId === agentId);
 
+  /** `now()` as an ISO string; one call per use so a fake clock stays predictable. */
+  const stamped = (): string => new Date(now()).toISOString();
+
   const appendFeed = (event: Omit<FeedEvent, "id" | "at"> & { at?: string }): FeedEvent => {
-    const stored: FeedEvent = {
+    let at = event.at;
+    if (at === undefined) {
+      at = stamped();
+    } else if (!timestampSchema.safeParse(at).success) {
+      // A bad timestamp is not worth losing the event over: stamp it instead.
+      log.warn("feed event `at` invalid; using now", { roomId: event.roomId, at });
+      at = stamped();
+    }
+
+    const candidate: FeedEvent = {
       ...event,
       id: newId(),
-      at: event.at ?? new Date(now()).toISOString(),
+      at,
       text: truncateFeedText(event.text),
     };
+
+    const parsed = feedEventSchema.safeParse(candidate);
+    if (!parsed.success) {
+      log.error("rejected invalid feed event", { error: reason(parsed.error) });
+      return candidate;
+    }
+
+    const stored = parsed.data;
     feed.push(stored);
     trimRoomFeed(stored.roomId);
     scheduleWrite();
@@ -195,7 +266,7 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
   const endRoom = (roomId: string): void => {
     const target = rooms.find((candidate) => candidate.id === roomId);
     if (target === undefined || target.endedAt !== undefined) return;
-    target.endedAt = new Date(now()).toISOString();
+    target.endedAt = stamped();
     scheduleWrite();
   };
 

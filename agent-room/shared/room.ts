@@ -10,7 +10,12 @@ export const FEED_TEXT_CAP = 4000;
 export const ROOMS_FILE_VERSION = 1;
 
 const nonEmptyText = z.string().min(1);
-const timestamp = z.string().min(1);
+
+/**
+ * Timestamps are non-empty ISO-8601 strings. Exported so the store can validate
+ * a caller-supplied `at` at the mutation boundary, before it reaches the file.
+ */
+export const timestampSchema = z.string().min(1);
 
 /** How to start one agent, exactly as `SeatMarker` describes it. */
 export const seatMarkerSchema = z.discriminatedUnion("seat", [
@@ -35,8 +40,8 @@ export const roomRecordSchema = z.object({
   task: z.string(),
   cwd: z.string(),
   workspaceId: z.string().nullable(),
-  createdAt: timestamp,
-  endedAt: timestamp.optional(),
+  createdAt: timestampSchema,
+  endedAt: timestampSchema.optional(),
 });
 
 export type RoomRecord = z.infer<typeof roomRecordSchema>;
@@ -69,7 +74,7 @@ export type FeedKind = z.infer<typeof feedKindSchema>;
 export const feedEventSchema = z.object({
   id: nonEmptyText,
   roomId: nonEmptyText,
-  at: timestamp,
+  at: timestampSchema,
   kind: feedKindSchema,
   from: z.string().nullable(),
   to: z.string().nullable(),
