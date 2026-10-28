@@ -14,7 +14,8 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "gen:prompts": "node server/prompts/gen.mts"
   },
   "devDependencies": {
     "@getpaseo/plugin": "0.13.1",
