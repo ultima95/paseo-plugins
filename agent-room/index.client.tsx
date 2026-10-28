@@ -3,6 +3,7 @@ import { Icon, SidebarRow } from "@getpaseo/plugin/client/ui";
 import { Pressable } from "react-native";
 
 import { GuardRow, guardRowSchema } from "./client/guard-row";
+import { RoomManagerPanel } from "./client/room-manager";
 import { contributeRoomPills } from "./client/room-pill";
 import { RoomScreen } from "./client/room-screen";
 import { RoomsPopover } from "./client/rooms-popover";
@@ -50,6 +51,12 @@ export default function contribute(client: PluginClientContext): () => void {
     client.addScreen({ id: "rooms", title: "Room", Component: RoomsScreen }),
     client.addScreen({ id: "room", title: () => "Room", Component: RoomScreen }),
     client.addSidebarHeaderItem({ id: "rooms", title: "Room", Component: RoomsSidebarItem }),
+    client.addWorkspacePanel({
+      id: "rooms-manager",
+      title: "Rooms",
+      icon: "Users",
+      Component: RoomManagerPanel,
+    }),
     client.addCommandCenterItem({
       id: "open-rooms",
       title: "Room",
