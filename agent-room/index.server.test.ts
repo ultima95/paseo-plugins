@@ -1,5 +1,15 @@
-import type { PluginServerContext, PluginSettings } from "@getpaseo/plugin/server";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import type { PaseoApi } from "@getpaseo/client";
+import type {
+  PluginHookAgent,
+  PluginHookContext,
+  PluginServerContext,
+  PluginSettings,
+} from "@getpaseo/plugin/server";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_SETTINGS, roomSettingsSchema } from "./shared/seats";
 import contribute from "./index.server";
@@ -7,6 +17,7 @@ import type { AgentCreateRequest } from "./server/inject";
 
 type SeatsSettings = PluginSettings<typeof roomSettingsSchema>;
 type CreateHook = (input: { request: AgentCreateRequest }) => Promise<AgentCreateRequest | void>;
+type LifecycleHook = (event: unknown, context: PluginHookContext) => Promise<void>;
 
 function readState(state: Awaited<ReturnType<SeatsSettings["read"]>>) {
   return vi.fn(async () => state);
@@ -14,27 +25,53 @@ function readState(state: Awaited<ReturnType<SeatsSettings["read"]>>) {
 
 function contributeWith(read: ReturnType<typeof readState>) {
   let hook: CreateHook | undefined;
+  const hooks: Record<string, LifecycleHook> = {};
   const server = {
     registerSettings: () => ({ read, subscribe: () => () => undefined }) as unknown as SeatsSettings,
     before: (name: string, handler: CreateHook) => {
       if (name === "agent.create") hook = handler;
       return () => undefined;
     },
-    on: () => () => undefined,
+    on: (name: string, handler: LifecycleHook) => {
+      hooks[name] = handler;
+      return () => undefined;
+    },
     handle: () => undefined,
     registerProvider: () => undefined,
     registerUsageSource: () => undefined,
   } as unknown as PluginServerContext;
 
   const cleanup = contribute(server);
-  return { cleanup, create: (request: AgentCreateRequest) => hook!({ request }) };
+  return { cleanup, hooks, create: (request: AgentCreateRequest) => hook!({ request }) };
 }
 
 const request = (title: string | null): AgentCreateRequest => ({
   config: { provider: "opencode", cwd: "/repo", title, model: "x" },
 });
 
-afterEach(() => {
+const hookAgent = (over: Partial<PluginHookAgent> & { id: string }): PluginHookAgent => ({
+  id: over.id,
+  workspaceId: over.workspaceId ?? "W1",
+  parentAgentId: over.parentAgentId ?? null,
+  provider: over.provider ?? "claude",
+  cwd: over.cwd ?? "/repo",
+  title: over.title ?? null,
+});
+
+/** The store path resolves at contribute time, so the data dir must be sandboxed. */
+let home: string;
+let previousPaseoHome: string | undefined;
+
+beforeEach(async () => {
+  home = await mkdtemp(join(tmpdir(), "agent-room-home-"));
+  previousPaseoHome = process.env.PASEO_HOME;
+  process.env.PASEO_HOME = home;
+});
+
+afterEach(async () => {
+  if (previousPaseoHome === undefined) delete process.env.PASEO_HOME;
+  else process.env.PASEO_HOME = previousPaseoHome;
+  await rm(home, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
 
@@ -42,6 +79,32 @@ describe("agent-room server contribution", () => {
   it("registers the seats settings and an agent.create hook", () => {
     const { cleanup } = contributeWith(readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }));
     expect(typeof cleanup).toBe("function");
+  });
+
+  it("registers the room lifecycle hooks and flushes the store on cleanup", async () => {
+    const { cleanup, hooks } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+
+    expect(Object.keys(hooks).sort()).toEqual(["agent.archived", "agent.created", "agent.turn_ended"]);
+    await expect(cleanup()).resolves.toBeUndefined();
+  });
+
+  it("swallows lifecycle failures instead of throwing at the daemon", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const { hooks } = contributeWith(readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }));
+    const context = { paseo: {} as PaseoApi, signal: new AbortController().signal };
+
+    // A parent id with no room and an unreadable daemon: the handler logs, never throws.
+    await expect(
+      hooks["agent.created"]({ agent: hookAgent({ id: "X1", parentAgentId: "U1", title: "plain" }) }, context),
+    ).resolves.toBeUndefined();
+    await expect(
+      hooks["agent.archived"](
+        { agent: hookAgent({ id: "Y1" }), archivedAt: "2026-10-28T10:00:00.000Z" },
+        context,
+      ),
+    ).resolves.toBeUndefined();
   });
 
   it("passes an unmarked agent through untouched (returns undefined)", async () => {

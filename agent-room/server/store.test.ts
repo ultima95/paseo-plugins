@@ -29,7 +29,9 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await rm(dir, { recursive: true, force: true });
+  // A store write can still be in flight when a test ends; Node retries the
+  // transient ENOTEMPTY instead of failing the test on its own teardown.
+  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 });
 
 function make() {
