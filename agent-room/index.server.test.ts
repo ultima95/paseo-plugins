@@ -26,6 +26,7 @@ function readState(state: Awaited<ReturnType<SeatsSettings["read"]>>) {
 function contributeWith(read: ReturnType<typeof readState>) {
   let hook: CreateHook | undefined;
   const hooks: Record<string, LifecycleHook> = {};
+  const handled: string[] = [];
   const server = {
     registerSettings: () => ({ read, subscribe: () => () => undefined }) as unknown as SeatsSettings,
     before: (name: string, handler: CreateHook) => {
@@ -36,13 +37,15 @@ function contributeWith(read: ReturnType<typeof readState>) {
       hooks[name] = handler;
       return () => undefined;
     },
-    handle: () => undefined,
+    handle: (contract: { name: string }) => {
+      handled.push(contract.name);
+    },
     registerProvider: () => undefined,
     registerUsageSource: () => undefined,
   } as unknown as PluginServerContext;
 
   const cleanup = contribute(server);
-  return { cleanup, hooks, create: (request: AgentCreateRequest) => hook!({ request }) };
+  return { cleanup, handled, hooks, create: (request: AgentCreateRequest) => hook!({ request }) };
 }
 
 const request = (title: string | null): AgentCreateRequest => ({
@@ -88,6 +91,14 @@ describe("agent-room server contribution", () => {
 
     expect(Object.keys(hooks).sort()).toEqual(["agent.archived", "agent.created", "agent.turn_ended"]);
     await expect(cleanup()).resolves.toBeUndefined();
+  });
+
+  it("registers the launch, list and get RPCs in contract order", () => {
+    const { handled } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+
+    expect(handled).toEqual(["room.launch", "room.list", "room.get"]);
   });
 
   it("swallows lifecycle failures instead of throwing at the daemon", async () => {

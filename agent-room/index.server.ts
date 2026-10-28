@@ -8,8 +8,10 @@ import type {
   PluginServerContext,
 } from "@getpaseo/plugin/server";
 
+import { getRoomRpc, launchRoomRpc, listRoomsRpc } from "./shared/rpc";
 import { DEFAULT_SETTINGS, roomSettings, type RoomSettings } from "./shared/seats";
 import { createRoomEvents, lookupTitle } from "./server/events";
+import { createHandlers } from "./server/handlers";
 import { applySeat } from "./server/inject";
 import { consoleLogger } from "./server/logger";
 import { createSettingsReader, type SettingsReader } from "./server/settings";
@@ -86,6 +88,10 @@ export default function contribute(server: PluginServerContext): () => Promise<v
 
   const events = createRoomEvents({ store, readSettings, lookupTitle, log });
 
+  // The screen's RPCs read the same store the hooks write, so each one waits for
+  // the load first. `readSeats` keeps a stuck settings read from stalling launch.
+  const handlers = createHandlers({ store, readSettings: () => readSeats(readSettings) });
+
   /** Wait for the load, then run the handler; a handler failure is logged, not thrown. */
   const afterLoad = <Name extends keyof PluginLifecycleEvents>(
     name: Name,
@@ -118,6 +124,23 @@ export default function contribute(server: PluginServerContext): () => Promise<v
       log.error("agent.create hook failed; request passed through", { error });
       return;
     }
+  });
+
+  // RPC failures are the caller's to see (the launch form shows them), so these
+  // propagate instead of being swallowed the way the lifecycle hooks are.
+  server.handle(launchRoomRpc, async (input, { paseo }) => {
+    await loaded;
+    return handlers.launch(input, paseo);
+  });
+
+  server.handle(listRoomsRpc, async () => {
+    await loaded;
+    return handlers.list();
+  });
+
+  server.handle(getRoomRpc, async (input) => {
+    await loaded;
+    return handlers.get(input);
   });
 
   return async () => {
