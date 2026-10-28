@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { PaseoApi } from "@getpaseo/client";
+import type { PaseoAgentCreateOptions, PaseoApi } from "@getpaseo/client";
 import type {
   PluginHookAgent,
   PluginHookContext,
@@ -14,19 +14,101 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SETTINGS, roomSettingsSchema } from "./shared/seats";
 import contribute from "./index.server";
 import type { AgentCreateRequest } from "./server/inject";
+import { SEAT_SETTINGS_UNLOADED, SETTINGS_TIMEOUT_MS } from "./server/settings";
 
 type SeatsSettings = PluginSettings<typeof roomSettingsSchema>;
+type SeatsState = Awaited<ReturnType<SeatsSettings["read"]>>;
+type SeatsRead = () => Promise<SeatsState>;
 type CreateHook = (input: { request: AgentCreateRequest }) => Promise<AgentCreateRequest | void>;
 type LifecycleHook = (event: unknown, context: PluginHookContext) => Promise<void>;
 
-function readState(state: Awaited<ReturnType<SeatsSettings["read"]>>) {
+/** A registered RPC handler, callable with whatever the test passes. */
+type RpcCall = (input: unknown, context: unknown) => Promise<unknown>;
+type RegisteredHandler = (input: never, context: never) => Promise<unknown>;
+
+function readState(state: SeatsState) {
   return vi.fn(async () => state);
 }
 
-function contributeWith(read: ReturnType<typeof readState>) {
+/** A daemon whose settings read never answers: the stall the rulings care about. */
+function stallingState(): SeatsRead {
+  return () => new Promise<SeatsState>(() => undefined);
+}
+
+/**
+ * The store load is the only wait between a plugin load and an RPC serving, and
+ * it is real file I/O, so the tests need a way to hold it open.
+ */
+const loadGate = vi.hoisted(() => {
+  let hold = false;
+  let release: (() => void) | undefined;
+  let waiting = Promise.resolve();
+
+  return {
+    close(): void {
+      hold = true;
+      waiting = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    },
+    open(): void {
+      hold = false;
+      release?.();
+      release = undefined;
+      waiting = Promise.resolve();
+    },
+    wait(): Promise<void> {
+      return waiting;
+    },
+    get held(): boolean {
+      return hold;
+    },
+  };
+});
+
+vi.mock("./server/store", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./server/store")>();
+  return {
+    ...actual,
+    createRoomStore: (deps: Parameters<typeof actual.createRoomStore>[0]) => {
+      const store = actual.createRoomStore(deps);
+      const load = store.load.bind(store);
+      store.load = () => (loadGate.held ? loadGate.wait() : load());
+      return store;
+    },
+  };
+});
+
+/** A daemon stub that records every `agents.create` and hands back sequential ids. */
+function fakePaseo() {
+  const created: PaseoAgentCreateOptions[] = [];
+  const paseo = {
+    agents: {
+      create: vi.fn(async (options: PaseoAgentCreateOptions) => {
+        created.push(options);
+        return { id: `A${created.length}` };
+      }),
+    },
+    workspaces: {
+      ref: vi.fn((workspaceId: string) => ({
+        id: workspaceId,
+        agents: {
+          create: vi.fn(async (options: PaseoAgentCreateOptions) => {
+            created.push(options);
+            return { id: `W${created.length}` };
+          }),
+        },
+      })),
+    },
+  } as unknown as PaseoApi;
+
+  return { paseo, created };
+}
+
+function contributeWith(read: SeatsRead) {
   let hook: CreateHook | undefined;
   const hooks: Record<string, LifecycleHook> = {};
-  const handled: string[] = [];
+  const handled: Array<{ name: string; handler: RegisteredHandler }> = [];
   const server = {
     registerSettings: () => ({ read, subscribe: () => () => undefined }) as unknown as SeatsSettings,
     before: (name: string, handler: CreateHook) => {
@@ -37,15 +119,23 @@ function contributeWith(read: ReturnType<typeof readState>) {
       hooks[name] = handler;
       return () => undefined;
     },
-    handle: (contract: { name: string }) => {
-      handled.push(contract.name);
+    handle: (contract: { name: string }, handler: RegisteredHandler) => {
+      handled.push({ name: contract.name, handler });
     },
     registerProvider: () => undefined,
     registerUsageSource: () => undefined,
   } as unknown as PluginServerContext;
 
   const cleanup = contribute(server);
-  return { cleanup, handled, hooks, create: (request: AgentCreateRequest) => hook!({ request }) };
+
+  /** The handler the daemon would run for `name`, with its narrow types erased. */
+  const invoke = (name: string): RpcCall => {
+    const entry = handled.find((candidate) => candidate.name === name);
+    if (entry === undefined) throw new Error(`no handler registered for ${name}`);
+    return (input, context) => entry.handler(input as never, context as never);
+  };
+
+  return { cleanup, handled, hooks, invoke, create: (request: AgentCreateRequest) => hook!({ request }) };
 }
 
 const request = (title: string | null): AgentCreateRequest => ({
@@ -66,12 +156,14 @@ let home: string;
 let previousPaseoHome: string | undefined;
 
 beforeEach(async () => {
+  loadGate.open();
   home = await mkdtemp(join(tmpdir(), "agent-room-home-"));
   previousPaseoHome = process.env.PASEO_HOME;
   process.env.PASEO_HOME = home;
 });
 
 afterEach(async () => {
+  loadGate.open();
   if (previousPaseoHome === undefined) delete process.env.PASEO_HOME;
   else process.env.PASEO_HOME = previousPaseoHome;
   await rm(home, { recursive: true, force: true });
@@ -98,7 +190,94 @@ describe("agent-room server contribution", () => {
       readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
     );
 
-    expect(handled).toEqual(["room.launch", "room.list", "room.get"]);
+    expect(handled.map((entry) => entry.name)).toEqual(["room.launch", "room.list", "room.get"]);
+    // Three contracts, three distinct handlers: none registered twice by mistake.
+    expect(new Set(handled.map((entry) => entry.handler)).size).toBe(3);
+  });
+
+  it("binds each contract to its matching handler, not merely to some handler", async () => {
+    const { invoke } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+    const { paseo, created } = fakePaseo();
+    const context = { paseo };
+
+    // `room.launch` reaches the create path: a `room.list` binding would answer
+    // with rooms and create nothing.
+    await expect(
+      invoke("room.launch")({ task: "Fix the room", cwd: "/repo" }, context),
+    ).resolves.toEqual({ roomId: "A1" });
+    expect(created).toHaveLength(1);
+    expect(created[0]?.prompt).toBe("Fix the room");
+
+    // …and the reads stay reads: neither creates an agent.
+    await expect(invoke("room.list")({}, context)).resolves.toEqual({ rooms: [] });
+    await expect(invoke("room.get")({ roomId: "no-such-room" }, context)).resolves.toEqual({
+      missing: true,
+    });
+    expect(created).toHaveLength(1);
+  });
+
+  it("holds a launch until the room store has loaded", async () => {
+    loadGate.close();
+    const { invoke } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+    const { paseo, created } = fakePaseo();
+
+    const pending = invoke("room.launch")({ task: "Fix the room", cwd: "/repo" }, { paseo });
+
+    // A real macrotask drains the handler's microtasks: with the load still
+    // unresolved it must be parked on `await loaded`, not creating an agent
+    // against a store that is not in memory yet.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(loadGate.held).toBe(true);
+    expect(created).toHaveLength(0);
+
+    loadGate.open();
+    await expect(pending).resolves.toEqual({ roomId: "A1" });
+    expect(created).toHaveLength(1);
+  });
+
+  it("fails the launch, and creates nothing, when the seat settings stall", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const { invoke } = contributeWith(stallingState());
+      // Drain the store load first, so the only pending wait is the settings read.
+      await invoke("room.list")({}, {});
+
+      const { paseo, created } = fakePaseo();
+      const pending = invoke("room.launch")({ task: "Fix the room", cwd: "/repo" }, { paseo });
+      const rejected = expect(pending).rejects.toThrow(SEAT_SETTINGS_UNLOADED);
+
+      // Let the handler reach the settings read, then run its 2 s timer out.
+      await new Promise((resolve) => setImmediate(resolve));
+      await vi.advanceTimersByTimeAsync(SETTINGS_TIMEOUT_MS);
+      await rejected;
+
+      expect(created).toHaveLength(0);
+      expect(warn).toHaveBeenCalledWith("[agent-room]", "seat settings read timed out", {
+        error: `timed out after ${SETTINGS_TIMEOUT_MS}ms`,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still seeds DEFAULT_SETTINGS for a launch when the saved settings are invalid", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { invoke } = contributeWith(readState({ status: "invalid", revision: "1", error: "bad seats" }));
+    const { paseo, created } = fakePaseo();
+
+    await invoke("room.launch")({ task: "Fix the room", cwd: "/repo" }, { paseo });
+
+    expect(created).toHaveLength(1);
+    expect(created[0]?.config).toEqual({
+      provider: "claude/claude-opus-5-5",
+      modeId: "bypassPermissions",
+      thinkingOptionId: "xhigh",
+    });
   });
 
   it("swallows lifecycle failures instead of throwing at the daemon", async () => {
@@ -152,7 +331,7 @@ describe("agent-room server contribution", () => {
     const read = vi.fn(async () => {
       throw new Error("daemon gone");
     });
-    const { create } = contributeWith(read as unknown as ReturnType<typeof readState>);
+    const { create } = contributeWith(read);
     await expect(create(request("[room:lead] x"))).resolves.toMatchObject({
       config: { provider: "claude", model: "claude-opus-5-5" },
     });

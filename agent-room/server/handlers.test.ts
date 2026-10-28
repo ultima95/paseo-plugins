@@ -5,6 +5,7 @@ import type { FeedEvent, RoomRecord, SeatRecord } from "../shared/room";
 import { getRoomRpc, launchRoomRpc, listRoomsRpc } from "../shared/rpc";
 import { DEFAULT_SETTINGS, seatTitle, type RoomSettings } from "../shared/seats";
 import { createHandlers } from "./handlers";
+import { SEAT_SETTINGS_UNLOADED } from "./settings";
 import type { RoomStore } from "./store";
 
 interface CreateCall {
@@ -159,6 +160,22 @@ describe("launch", () => {
     const { handlers } = handlersFor();
 
     await expect(handlers.launch({ task: "Fix the room" }, paseo)).rejects.toThrow(/workspaceId or cwd/);
+    expect(created).toHaveLength(0);
+  });
+
+  it("fails the launch instead of creating a default Supervisor when the seats do not load", async () => {
+    const { paseo, created } = fakePaseo();
+    const fake = fakeStore();
+    const handlers = createHandlers({
+      store: fake.store,
+      readSettings: async () => {
+        throw new Error(SEAT_SETTINGS_UNLOADED);
+      },
+    });
+
+    await expect(handlers.launch({ task: "Fix the room", cwd: "/repo" }, paseo)).rejects.toThrow(
+      SEAT_SETTINGS_UNLOADED,
+    );
     expect(created).toHaveLength(0);
   });
 

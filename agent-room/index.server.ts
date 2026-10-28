@@ -9,50 +9,18 @@ import type {
 } from "@getpaseo/plugin/server";
 
 import { getRoomRpc, launchRoomRpc, listRoomsRpc } from "./shared/rpc";
-import { DEFAULT_SETTINGS, roomSettings, type RoomSettings } from "./shared/seats";
+import { roomSettings } from "./shared/seats";
 import { createRoomEvents, lookupTitle } from "./server/events";
 import { createHandlers } from "./server/handlers";
 import { applySeat } from "./server/inject";
 import { consoleLogger } from "./server/logger";
-import { createSettingsReader, type SettingsReader } from "./server/settings";
+import { createSettingsReader } from "./server/settings";
 import { createRoomStore, resolveDataDir } from "./server/store";
-
-/** Seat settings live in the daemon, so a stuck read must not stall creation. */
-const SETTINGS_TIMEOUT_MS = 2_000;
 
 /** The plugin's single store file, inside `resolveDataDir(...)`. */
 const ROOMS_FILE = "rooms.json";
 
 const log = consoleLogger;
-
-async function readSeats(read: SettingsReader): Promise<RoomSettings> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let timedOut = false;
-  const timeout = new Promise<RoomSettings>((resolve) => {
-    timer = setTimeout(() => {
-      timedOut = true;
-      resolve(DEFAULT_SETTINGS);
-    }, SETTINGS_TIMEOUT_MS);
-    timer.unref?.();
-  });
-
-  try {
-    const settings = await Promise.race([read(), timeout]);
-    if (timedOut) {
-      log.warn("seat settings read timed out; using default seats", {
-        timeoutMs: SETTINGS_TIMEOUT_MS,
-      });
-    }
-    return settings;
-  } catch (error) {
-    // `createSettingsReader` never rejects; this is the belt to its braces so a
-    // future reader cannot fail agent creation.
-    log.error("seat settings read failed; using default seats", { error });
-    return DEFAULT_SETTINGS;
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
 
 function reason(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -88,9 +56,16 @@ export default function contribute(server: PluginServerContext): () => Promise<v
 
   const events = createRoomEvents({ store, readSettings, lookupTitle, log });
 
+  // Two readers over the same settings, deliberately: `agent.create` must never
+  // break, so it keeps the lenient one (a stalled read becomes default seats),
+  // while `room.launch` has a waiting user and must say so instead of launching
+  // a default `bypassPermissions` Supervisor. A settings state that is `invalid`
+  // still seeds `DEFAULT_SETTINGS` for both — that is the designed fallback.
+  const launchSettings = createSettingsReader(settings, log, { strict: true });
+
   // The screen's RPCs read the same store the hooks write, so each one waits for
-  // the load first. `readSeats` keeps a stuck settings read from stalling launch.
-  const handlers = createHandlers({ store, readSettings: () => readSeats(readSettings) });
+  // the load first.
+  const handlers = createHandlers({ store, readSettings: launchSettings });
 
   /** Wait for the load, then run the handler; a handler failure is logged, not thrown. */
   const afterLoad = <Name extends keyof PluginLifecycleEvents>(
@@ -113,7 +88,7 @@ export default function contribute(server: PluginServerContext): () => Promise<v
 
   server.before("agent.create", async ({ request }) => {
     try {
-      const applied = applySeat(request, await readSeats(readSettings));
+      const applied = applySeat(request, await readSettings());
       if (!applied) return;
       if (applied.fallbackFrom !== undefined) {
         log.warn("unknown peer tier", { tier: applied.fallbackFrom });
