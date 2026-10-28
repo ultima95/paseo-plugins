@@ -284,6 +284,33 @@ describe("feedFromTurn", () => {
     ]);
   });
 
+  it("does not re-emit the previous real task when a heartbeat wake comes after it", () => {
+    const events = feedFromTurn({
+      agent: supervisor,
+      childIds: ["L1"],
+      timeline: [
+        { type: "user_message", text: "fix the auth retry loop" },
+        { type: "assistant_message", text: "✅ Done: auth retry loop fixed" },
+        { type: "user_message", text: "[supervisor-heartbeat] Inspect changed room state" },
+        { type: "assistant_message", text: "⏳ Working:\n◉ auth · running" },
+      ],
+    });
+
+    // The heartbeat is the newest user message, so the turn starts there and the
+    // earlier real task is history — not something the heartbeat wake replays.
+    expect(events).toEqual([
+      {
+        kind: "message",
+        from: "S1",
+        to: null,
+        label: "reply",
+        text: "⏳ Working:\n◉ auth · running",
+      },
+    ]);
+    expect(events.some((event) => event.text.includes("fix the auth retry loop"))).toBe(false);
+    expect(events.some((event) => event.text.includes("[supervisor-heartbeat]"))).toBe(false);
+  });
+
   it("does not treat a heartbeat tag anywhere but the first line as synthetic", () => {
     const events = feedFromTurn({
       agent: supervisor,

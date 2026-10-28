@@ -84,22 +84,32 @@ function isHeartbeatWake(item: AgentTimelineItem): boolean {
  * Strip a 40-item tail down to the current turn. The last `user_message` marks
  * the turn's instruction, so anything up to and including the `assistant_message`
  * before it is history. With no user message the tail holds only the final
- * reply, and only the last `assistant_message` is news. Heartbeat wakes are
- * dropped first, so a turn woken by one keeps only its reply.
+ * reply, and only the last `assistant_message` is news.
+ *
+ * The boundary is found in the *unfiltered* tail and the heartbeat wakes are
+ * dropped only from the window that survives it. Filtering first would move the
+ * boundary backwards: on a heartbeat turn the tail ends
+ * `real task, reply, heartbeat, heartbeat reply`, so the last surviving user
+ * message would be the previous turn's real task and the slice would re-emit it
+ * on every heartbeat wake until it aged out of the tail.
  */
 function currentTurn(timeline: readonly AgentTimelineItem[]): AgentTimelineItem[] {
-  const items = timeline.filter((item) => !isHeartbeatWake(item));
   const isUser = (item: AgentTimelineItem): boolean => item.type === "user_message";
   const isAssistant = (item: AgentTimelineItem): boolean => item.type === "assistant_message";
 
-  const lastUser = items.map(isUser).lastIndexOf(true);
+  const lastUser = timeline.map(isUser).lastIndexOf(true);
+  let window: readonly AgentTimelineItem[];
   if (lastUser === -1) {
-    const lastAssistant = items.map(isAssistant).lastIndexOf(true);
-    return lastAssistant === -1 ? [] : items.slice(lastAssistant);
+    const lastAssistant = timeline.map(isAssistant).lastIndexOf(true);
+    window = lastAssistant === -1 ? [] : timeline.slice(lastAssistant);
+  } else {
+    const assistantBeforeUser = timeline.slice(0, lastUser).map(isAssistant).lastIndexOf(true);
+    window = timeline.slice(assistantBeforeUser + 1);
   }
 
-  const assistantBeforeUser = items.slice(0, lastUser).map(isAssistant).lastIndexOf(true);
-  return items.slice(assistantBeforeUser + 1);
+  // A heartbeat wake is not a room turn, so it contributes no user row — but it
+  // stays in the boundary scan above, where it is what marks the turn as current.
+  return window.filter((item) => !isHeartbeatWake(item));
 }
 
 /**
