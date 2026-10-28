@@ -7,7 +7,7 @@ import {
 import { useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 
-import { launchRoomRpc } from "../shared/rpc";
+import { launchRoomRpc, adoptRoomRpc } from "../shared/rpc";
 import { describeError } from "./seat-editor";
 
 const PILL_ID = "start-room";
@@ -20,12 +20,17 @@ const PILL_ID = "start-room";
  */
 export function RoomPopover(props: PluginButtonContentProps & { onManage?: () => void }) {
   const { theme, layout, workspaceId, close, onManage } = props;
+  const agentId = props.context === "agent" ? props.agentId : null;
   const launch = useRpc(launchRoomRpc);
+  const adopt = useRpc(adoptRoomRpc);
 
   const [task, setTask] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [roomId, setRoomId] = useState(null as string | null);
+  const [adopting, setAdopting] = useState(false);
+  const [adoptError, setAdoptError] = useState("");
+  const [adopted, setAdopted] = useState(null as string | null);
 
   const pad = layout.compact ? 12 : 16;
   const canLaunch = task.trim().length > 0 && !busy;
@@ -42,6 +47,20 @@ export function RoomPopover(props: PluginButtonContentProps & { onManage?: () =>
       setError(describeError(caught));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function adoptThisChat() {
+    if (agentId === null || adopting) return;
+    setAdopting(true);
+    setAdoptError("");
+    try {
+      const result = await adopt({ agentId });
+      setAdopted(result.roomId);
+    } catch (caught) {
+      setAdoptError(describeError(caught));
+    } finally {
+      setAdopting(false);
     }
   }
 
@@ -130,6 +149,35 @@ export function RoomPopover(props: PluginButtonContentProps & { onManage?: () =>
           <Text style={{ color: theme.colors.foregroundMuted }}>Cancel</Text>
         </Pressable>
       </View>
+      {agentId !== null ? (
+        <View style={{ gap: 6, borderTopWidth: 1, borderTopColor: theme.colors.border, paddingTop: pad }}>
+          {adopted !== null ? (
+            <Text style={{ color: theme.colors.foreground }}>
+              This chat is the room Supervisor now. Give it a task here; it will title Leads with
+              {" "}`[room:lead]`.
+            </Text>
+          ) : (
+            <>
+              <Text style={{ color: theme.colors.foregroundMuted }}>
+                Or make this chat the Supervisor. It keeps this chat's provider and model; the saved
+                Supervisor seat is not applied.
+              </Text>
+              <Pressable
+                accessibilityRole="button"
+                disabled={adopting}
+                onPress={() => void adoptThisChat()}
+              >
+                <Text style={{ color: theme.colors.accent, fontWeight: "600" }}>
+                  {adopting ? "Making it Supervisor…" : "Use this chat as Supervisor"}
+                </Text>
+              </Pressable>
+            </>
+          )}
+          {adoptError ? (
+            <Text style={{ color: theme.colors.statusDanger }}>{adoptError}</Text>
+          ) : null}
+        </View>
+      ) : null}
       {onManage ? (
         <Pressable
           accessibilityRole="button"

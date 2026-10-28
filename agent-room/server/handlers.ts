@@ -1,7 +1,7 @@
 import type { PaseoAgentConfig, PaseoApi, PaseoWorkspaceAgentCreateOptions } from "@getpaseo/client";
 import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 
-import { getRoomRpc, launchRoomRpc, listRoomsRpc } from "../shared/rpc";
+import { adoptRoomRpc, getRoomRpc, launchRoomRpc, listRoomsRpc } from "../shared/rpc";
 import { seatTitle, type RoomSettings, type SeatConfig } from "../shared/seats";
 import { renderSystemPrompt } from "./render";
 import type { RoomStore } from "./store";
@@ -14,6 +14,7 @@ export interface HandlerDeps {
 
 export interface RoomHandlers {
   launch(input: RpcInput<typeof launchRoomRpc>, paseo: PaseoApi): Promise<RpcOutput<typeof launchRoomRpc>>;
+  adopt(input: RpcInput<typeof adoptRoomRpc>, paseo: PaseoApi): Promise<RpcOutput<typeof adoptRoomRpc>>;
   list(): RpcOutput<typeof listRoomsRpc>;
   get(input: RpcInput<typeof getRoomRpc>): RpcOutput<typeof getRoomRpc>;
 }
@@ -83,6 +84,56 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
 
       // The contract refines this away; a handler is still a boundary.
       throw new Error("launch requires workspaceId or cwd");
+    },
+
+    async adopt(input, paseo) {
+      const recorded = store.room(input.agentId);
+      if (recorded) return { roomId: recorded.room.id };
+
+      const handle = paseo.agents.ref(input.agentId);
+      await handle.refresh();
+      const agent = handle.current();
+      if (!agent) throw new Error("room.adopt: agent not found");
+      if (store.seat(input.agentId)) {
+        throw new Error("room.adopt: agent already holds a room seat");
+      }
+
+      const roomId = agent.id;
+      const title = agent.title?.trim() ?? "";
+      // The chat keeps its provider, model, mode and effort. The seat record
+      // describes what actually runs so the tree and live view are truthful.
+      store.addRoom({
+        id: roomId,
+        task: title.length > 0 ? title : "Adopted chat",
+        cwd: agent.cwd,
+        workspaceId: agent.workspaceId ?? null,
+        createdAt: agent.createdAt,
+      });
+      store.addSeat({
+        agentId: roomId,
+        roomId,
+        parentId: null,
+        marker: { seat: "supervisor" },
+        provider: agent.provider,
+        model: agent.model ?? "",
+        title,
+      });
+      store.appendFeed({
+        roomId,
+        kind: "note",
+        from: null,
+        to: roomId,
+        label: "adopted",
+        text: "This chat became the room Supervisor.",
+      });
+      await store.flush();
+
+      const settings = await deps.readSettings();
+      const setup = renderSystemPrompt({ seat: "supervisor" }, settings);
+      await handle.send(
+        `This chat is the Supervisor seat of an agent room. Follow this protocol and role from here on.\n\n${setup}`,
+      );
+      return { roomId };
     },
 
     list() {

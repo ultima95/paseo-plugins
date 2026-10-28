@@ -8,7 +8,7 @@ import type {
   PluginServerContext,
 } from "@getpaseo/plugin/server";
 
-import { getRoomRpc, launchRoomRpc, listRoomsRpc } from "./shared/rpc";
+import { adoptRoomRpc, getRoomRpc, launchRoomRpc, listRoomsRpc } from "./shared/rpc";
 import { parseSeatMarker, roomSettings } from "./shared/seats";
 import { createRoomEvents, lookupTitle } from "./server/events";
 import { createHandlers } from "./server/handlers";
@@ -110,6 +110,11 @@ export default function contribute(server: PluginServerContext): () => Promise<v
   server.handle(launchRoomRpc, async (input, { paseo }) => {
     await loaded;
     return handlers.launch(input, paseo);
+  });
+
+  server.handle(adoptRoomRpc, async (input, { paseo }) => {
+    await loaded;
+    return handlers.adopt(input, paseo);
   });
 
   server.handle(listRoomsRpc, async () => {

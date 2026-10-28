@@ -186,14 +186,19 @@ describe("agent-room server contribution", () => {
     await expect(cleanup()).resolves.toBeUndefined();
   });
 
-  it("registers the launch, list and get RPCs in contract order", () => {
+  it("registers the launch, adopt, list and get RPCs in contract order", () => {
     const { handled } = contributeWith(
       readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
     );
 
-    expect(handled.map((entry) => entry.name)).toEqual(["room.launch", "room.list", "room.get"]);
-    // Three contracts, three distinct handlers: none registered twice by mistake.
-    expect(new Set(handled.map((entry) => entry.handler)).size).toBe(3);
+    expect(handled.map((entry) => entry.name)).toEqual([
+      "room.launch",
+      "room.adopt",
+      "room.list",
+      "room.get",
+    ]);
+    // Four contracts, four distinct handlers: none registered twice by mistake.
+    expect(new Set(handled.map((entry) => entry.handler)).size).toBe(4);
   });
 
   it("binds each contract to its matching handler, not merely to some handler", async () => {
