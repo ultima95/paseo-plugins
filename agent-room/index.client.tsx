@@ -3,6 +3,7 @@ import { Icon, SidebarRow } from "@getpaseo/plugin/client/ui";
 import { Pressable } from "react-native";
 
 import { GuardRow, guardRowSchema } from "./client/guard-row";
+import { contributeRoomPills } from "./client/room-pill";
 import { RoomScreen } from "./client/room-screen";
 import { RoomsPopover } from "./client/rooms-popover";
 import { RoomsScreen } from "./client/rooms-screen";
@@ -93,7 +94,10 @@ export default function contribute(client: PluginClientContext): () => void {
     }),
   ];
 
+  const disposePills = contributeRoomPills(client);
+
   return () => {
+    disposePills();
     for (const dispose of disposers) dispose();
   };
 }
