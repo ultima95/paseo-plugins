@@ -90,6 +90,7 @@ function fakePaseo() {
       }),
     },
     workspaces: {
+      list: vi.fn(async () => ({ entries: [] })),
       ref: vi.fn((workspaceId: string) => ({
         id: workspaceId,
         agents: {
