@@ -18,8 +18,8 @@ const PILL_ID = "start-room";
  * own. A popover cannot navigate in 0.13.1, so a started room is reported here
  * and opened from the Room sidebar or its recent-rooms popover.
  */
-export function RoomPopover(props: PluginButtonContentProps) {
-  const { theme, layout, workspaceId, close } = props;
+export function RoomPopover(props: PluginButtonContentProps & { onManage?: () => void }) {
+  const { theme, layout, workspaceId, close, onManage } = props;
   const launch = useRpc(launchRoomRpc);
 
   const [task, setTask] = useState("");
@@ -130,6 +130,19 @@ export function RoomPopover(props: PluginButtonContentProps) {
           <Text style={{ color: theme.colors.foregroundMuted }}>Cancel</Text>
         </Pressable>
       </View>
+      {onManage ? (
+        <Pressable
+          accessibilityRole="button"
+          onPress={() => {
+            close();
+            onManage();
+          }}
+        >
+          <Text style={{ color: theme.colors.accent, fontWeight: "600" }}>
+            Manage rooms and agents
+          </Text>
+        </Pressable>
+      ) : null}
     </ScrollView>
   );
 }
@@ -155,7 +168,17 @@ export function contributeRoomPills(client: PluginClientContext): () => void {
           title: "Start a room",
           icon: "Users",
           label: "Room",
-          behavior: { kind: "popover", Content: RoomPopover },
+          behavior: {
+            kind: "popover",
+            Content: (contentProps) => (
+              <RoomPopover
+                {...contentProps}
+                onManage={() =>
+                  client.openPanel("rooms-manager", { workspaceId: contentProps.workspaceId })
+                }
+              />
+            ),
+          },
         },
       }),
     );
