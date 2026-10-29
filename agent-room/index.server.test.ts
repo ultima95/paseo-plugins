@@ -614,8 +614,19 @@ describe("agent-room server contribution", () => {
       ),
     ).toBe(true);
 
+    // Teardown order, not an assertion: the scheduled tick this test held open is
+    // still mid-tick below `record`, and it goes on to write the tick's report into
+    // `stateDir` (one `.txt` and, since Task 14, its `.json`). `cleanup()` first, so
+    // the interval stops and no *second* tick can start; then release the tick and
+    // wait for it through the public status, which carries a tick only once
+    // `runTick` has resolved. Without this the `afterEach` that removes the tmp home
+    // races those writes (`ENOTEMPTY`), which says nothing about the mutex above.
     releaseTick();
     await cleanup();
+    await vi.waitFor(async () => {
+      const status = (await invoke("gc.status")({}, {})) as { lastTickAt: string | null };
+      expect(status.lastTickAt).not.toBeNull();
+    });
   });
 
   it("warns about an unknown peer tier", async () => {

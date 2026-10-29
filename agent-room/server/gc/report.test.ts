@@ -407,7 +407,7 @@ describe("buildReport — shape", () => {
       state,
       garbage,
       reason: `not garbage: ${state}`,
-      action: null,
+      action: "none",
     });
     const report = buildReport(
       input({ agents: [row("live"), row("archived"), row("archived"), row("closed-unarchived"), row("unreadable")] }),

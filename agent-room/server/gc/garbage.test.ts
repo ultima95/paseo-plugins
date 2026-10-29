@@ -84,6 +84,8 @@ function baseSchedule(over: Partial<ScheduleRecord> = {}): ScheduleRecord {
     updatedAt: iso(NOW - 7200),
     updatedEpoch: NOW - 7200,
     lastRunEpoch: NOW - 7200,
+    cadence: "*/2 * * * *",
+    createdAt: iso(NOW - 3 * 86400),
     fires1h: 0,
     fires24h: 2,
     activeRunFail24h: 0,

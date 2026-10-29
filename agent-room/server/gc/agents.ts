@@ -109,6 +109,13 @@ export interface ScheduleRec {
   updatedEpoch: number | null;
   /** `lastRunAt` in epoch seconds (:247). */
   lastRunEpoch: number | null;
+  /**
+   * `.cadence.expression // (.cadence.type + ":" + (.cadence.everyMs|.cadence.interval))`
+   * for an object cadence, else null (:244). Report-only: no rule reads it.
+   */
+  cadence: string | null;
+  /** `createdAt` verbatim (:245), report-only. */
+  createdAt: string | null;
   /** Run timestamps inside the last hour / day (:229, 250-251). */
   fires1h: number;
   fires24h: number;
@@ -350,6 +357,19 @@ function isActiveRunFailure(run: Record<string, unknown>): boolean {
 }
 
 /**
+ * `cadence` as the report prints it (SCHED_JQ:244): an object's `expression`, else
+ * `<type>:<everyMs|interval>`, else null. Report-only — the deletion rule never
+ * reads a cadence, which is why the port could ship without it; the equivalence
+ * harness found the gap (every live schedule row said `null`).
+ */
+function readCadence(value: unknown): string | null {
+  if (!isObject(value)) return null;
+  if (typeof value.expression === "string") return value.expression;
+  const interval = value.everyMs ?? value.interval ?? "";
+  return `${typeof value.type === "string" ? value.type : ""}:${String(interval)}`;
+}
+
+/**
  * One schedule record -> `ScheduleRec` (SCHED_JQ:228-252).
  *
  * The record carries its own `runs` array (that is what SCHED_JQ reads: `(.runs
@@ -407,6 +427,12 @@ function readSchedule(raw: unknown, now: number): ReadResult<ScheduleRec> {
         prompt.startsWith("[supervisor-heartbeat]"),
       updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : null,
       updatedEpoch: isoEpoch(raw.updatedAt),
+      // SCHED_JQ:244-245. A cadence is `{type, expression}` in the daemon's own
+      // records; the report flattens it (`expression`, else `type:` + its interval)
+      // so a screen can print one token. A cadence that is not an object is `null`,
+      // exactly as the reference reads it.
+      cadence: readCadence(raw.cadence),
+      createdAt: typeof raw.createdAt === "string" ? raw.createdAt : null,
       lastRunEpoch: isoEpoch(raw.lastRunAt),
       fires1h: epochs.filter((epoch) => epoch >= now - HOUR).length,
       fires24h: epochs.filter((epoch) => epoch >= now - DAY).length,

@@ -148,7 +148,11 @@ export const ENV_PID_CAP = 64;
 /** `fill_exe`'s `head -n 40` (slp-gc.bash:727): `lsof` lookups per tick. */
 export const EXE_LOOKUP_CAP = 40;
 
-/** `ls -1 "$STATE/reports" | sort -r | tail -n +49` (slp-gc.bash:1327): 48 reports kept. */
+/**
+ * `ls -1 "$STATE/reports" | sort -r | tail -n +49` (slp-gc.bash:1327): 48 reports kept.
+ * A report is one stamp and two files (`.txt` + `.json`), so this is the number of
+ * stamps: see `writeReportFile`.
+ */
 export const REPORTS_KEPT = 48;
 
 /**
@@ -730,8 +734,10 @@ export async function collectProcsPhase(input: ProcsPhaseInput): Promise<ProcsPh
   });
   const table = buildProcTable({ ...common, daemonPid: ident.daemonPid });
 
-  // `$orph` (:399): an unclassified row reparented to launchd. The proof itself
-  // refuses anything else, so the selection is the reference's `select`.
+  // `$orph` (:399): an unclassified row reparented to launchd, **and** named by the
+  // ledger or proven by its env — the reference's `select($led != null or $envProof)`,
+  // applied below before the proof runs. The proof itself refuses anything else, so
+  // the selection is what decides which rows are candidates at all.
   //
   // The three tree inputs are passed **explicitly empty**, not omitted: the
   // reference protects the GC's own tree (`$selfTree`), the invoking agent's
@@ -765,11 +771,28 @@ export async function collectProcsPhase(input: ProcsPhaseInput): Promise<ProcsPh
   for (const row of ps.rows) {
     if (row.ppid !== 1) continue;
     if (classify(row.cmd) !== null) continue;
+    const envFacts = env.get(row.pid) ?? NO_ENV;
+    const ledgerRow = previous.get(ledgerKey(row.pid, row.lstart)) ?? null;
+    // `select($led != null or $envProof)` (:399-402). The reference lists an
+    // unclassified launchd child as an orphan *candidate* only when the lineage
+    // ledger names it or its env proves it belongs to this home
+    // (`$e.home == "match" and $e.agent != null`). Without this gate every system
+    // daemon on the box (ppid 1, no ledger row, an unreadable env) would appear as
+    // an "orphan" — 364 rows on this host against the reference's 0, which is what
+    // the equivalence harness found. Such a row is not a candidate at all: the
+    // proof would refuse it anyway (no ledger executable path), and the report is
+    // the reference's list.
+    if (
+      ledgerRow === null &&
+      !(envFacts.read && envFacts.home === "match" && envFacts.agent !== null)
+    ) {
+      continue;
+    }
     orphans.push(
       orphanDecision({
         row,
-        env: env.get(row.pid) ?? NO_ENV,
-        ledger: previous.get(ledgerKey(row.pid, row.lstart)) ?? null,
+        env: envFacts,
+        ledger: ledgerRow,
         ctx: orphanCtx,
       }),
     );
@@ -1095,8 +1118,10 @@ function agentReportRows(
       state,
       garbage: candidate?.refusedBy === null,
       reason: candidate?.reason ?? "not garbage: no decision",
-      action: candidate?.action ?? null,
-      refusedBy: candidate?.refusedBy ?? null,
+      // `$agentRows`' `action` (:503-519): the delete command on a garbage row, `"none"`
+      // on every other one. Never `null` — the reference's report says `"none"` on all
+      // 298 rows here, which is one of the differences the equivalence harness found.
+      action: candidate?.refusedBy === null ? (candidate.action ?? "none") : "none",
     };
   });
 }
@@ -1123,6 +1148,10 @@ function scheduleReportRows(
     const candidate = byId.get(record.id);
     const targetState =
       record.targetType === "agent" ? agentState(record.targetAgent, agentById, trusted) : "n/a";
+    // `$schedRows`' three report-only arms (:544-547): the anomaly row carries
+    // `anomaly: true` and its own action sentence, and every other refused row says
+    // `"none"`; only a garbage row carries the delete command.
+    const anomaly = candidate?.refusedBy?.startsWith("schedule-anomaly:") === true;
     return {
       category: "schedule" as const,
       path: record.path ?? `schedules/${record.id}.json`,
@@ -1134,8 +1163,8 @@ function scheduleReportRows(
       strict: record.strict,
       targetType: record.targetType,
       targetAgent: record.targetAgent,
-      cadence: null,
-      createdAt: null,
+      cadence: record.cadence,
+      createdAt: record.createdAt,
       updatedAt: record.updatedAt,
       updatedEpoch: record.updatedEpoch,
       lastRunAt: record.lastRunAt,
@@ -1150,9 +1179,14 @@ function scheduleReportRows(
       activeRunFail24h: record.activeRunFail24h,
       targetState,
       garbage: candidate?.refusedBy === null,
+      ...(anomaly ? { anomaly: true } : {}),
       reason: candidate?.reason ?? "not garbage: no decision",
-      action: candidate?.action ?? null,
-      refusedBy: candidate?.refusedBy ?? null,
+      action:
+        candidate?.refusedBy === null
+          ? (candidate.action ?? "none")
+          : anomaly
+            ? "none (report-only in this version)"
+            : "none",
     };
   });
 }
@@ -1368,18 +1402,51 @@ async function readLastReport(stateDir: string): Promise<number> {
   }
 }
 
-/** `ts_now` in the state dir, then the prune to 48 (slp-gc.bash:1325-1327). */
-async function writeReportFile(stateDir: string, now: number, text: string): Promise<void> {
+/**
+ * `ts_now` in the state dir, then the prune to 48 (slp-gc.bash:1325-1327).
+ *
+ * One report stamp owns **two** artifacts: the rendered text the reference writes
+ * (`reports/<stamp>.txt`, `renderReport`) and the JSON the reference prints with
+ * `report --json` (`reports/<stamp>.json`, the assembled `GcReport` at jq's
+ * two-space indent). The port assembles one report object per tick and renders the
+ * text from it; persisting that object is what lets a later reader — the
+ * equivalence harness, or anyone comparing the port with the reference — diff a
+ * tick's report without re-running it. `REPORTS_KEPT` counts *stamps*, so 48
+ * reports are up to 96 files, and the prune removes both artifacts of an expired
+ * stamp together (a JSON left behind would otherwise accumulate one file a tick).
+ */
+async function writeReportFile(stateDir: string, now: number, report: GcReport): Promise<void> {
   const reports = join(stateDir, "reports");
   await mkdir(reports, { recursive: true, mode: 0o700 });
-  await writeFile(join(reports, `${reportStamp(now)}.txt`), text, { encoding: "utf8", mode: 0o600 });
+  const stamp = reportStamp(now);
+  await writeFile(join(reports, `${stamp}.txt`), renderReport(report), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await writeFile(join(reports, `${stamp}.json`), `${JSON.stringify(report, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
   let names: string[];
   try {
-    names = (await readdir(reports)).filter((name) => name.endsWith(".txt")).sort().reverse();
+    names = await readdir(reports);
   } catch {
     return;
   }
-  for (const name of names.slice(REPORTS_KEPT)) {
+  const REPORT_NAME = /^(\d{8}T\d{6}Z)\.(txt|json)$/;
+  const stamps = [
+    ...new Set(
+      names
+        .map((name) => REPORT_NAME.exec(name)?.[1])
+        .filter((value): value is string => value !== undefined),
+    ),
+  ].sort();
+  // Newest 48 stamps survive (the reference's `sort -r | tail -n +49`).
+  const keep = new Set(stamps.reverse().slice(0, REPORTS_KEPT));
+  for (const name of names) {
+    const stampOfName = REPORT_NAME.exec(name)?.[1];
+    // Anything that is not one of this directory's two report artifacts is left alone.
+    if (stampOfName === undefined || keep.has(stampOfName)) continue;
     try {
       await rm(join(reports, name), { force: true });
     } catch {
@@ -1719,7 +1786,7 @@ export async function runTick(
   // only after the file landed, so a failed write retries next tick.
   if (reportDue) {
     await phase(log, "report", async () => {
-      await writeReportFile(deps.stateDir, startedAt, renderReport(report));
+      await writeReportFile(deps.stateDir, startedAt, report);
       await writeFile(join(deps.stateDir, ".last-report"), `${startedAt}\n`, {
         encoding: "utf8",
         mode: 0o600,

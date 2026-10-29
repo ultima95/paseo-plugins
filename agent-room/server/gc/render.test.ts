@@ -123,7 +123,7 @@ function agentRow(state: string, id: string, reason: string, garbage = false) {
     state,
     garbage,
     reason,
-    action: garbage ? `paseo agent delete ${id}` : null,
+    action: garbage ? `paseo agent delete ${id}` : "none",
   };
 }
 
@@ -155,7 +155,7 @@ function scheduleRow(overrides: Record<string, unknown> = {}) {
     targetState: "live",
     garbage: false,
     reason: "protected: target agent is live/unarchived",
-    action: null,
+    action: "none",
     ...overrides,
   } as unknown as GcReport["schedules"][number];
 }
@@ -599,7 +599,7 @@ describe("renderReport — schedules", () => {
     expect(text).toContain(
       "  b555dd4a  active     target agent:2e3e406f (live)  cadence */2 * * * *  runs 7  size 3 KB  fires 1h/24h 7/7  name supervisor: room",
     );
-    expect(text).toContain("      protected: target agent is live/unarchived  | action: null");
+    expect(text).toContain("      protected: target agent is live/unarchived  | action: none");
     expect(text).toContain(
       '      heartbeat health: runs[] 7, failures in the last 24 h 7, "already has an active run" share 100%',
     );

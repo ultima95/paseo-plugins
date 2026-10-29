@@ -440,6 +440,13 @@ export interface DecisionEntry {
   /** Age in seconds; `-1` when unreadable, which fails every minimum. */
   etime_s: number;
   footprint_mb: number;
+  /**
+   * Where `footprint_mb` came from (`:315`, `:431`): a `top` sample or the `rss`
+   * fallback. The rule text prints the number the way jq renders *that* provenance
+   * (see `footprintText`), so a row judged from `rss` says `115 MB` and a row
+   * judged from `top` says `115.0 MB` — the reference's own difference.
+   */
+  footprintSource?: "top" | "rss";
   /** The basename of `argv[0]` — the comm the allowlist compares (slp-gc.bash:311, 373). */
   exe: string;
   /** Why this process must never be signalled, or null. */
@@ -582,7 +589,7 @@ export function overmemDecision(entry: DecisionEntry, ctx: DecisionContext): Dec
   if (entry.footprint_mb <= ctx.killMb) {
     return {
       eligible: false,
-      why: `footprint ${entry.footprint_mb} MB <= ${ctx.killMb} MB`,
+      why: `footprint ${footprintText(entry)} MB <= ${ctx.killMb} MB`,
     };
   }
   if (entry.class === "app-main" || entry.class === "supervisor") {
@@ -651,8 +658,24 @@ export function overmemDecision(entry: DecisionEntry, ctx: DecisionContext): Dec
 
   return {
     eligible: true,
-    why: `footprint ${entry.footprint_mb} MB > ${ctx.killMb} MB`,
+    why: `footprint ${footprintText(entry)} MB > ${ctx.killMb} MB`,
   };
+}
+
+/**
+ * `footprint_mb | tostring` in the reference's rule text (`:361`, `:374`, `:434`,
+ * `:437`), reproduced with jq 1.7's number rendering.
+ *
+ * jq 1.7 keeps a number's **original literal**, so a footprint that arrived as
+ * `top`'s `%.1f` text (`115.0`) prints as `115.0`; the `rss` fallback is *computed*
+ * (`(.rss | tonumber) / 1024 | mb1`, `:285`) and prints as a plain number (`115`).
+ * The two sources are therefore rendered differently on purpose, and the port's
+ * report said `115 MB` for both until the equivalence harness compared the text.
+ */
+function footprintText(entry: { footprint_mb: number; footprintSource?: "top" | "rss" }): string {
+  return entry.footprintSource === "top"
+    ? entry.footprint_mb.toFixed(1)
+    : String(entry.footprint_mb);
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,14 +1103,23 @@ export function orphanDecision(input: OrphanInput): OrphanDecision {
 
   // `overmem` (`:434-437`), in the reference's own order: the threshold is
   // checked before the proof, so a small unproven row reports its footprint.
+  // The text renders the footprint from the same source the row's decision used
+  // (`:434-437` again; see `footprintText`).
+  const footprintEntry = {
+    footprint_mb: footprint,
+    footprintSource: sample === undefined ? ("rss" as const) : ("top" as const),
+  };
   const overmem: Decision =
     footprint <= ctx.killMb
-      ? { eligible: false, why: `footprint ${footprint} MB <= ${ctx.killMb} MB` }
+      ? { eligible: false, why: `footprint ${footprintText(footprintEntry)} MB <= ${ctx.killMb} MB` }
       : !proven
         ? { eligible: false, why }
         : !ctx.identity.ok
           ? { eligible: false, why: `identification failed: ${ctx.identity.why}` }
-          : { eligible: true, why: `proven orphan, footprint ${footprint} MB > ${ctx.killMb} MB` };
+          : {
+              eligible: true,
+              why: `proven orphan, footprint ${footprintText(footprintEntry)} MB > ${ctx.killMb} MB`,
+            };
 
   const entry: OrphanEntry = {
     pid: row.pid,

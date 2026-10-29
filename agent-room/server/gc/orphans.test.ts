@@ -407,7 +407,10 @@ describe("orphanDecision — age, threshold and identification", () => {
     const big = new Map([[500, { mem: 9000, cmprs: 10 }]]);
     const proven = orphanDecision({ row, env: noEnv, ledger, ctx: { ...ctx, top: big } });
     expect(proven.overmem.eligible).toBe(true);
-    expect(proven.overmem.why).toBe("proven orphan, footprint 9000 MB > 4096 MB");
+    // `top` sampled the pid, so the number keeps `%.1f`'s one decimal — the
+    // reference's `footprint_mb | tostring` on a preserved literal (evaluate.ts
+    // `footprintText`). An `rss`-sourced row prints a bare number instead.
+    expect(proven.overmem.why).toBe("proven orphan, footprint 9000.0 MB > 4096 MB");
     const unproven = orphanDecision({ row, env: noEnv, ledger: { ...ledger, exe: "" }, ctx: { ...ctx, top: big } });
     expect(unproven.overmem.eligible).toBe(false);
     expect(unproven.overmem.why).toContain("real executable path not recorded");
@@ -415,7 +418,7 @@ describe("orphanDecision — age, threshold and identification", () => {
     const exact = new Map([[500, { mem: 4096, cmprs: 10 }]]);
     const at = orphanDecision({ row, env: noEnv, ledger, ctx: { ...ctx, top: exact } });
     expect(at.overmem.eligible).toBe(false);
-    expect(at.overmem.why).toBe("footprint 4096 MB <= 4096 MB");
+    expect(at.overmem.why).toBe("footprint 4096.0 MB <= 4096 MB");
     expect(at.stale.eligible).toBe(true);
   });
 

@@ -811,13 +811,11 @@ export interface ReportAgentRow {
   state: string;
   garbage: boolean;
   reason: string;
-  /** The reference's `action` (`"none"`, or a `paseo … delete …` command). */
-  action: string | null;
   /**
-   * The port's stable refusal key (`<rule>: <reference text>`, from `garbageDecisions`), when the
-   * row was judged. Not part of the reference's row; carried so a screen can group by rule.
+   * The reference's `action` (`"none"`, or a `paseo … delete …` command). Never `null`: a row the
+   * rules refused gets the reference's own sentence, exactly as `$agentRows` sets it (:503-519).
    */
-  refusedBy?: string | null;
+  action: string;
 }
 
 /** One schedule row (`$schedRows`, :523-548). */
@@ -853,10 +851,10 @@ export interface ReportScheduleRow {
   targetState: string;
   garbage: boolean;
   reason: string;
-  action: string | null;
+  /** The reference's `action`, never `null` (:530-547); the anomaly row keeps its own sentence. */
+  action: string;
   /** Set on the report-only anomaly row (:546). */
   anomaly?: boolean;
-  refusedBy?: string | null;
 }
 
 /** The `agents` section (`{agents: …}`, :549-556). */

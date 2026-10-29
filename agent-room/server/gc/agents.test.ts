@@ -471,6 +471,31 @@ describe("snapshotSchedules", () => {
     expect(schedules[0].fail24h).toBe(1);
   });
 
+  it("flattens the cadence object and keeps createdAt (SCHED_JQ:244-245)", async () => {
+    // The report's `cadence` is one token, not the record's object: the reference
+    // reads `.cadence.expression`, else `type:` + the interval, and `null` for
+    // anything that is not an object. The port shipped `cadence: null` on every
+    // row until the equivalence harness compared the two reports.
+    const home = await makeHome();
+    await putSchedule(home, "aaaaaaaa.json", schedule({ id: "aaaaaaaa" }));
+    await putSchedule(
+      home,
+      "bbbbbbbb.json",
+      schedule({ id: "bbbbbbbb", cadence: { type: "interval", everyMs: 5000 } }),
+    );
+    await putSchedule(home, "cccccccc.json", schedule({ id: "cccccccc", cadence: "*/5 * * * *" }));
+    await putSchedule(home, "dddddddd.json", schedule({ id: "dddddddd", createdAt: null }));
+
+    const { schedules } = await snapshotSchedules(home, { now: NOW });
+    const byId = new Map(schedules.map((entry) => [entry.id, entry]));
+
+    expect(byId.get("aaaaaaaa")?.cadence).toBe("*/2 * * * *");
+    expect(byId.get("bbbbbbbb")?.cadence).toBe("interval:5000");
+    expect(byId.get("cccccccc")?.cadence).toBeNull();
+    expect(byId.get("aaaaaaaa")?.createdAt).toBe(iso(NOW - 7200));
+    expect(byId.get("dddddddd")?.createdAt).toBeNull();
+  });
+
   it("detects room machinery by name and by heartbeat prompt", async () => {
     const home = await makeHome();
     await putSchedule(home, "11111111.json", schedule({ id: "11111111", name: "supervisor: nightly" }));

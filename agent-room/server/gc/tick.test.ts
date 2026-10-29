@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,6 +13,7 @@ import {
   collectProcsPhase,
   emptyStatus,
   NO_SELF_PID,
+  reportStamp,
   runTick,
   type TickDeps,
 } from "./tick";
@@ -266,6 +267,46 @@ describe("runTick", () => {
     expect(result.nextReportAt).toBe(
       new Date((NOW + 3600) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z"),
     );
+  });
+
+  it("writes the report's JSON beside its text, one stamp for both", async () => {
+    const test = await harness();
+
+    const result = await runTick(test.deps);
+
+    const stamp = reportStamp(NOW);
+    const reports = join(test.deps.stateDir, "reports");
+    // The reference's two artifacts of one report: the rendered text and the JSON
+    // its `report --json` prints. The JSON is the assembled object, nothing rendered.
+    expect(await readFile(join(reports, `${stamp}.txt`), "utf8")).toContain("slp-gc report");
+    expect(JSON.parse(await readFile(join(reports, `${stamp}.json`), "utf8"))).toEqual(
+      result.report,
+    );
+  });
+
+  it("prunes expired report stamps with both artifacts, and touches nothing else", async () => {
+    const test = await harness();
+    const reports = join(test.deps.stateDir, "reports");
+    await mkdir(reports, { recursive: true, mode: 0o700 });
+    // 48 old stamps (`REPORTS_KEPT`) plus this tick's = 49, so exactly the oldest
+    // stamp must go. The oldest carries both artifacts; the next one still keeps its text.
+    const stamps = Array.from(
+      { length: 48 },
+      (_, index) => `20260101T${String(index).padStart(6, "0")}Z`,
+    );
+    for (const stamp of stamps) await writeFile(join(reports, `${stamp}.txt`), "old\n", "utf8");
+    await writeFile(join(reports, `${stamps[0]}.json`), "{}\n", "utf8");
+    await writeFile(join(reports, "notes.md"), "not a report\n", "utf8");
+
+    await runTick(test.deps);
+
+    const names = await readdir(reports);
+    expect(names).not.toContain(`${stamps[0]}.txt`);
+    expect(names).not.toContain(`${stamps[0]}.json`);
+    expect(names).toContain(`${stamps[1]}.txt`);
+    expect(names).toContain(`${reportStamp(NOW)}.txt`);
+    expect(names).toContain(`${reportStamp(NOW)}.json`);
+    expect(names).toContain("notes.md");
   });
 
   it("retries a migration that failed, because it never claims to have run", async () => {
