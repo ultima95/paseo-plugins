@@ -1,6 +1,6 @@
 // The per-process half of the GC port: the process table the reference builds
-// after classification (protection, ownership, footprint) and the two decision
-// rules that read it — staleness and over-memory.
+// after classification (protection, ownership, footprint) and the three decision
+// rules that read it — staleness, over-memory and the orphan proof.
 //
 // Reference (`agent-room/docs/gc-port/slp-gc.bash`, byte-identical to the
 // deployed copy):
@@ -13,6 +13,10 @@
 //   stale rule              slp-gc.bash:345-359
 //   over-memory rule        slp-gc.bash:360-374
 //   `underDaemon` / `warn`  slp-gc.bash:346, 375
+//   `ost` (owner state)     slp-gc.bash:390-391
+//   `$blindAgents`          slp-gc.bash:392, 474
+//   `ldead` / `olive`       slp-gc.bash:393-398
+//   `$orph` (orphan proof)  slp-gc.bash:399-437
 //
 // Two properties matter more than tidiness:
 //
@@ -54,6 +58,7 @@ import type {
   IdentityFacts,
   ProcClassValue,
 } from "./identity";
+import { ledgerKey, type LedgerRow } from "./ledger";
 
 /**
  * Agent classes whose process *is* an agent (`agentish`, slp-gc.bash:277): the
@@ -641,4 +646,440 @@ export function overmemDecision(entry: DecisionEntry, ctx: DecisionContext): Dec
     eligible: true,
     why: `footprint ${entry.footprint_mb} MB > ${ctx.killMb} MB`,
   };
+}
+
+// ---------------------------------------------------------------------------
+// The orphan proof (slp-gc.bash:390-437)
+// ---------------------------------------------------------------------------
+//
+// Everything above judges a row that classification gave a class to. The orphan
+// block judges the one kind of row that has **none**: a `ppid == 1` process that
+// no longer has an agent ancestor to explain it. It is the rule that must never
+// signal a live process, so it proves its subject dead from three independent
+// sources — the lineage ledger (`pid+lstart`), the agent index, and the process
+// table — and refuses on the first one that cannot answer.
+//
+// The two decision rules above are *not* reused for it, and the reference does
+// not reuse them either (`:433-437`): an orphan entry's class is the literal
+// `"orphan"`, which both of those rules refuse at their class arm, and their
+// remaining arms (PASEO_HOME, daemon descent, the `.app`/comm arms) are already
+// folded into the proof. What *is* shared is the vocabulary: `Decision`, the
+// `identification failed: …` sentence, the threshold sentence and `baseName`.
+//
+// Two properties matter more than tidiness:
+//
+// 1. **The order is the proof** (`:419-426`): protection, an env/ledger owner
+//    contradiction, a missing recorded executable, the comm allowlist, the
+//    dead-owner proof, `orphanedAt == 0`, the minimum age, then proven. Every arm
+//    before the last one is a refusal, and the dead-owner arm is the only place
+//    the agent index and the process table have to agree.
+// 2. **`ldead` fails closed at every unknown** (`:393-395`): no owner, an
+//    unreadable environment anywhere in the agent family, an index that is empty
+//    or incomplete, a record that says `live` — each one means "treat the owner
+//    as live", and a live owner is never an orphan.
+//
+// Nothing here reads a clock or a process table: `now`, the ledger row, the env
+// verdict, the agent index and the built table all arrive as values. Task 12 owns
+// `ps`, `lsof`, the environment reads and the tick's own timing.
+
+/**
+ * One row of the built table, as the orphan proof reads it — the reference's
+ * `$procs` (`:304-320`) narrowed to the five fields `ost`, `$blindAgents`,
+ * `ldead` and the `pid:` live check consult. A `ProcEntry` satisfies it as is.
+ */
+export interface OrphanTableRow {
+  pid: number;
+  /** `ps`'s `lstart`, whitespace-collapsed. Part of the ledger's identity. */
+  lstart: string;
+  class: ProcClassValue | null;
+  /** `PASEO_AGENT_ID` of the row or of its nearest agent-class ancestor. */
+  owner: string | null;
+  /** Whether the row's environment could be read at all. */
+  envRead: boolean;
+}
+
+/**
+ * Everything the orphan proof reads beyond the row, its env verdict and its
+ * ledger row. Named after the reference's jq arguments, like `DecisionContext`.
+ *
+ * The optional fields are the ones the reference computes from inputs a single
+ * row cannot carry. Each defaults to the reading its own doc states: the two that
+ * can only *withhold* a proof (`agents`, `agentIndexOk`) default to the closed
+ * answer, and the one that can *widen* one (`procs`) is documented as the tick's
+ * table, which Task 12 must pass.
+ */
+export interface OrphanContext {
+  /** `$now`: epoch seconds, read once by the caller. */
+  now: number;
+  /** `$idt` — the identification the orphan's own stale/over-memory answers carry. */
+  identity: IdentityFacts;
+  /** `$killMb`: `SLP_GC_MEM_KILL_MB`. */
+  killMb: number;
+  /** `$oc` (`$orphanComms`): the comms an orphan descendant may be signalled by. */
+  killComms: readonly string[];
+  /** `$warnMb`: `SLP_GC_MEM_WARN_MB`, reported as `warn` and read by no arm. */
+  warnMb: number;
+  /** `SLP_GC_ORPHAN_MIN_AGE_MIN`; the reference multiplies it by 60 (`:785`). */
+  orphanMinAgeMin: number;
+  /**
+   * `$agentIdx`, reduced to the records that parsed (`map(select(.ok))`, `:290`).
+   * An **empty** index is `unknown`, never `missing` (`:390`) — a GC that could
+   * not read the index learns nothing about its agents.
+   */
+  agents: readonly AgentOwner[];
+  /**
+   * Whether the index was complete (`$nbad == 0`, `:291`). **Defaults to
+   * `false`**, so a `missing` record — the only owner state that helps prove an
+   * agent is gone — has to be opted into by a caller that checked the index.
+   */
+  agentIndexOk?: boolean;
+  /** `$topBy`: the `top` sample, when it had a row for the pid. */
+  top?: ReadonlyMap<number, TopRow>;
+  /**
+   * `$procs`: the built table (`buildProcTable().procs`). Three answers depend on
+   * it — the agent-class owner scan in `ldead` (`:395`), `$blindAgents` (`:392`)
+   * and the live half of a `pid:<n>@<lstart>` owner (`:394`).
+   *
+   * `$liveSet` is built from every `ps` row in the reference (`:343`); only a row
+   * with that exact pid *and* lstart can answer it, and such a row is the agent
+   * process the `pid:` owner names — an `agentish` row with a class of its own,
+   * which is always in `$ours` and therefore always in `procs`. So the built
+   * table answers the question exactly.
+   *
+   * **Absent means an empty table**: no agent-class process carries any owner and
+   * no `pid:` owner is live. That is right for a tick that saw no agents and
+   * wrong for a caller that merely forgot the table, so Task 12 must pass it.
+   */
+  procs?: readonly OrphanTableRow[];
+  /** `$invoker`: the invoking agent's id, or null/"" when the GC was run by hand. */
+  invoker?: string | null;
+  /** `$invOwnerPid`: `pid:<n>@<lstart>` of the invoking agent, or null. */
+  invOwnerPid?: string | null;
+  /** `$invSub`: the invoking agent's process subtree. */
+  invTree?: readonly number[];
+  /** `$selfTree`: the GC's own process tree, ancestry plus descendants. */
+  selfTree?: readonly number[];
+  /**
+   * `$blindAgents`: some `agentfam` row's environment could not be read (`:392`).
+   *
+   * Passed **in addition to** `procs`, never instead of it: blindness is the or
+   * of both, so a caller can only ever add a refusal here. Task 12 computes it as
+   * `procs.some(p => isAgentFamily(p.class) && !p.envRead)` (the reference's own
+   * expression) or hands in the table and lets this function derive it.
+   */
+  blindAgentPresent?: boolean;
+}
+
+/**
+ * One orphan entry — the reference's `$orph` object (`:427-437`), field for field.
+ *
+ * `class` is the literal `"orphan"` (it is not a product of `classify`),
+ * `ownerState` is always null (an orphan's owner state is answered by the proof,
+ * not by the record alone) and `underDaemon` is always false: a row under the
+ * daemon would have a `Paseo` ancestor and therefore a class.
+ */
+export interface OrphanEntry {
+  pid: number;
+  ppid: number;
+  pgid: number;
+  lstart: string;
+  etime_s: number;
+  class: "orphan";
+  /** The basename of the real executable — `comm` (`:405`, `:427`). */
+  exe: string;
+  comm: string;
+  owner: string | null;
+  ownerState: null;
+  proof: "ledger" | "env";
+  /** `$oat`: the ledger's ppid-1 first-seen, or 0 while it is not recorded. */
+  orphanedAt: number;
+  /** `$rexe`: the real executable path from the ledger, or "" when unrecorded. */
+  exePath: string;
+  envRead: boolean;
+  home: HomeState;
+  rss_mb: number;
+  mem_mb: number | null;
+  cmprs_mb: number | null;
+  footprint_mb: number;
+  footprintSource: "top" | "rss";
+  cmd: string;
+  protected: string | null;
+  proven: boolean;
+  underDaemon: false;
+  warn: boolean;
+  /** `hint` is the reference's placeholder for a future remediation (`:432`). */
+  hint: null;
+  stale: Decision;
+  overmem: Decision;
+}
+
+/** The three values `orphanDecision` answers with, plus the entry they describe. */
+export interface OrphanDecision {
+  entry: OrphanEntry;
+  /** `$led != null ? "ledger" : "env"` (`:428`) — the *source*, not a proof. */
+  proof: "ledger" | "env";
+  /** `$orph[].stale` (`:433`). */
+  stale: Decision;
+  /** `$orph[].overmem` (`:434-437`). */
+  overmem: Decision;
+}
+
+export interface OrphanInput {
+  /** An unclassified `ps` row the caller saw at `ppid == 1` (`:399`). */
+  row: ProcRow;
+  /** `$envBy[pid]`, or the reference's default `{agent: null, home: "none", read: false}`. */
+  env: EnvFacts;
+  /** `$ledBy[pid|lstart]` — the proof row, when the ledger has one (`:401`). */
+  ledger?: LedgerRow | null;
+  ctx: OrphanContext;
+}
+
+/**
+ * The orphan proof (slp-gc.bash:399-437).
+ *
+ * The reference's per-row block, in its own order:
+ *
+ * | # | Arm | Reference |
+ * |---|---|---|
+ * | — | candidate: no class of its own, `ppid == 1` | `:399` (the `select`) |
+ * | 1 | protection: own tree, invoking agent, invoking agent's pid owner, invoking agent's subtree, `.app` bundle, `/System`/`/Library` | `:411-417`, `:419` |
+ * | 2 | the current env contradicts the ledger owner | `:420` |
+ * | 3 | no real executable path recorded in the ledger | `:421` |
+ * | 4 | the recorded comm is not in `SLP_GC_KILL_COMMS` | `:422` |
+ * | 5 | `ldead($owner)` — the owner is treated as live (fail closed) | `:423` |
+ * | 6 | `orphanedAt == 0`: no ledger ppid-1 first-seen yet | `:424` |
+ * | 7 | `now - orphanedAt < SLP_GC_ORPHAN_MIN_AGE_MIN * 60` | `:425` |
+ * | 8 | proven | `:426` |
+ *
+ * Arms 1-7 are refusals. Protection comes first because it is the only arm that
+ * needs nothing but the row; the owner contradiction comes next because a ledger
+ * row and an env that name two different agents prove nothing about either; and
+ * the dead-owner arm comes after the cheap syntactic arms so that a process we
+ * would never signal costs no owner lookup.
+ *
+ * The candidate check is the reference's `select` (`:399`, `:403`), which drops
+ * a row rather than judging it. Here it refuses instead, so a caller that hands
+ * in every `ppid == 1` row it saw gets an answer for each one and can never
+ * mistake a dropped row for a proven one. Its two sentences are the only strings
+ * in this function the reference does not itself emit, and no input the reference
+ * would have judged can reach them.
+ */
+export function orphanDecision(input: OrphanInput): OrphanDecision {
+  const { row, env, ctx } = input;
+  const ledger = input.ledger ?? null;
+  const procs = ctx.procs ?? [];
+  const top = ctx.top ?? new Map<number, TopRow>();
+  const invoker = ctx.invoker === null || ctx.invoker === undefined || ctx.invoker === ""
+    ? null
+    : ctx.invoker;
+  const invOwnerPid = ctx.invOwnerPid ?? null;
+  const selfTree = ctx.selfTree ?? [];
+  const invTree = ctx.invTree ?? [];
+  const agentIndexOk = ctx.agentIndexOk ?? false;
+  // `--argjson orphanMinAge $((ORPHAN_MIN_AGE_MIN * 60))` (slp-gc.bash:785).
+  const orphanMinAge = ctx.orphanMinAgeMin * 60;
+
+  const proof: "ledger" | "env" = ledger !== null ? "ledger" : "env";
+  // `$led.exe // ""` (`:404`). Without a ledger row there is no recorded
+  // executable, and the arm below refuses on exactly that — an env proof seeds
+  // the ledger (`:464-465`) and never kills on its own.
+  const exePath = ledger?.exe ?? "";
+  // `if $rexe != "" then base($rexe) else ($r.cmd | split(" ") | .[0] | base)` (`:405`).
+  const comm = exePath !== "" ? baseName(exePath) : baseName(row.cmd.split(" ")[0] ?? "");
+  // `($r.cmd | split(" -") | .[0])` (`:406`): the executable part of the command.
+  const exe = row.cmd.split(" -")[0] ?? "";
+  // `def fp` (`:377`): `top`'s footprint when it sampled the pid, else `rss`.
+  const sample = top.get(row.pid);
+  const footprint = sample === undefined ? row.rss_mb : sample.mem;
+  // `($led.owner // $e.agent)` (`:408`): the ledger's owner wins when it has one.
+  const owner = ledger?.owner ?? env.agent;
+  // `if $led != null then ($led.orphaned // 0) else 0 end` (`:409`).
+  const orphanedAt = ledger === null ? 0 : (ledger.orphaned ?? 0);
+
+  // `$ownerBy` (`:290`), first record wins, exactly as `buildProcTable` builds it.
+  const ownerBy = new Map<string, "archived" | "live">();
+  for (const rec of ctx.agents) {
+    if (ownerBy.has(rec.id)) continue;
+    ownerBy.set(rec.id, rec.archivedAt !== null ? "archived" : "live");
+  }
+
+  /** `def ost($o)` (slp-gc.bash:390-391). */
+  const ownerState = (id: string | null): OwnerState | null => {
+    if (id === null) return null;
+    // An empty index (or one whose every record failed to parse) is `unknown`:
+    // a GC that could not read the index has learned nothing about its agents.
+    if (ctx.agents.length === 0) return "unknown";
+    // `missing` proves the agent is gone, so it needs a complete index.
+    return ownerBy.get(id) ?? (agentIndexOk ? "missing" : "unknown");
+  };
+
+  // `$blindAgents` (`:392`): any `agentfam` row whose environment could not be
+  // read. Both sources can only add blindness, never clear it.
+  const blind =
+    ctx.blindAgentPresent === true ||
+    procs.some((proc) => isAgentFamily(proc.class) && !proc.envRead);
+
+  // `$liveSet`'s keys, as the built table can answer them (see `OrphanContext.procs`).
+  const liveKeys = new Set(procs.map((proc) => ledgerKey(proc.pid, proc.lstart)));
+
+  /**
+   * `def ldead($o)` (slp-gc.bash:393-395): can this owner be proven gone?
+   *
+   * Every unknown answers `false`, which the decision reads as "live":
+   *
+   * - a blind agent family (`:393`) — any agent-class process with an unreadable
+   *   env might be the owner we are asking about, so no owner is dead;
+   * - no owner at all;
+   * - a `pid:<n>@<lstart>` owner, unless no live row carries that pid *and* start
+   *   time (`:394`) — the start time is what makes a recycled pid dead;
+   * - an agent id, unless the record says `archived`/`missing` **and** no
+   *   agent-class process still carries that id (`:395`). `live` and `unknown`
+   *   both refuse: a record is the only thing that can prove an agent gone.
+   */
+  const deadOwner = (id: string | null): boolean => {
+    if (blind) return false;
+    if (id === null) return false;
+    if (id.startsWith("pid:")) {
+      // `$o | ltrimstr("pid:") | split("@") | (.[0] + "|" + (.[1:] | join("@")))`.
+      // A non-canonical token (`pid:07@…`) can only make the answer more
+      // conservative: the ledger validates the token as digits, so the number is
+      // exact for every row the reference would have kept.
+      const [pidPart, ...rest] = id.slice("pid:".length).split("@");
+      return !liveKeys.has(ledgerKey(Number(pidPart), rest.join("@")));
+    }
+    const state = ownerState(id);
+    return (
+      (state === "archived" || state === "missing") &&
+      !procs.some((proc) => isAgentChild(proc.class) && proc.owner === id)
+    );
+  };
+
+  /** `$prot` (slp-gc.bash:411-417), in the reference's order. */
+  const protectedBy = ((): string | null => {
+    if (selfTree.includes(row.pid)) return "in the GC's own process tree";
+    if (invoker !== null && owner === invoker) return "belongs to the invoking agent";
+    if (invOwnerPid !== null && owner === invOwnerPid) {
+      return "belongs to the invoking agent (from slp-gc's own ancestry)";
+    }
+    if (invTree.includes(row.pid)) return "in the invoking agent's process subtree";
+    if (/\.app\//.test(exe) || /\.app\//.test(exePath)) {
+      return "executable inside an .app bundle (GUI app / service): never garbage";
+    }
+    if (/^\/(?:System|Library)\//.test(exe) || /^\/(?:System|Library)\//.test(exePath)) {
+      return "executable under /System or /Library (system service): never garbage";
+    }
+    return null;
+  })();
+
+  /** `$ov` (slp-gc.bash:418-426): the proof, or the first arm that refused it. */
+  const verdict = ((): { proven: boolean; why: string } => {
+    // The reference's `select` (`:399`): neither a class of its own nor `ppid 1`
+    // is an orphan descendant. Refused rather than dropped — see the doc above.
+    const own = classify(row.cmd);
+    if (own !== null) {
+      return {
+        proven: false,
+        why: `not an orphan: the row is classified "${own}" (an orphan has no class of its own)`,
+      };
+    }
+    if (row.ppid !== 1) {
+      return {
+        proven: false,
+        why: `not an orphan: ppid ${row.ppid} (an orphan is reparented to launchd, ppid 1)`,
+      };
+    }
+    if (protectedBy !== null) return { proven: false, why: `protected: ${protectedBy}` };
+    if (ledger !== null && env.agent !== null && env.agent !== ledger.owner) {
+      return {
+        proven: false,
+        why: `the current env PASEO_AGENT_ID ${env.agent} contradicts the ledger owner ${ledger.owner}: no proof`,
+      };
+    }
+    if (exePath === "") {
+      return {
+        proven: false,
+        why: "real executable path not recorded in the ledger (needs the ledger row from a record tick): no proof",
+      };
+    }
+    if (!ctx.killComms.includes(comm)) {
+      return {
+        proven: false,
+        why: `report only: executable "${exePath}" (comm "${comm}") is not in SLP_GC_KILL_COMMS`,
+      };
+    }
+    if (!deadOwner(owner)) {
+      return {
+        proven: false,
+        why: `owner ${owner ?? "?"} is treated as LIVE (fail closed): it is dead only if its record is archived or missing (a valid record, not unknown) or its pid:N@lstart child is gone, and no agent-class process may have an unreadable env: not an orphan`,
+      };
+    }
+    if (orphanedAt === 0) {
+      return {
+        proven: false,
+        why: "orphaned-at not recorded yet (no ledger ppid-1 first-seen): waits for the next record tick",
+      };
+    }
+    if (ctx.now - orphanedAt < orphanMinAge) {
+      return { proven: false, why: `orphaned ${ctx.now - orphanedAt}s ago < ${orphanMinAge}s` };
+    }
+    return {
+      proven: true,
+      why: `orphaned agent descendant: ppid 1, proven by ${
+        ledger !== null ? "the lineage ledger (pid+lstart)" : "env PASEO_HOME + PASEO_AGENT_ID"
+      }, owner not live, comm ${comm}, orphaned ${ctx.now - orphanedAt}s >= ${orphanMinAge}s`,
+    };
+  })();
+
+  const proven = verdict.proven;
+  const why = verdict.why;
+
+  // `stale` (`:433`): the proof, refused outright when identification failed.
+  const stale: Decision =
+    proven && !ctx.identity.ok
+      ? { eligible: false, why: `identification failed: ${ctx.identity.why}` }
+      : { eligible: proven, why };
+
+  // `overmem` (`:434-437`), in the reference's own order: the threshold is
+  // checked before the proof, so a small unproven row reports its footprint.
+  const overmem: Decision =
+    footprint <= ctx.killMb
+      ? { eligible: false, why: `footprint ${footprint} MB <= ${ctx.killMb} MB` }
+      : !proven
+        ? { eligible: false, why }
+        : !ctx.identity.ok
+          ? { eligible: false, why: `identification failed: ${ctx.identity.why}` }
+          : { eligible: true, why: `proven orphan, footprint ${footprint} MB > ${ctx.killMb} MB` };
+
+  const entry: OrphanEntry = {
+    pid: row.pid,
+    ppid: row.ppid,
+    pgid: row.pgid,
+    lstart: row.lstart,
+    etime_s: row.etime_s,
+    class: "orphan",
+    exe: comm,
+    comm,
+    owner,
+    ownerState: null,
+    proof,
+    orphanedAt,
+    exePath,
+    envRead: env.read,
+    home: env.read ? env.home : "unreadable",
+    rss_mb: row.rss_mb,
+    mem_mb: sample === undefined ? null : sample.mem,
+    cmprs_mb: sample === undefined ? null : sample.cmprs,
+    footprint_mb: footprint,
+    footprintSource: sample === undefined ? "rss" : "top",
+    cmd: row.cmd,
+    protected: protectedBy,
+    proven,
+    underDaemon: false,
+    warn: footprint >= ctx.warnMb,
+    hint: null,
+    stale,
+    overmem,
+  };
+
+  return { entry, proof, stale, overmem };
 }
