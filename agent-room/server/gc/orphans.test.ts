@@ -8,7 +8,7 @@
 // `docs/gc-port/slp-gc.bash`; the line numbers in the comments are its.
 import { describe, expect, it } from "vitest";
 
-import type { EnvFacts, OrphanContext } from "./evaluate";
+import type { EnvFacts, OrphanContext, OrphanTableRow } from "./evaluate";
 import { orphanDecision } from "./evaluate";
 import type { LedgerRow } from "./ledger";
 import type { ProcRow } from "./procs";
@@ -28,19 +28,27 @@ const ledger: LedgerRow = {
 const noEnv: EnvFacts = { agent: null, home: "none", read: false };
 
 /**
- * The brief's `ctx`, minus one correction (slp-gc.bash:390): the reference reads
- * an **empty** agent index as `unknown`, never as `missing`, so with `agents: []`
- * no owned orphan can be proven dead. The brief's first case expected a proof
- * from exactly that shape; `ctx` below therefore carries the owner's archived
- * record, and `briefCtx` is kept to pin the empty-index refusal (see
- * "treats an empty agent index as unknown"). Same class of adjustment as the
- * Task 6 report's concern 1 — the reference wins, the brief's intent is kept.
+ * The brief's `ctx`, with the two corrections the port forced:
+ *
+ * 1. (slp-gc.bash:390) the reference reads an **empty** agent index as `unknown`,
+ *    never as `missing`, so with `agents: []` no owned orphan can be proven dead.
+ *    The brief's first case expected a proof from exactly that shape; `ctx` below
+ *    therefore carries the owner's archived record, and `briefCtx` is kept to pin
+ *    the empty-index refusal (see "treats an empty agent index as unknown"). Same
+ *    class of adjustment as the Task 6 report's concern 1 — the reference wins,
+ *    the brief's intent is kept.
+ * 2. `procs: []` — the brief's `ctx` omitted the process table, which the fix
+ *    round made **required** (`OrphanContext.procs`): absent, it cleared three
+ *    owner guards at once. `[]` is the reading the brief's cases were written
+ *    against (a tick that saw no agent-class process); an explicitly `undefined`
+ *    table is its own refusal, pinned by "refuses an explicitly absent process
+ *    table".
  */
 const briefCtx: OrphanContext = {
   now: NOW,
   identity: { ok: true, why: "ok", daemonPid: 200, appPid: 100, supervisorPid: 150 },
   killMb: 4096, killComms: ["node"], warnMb: 3072, orphanMinAgeMin: 10,
-  agents: [], top: new Map(), invoker: null, invTree: [], selfTree: [],
+  agents: [], procs: [], top: new Map(), invoker: null, invTree: [], selfTree: [],
 };
 const archivedOwner = [{ id: OWNER, archivedAt: "2026-10-01T00:00:00.000Z" }];
 const ctx: OrphanContext = { ...briefCtx, agents: archivedOwner };
@@ -200,6 +208,51 @@ describe("orphanDecision — the proof chain", () => {
     expect(d.stale.eligible).toBe(true);
   });
 
+  it("holds a pid:<n>@<lstart> owner live when an agent-class env is unreadable", () => {
+    // `$blindAgents` is the **first** line of `ldead` (`:393`), ahead of the
+    // `pid:` arm (`:394`): a blind agent family makes every owner live, including
+    // one whose process the table cannot find. The sighted call below proves that
+    // this owner *is* dead by the `pid:` arm alone, so only the blind guard can be
+    // what refuses the other two.
+    const pidOwner = `pid:700@${LSTART}`;
+    const pidLedger = { ...ledger, owner: pidOwner };
+    const sighted = orphanDecision({ row, env: noEnv, ledger: pidLedger, ctx });
+    expect(sighted.stale.eligible).toBe(true);
+    expect(sighted.entry.owner).toBe(pidOwner);
+    // 700 never appears in either table below, so the `pid:` arm answers "gone".
+    const blindRow = { pid: 501, lstart: LSTART, class: "claude-child" as const, owner: OWNER, envRead: false };
+    const flagged = orphanDecision({
+      row, env: noEnv, ledger: pidLedger, ctx: { ...ctx, blindAgentPresent: true },
+    });
+    const derived = orphanDecision({
+      row, env: noEnv, ledger: pidLedger, ctx: { ...ctx, procs: [blindRow] },
+    });
+    for (const d of [flagged, derived]) {
+      expect(d.stale.eligible).toBe(false);
+      expect(d.entry.proven).toBe(false);
+      expect(d.stale.why).toContain("treated as LIVE (fail closed)");
+    }
+  });
+
+  it("proves the owner dead before it reads orphaned-at", () => {
+    // Arms 5 and 6 in the reference's order (`:423`, then `:424`). A live owner
+    // *and* an unrecorded `orphanedAt` are both refusals; the dead-owner arm
+    // answers first, so the operator is told about the owner, not the ledger.
+    const agents = [{ id: OWNER, archivedAt: null }];
+    const d = orphanDecision({
+      row, env: noEnv, ledger: { ...ledger, orphaned: 0 }, ctx: { ...ctx, agents },
+    });
+    expect(d.stale.eligible).toBe(false);
+    expect(d.stale.why).toContain("treated as LIVE (fail closed)");
+    expect(d.stale.why).not.toContain("not recorded yet");
+    // The same `orphanedAt` with a dead owner reaches the orphaned-at arm: the
+    // two arms are distinguishable, which is what makes the order observable.
+    const dead = orphanDecision({ row, env: noEnv, ledger: { ...ledger, orphaned: 0 }, ctx });
+    expect(dead.stale.why).toBe(
+      "orphaned-at not recorded yet (no ledger ppid-1 first-seen): waits for the next record tick",
+    );
+  });
+
   it("refuses a ledger row with no owner at all", () => {
     // Defensive: `validateLedger` never lets such a row through, so this pins the
     // fail-closed answer for a caller that skipped it. `ldead(null)` is false.
@@ -209,13 +262,46 @@ describe("orphanDecision — the proof chain", () => {
     expect(d.stale.why).toContain("treated as LIVE (fail closed)");
   });
 
-  it("reads an absent table as an empty one", () => {
-    // The documented default of `OrphanContext.procs`: a tick that hands in no
-    // table saw no agent-class process. Task 12 must pass `buildProcTable().procs`
-    // (see the context's doc); this pin keeps the default from being a surprise.
+  it("proves through an empty table and refuses a table that carries the owner", () => {
+    // An empty table is the tick that saw no agent-class process: nothing is blind
+    // and no `pid:` owner is live, so the archived record stands. A table that
+    // carries the owner is the reason the empty one is not the default.
     expect(orphanDecision({ row, env: noEnv, ledger, ctx }).entry.proven).toBe(true);
     const carrying = { pid: 800, lstart: LSTART, class: "claude-child" as const, owner: OWNER, envRead: true };
     expect(orphanDecision({ row, env: noEnv, ledger, ctx: { ...ctx, procs: [carrying] } }).entry.proven).toBe(false);
+  });
+
+  it("refuses an explicitly absent process table (undefined is not empty)", () => {
+    // `procs` is required in the type, but a JavaScript caller can still forward
+    // `undefined` (`procs: someOptionalTable`). An absent table would clear three
+    // owner guards at once — blindness, a live `pid:` owner and an agent-class
+    // carrier — so it is a refusal, and the only new `why` sentence in the port.
+    const absent = { ...ctx, procs: undefined as unknown as readonly OrphanTableRow[] };
+    const d = orphanDecision({ row, env: noEnv, ledger, ctx: absent });
+    expect(d.entry.proven).toBe(false);
+    expect(d.stale.eligible).toBe(false);
+    expect(d.stale.why).toContain("missing process table");
+    // Every arm that answers from the row, the env and the ledger alone keeps its
+    // own sentence: the table is refused only just before the arm that needs it.
+    const protectedAbsent = orphanDecision({ row, env: noEnv, ledger, ctx: { ...absent, selfTree: [500] } });
+    expect(protectedAbsent.stale.why).toBe("protected: in the GC's own process tree");
+    expect(
+      orphanDecision({ row, env: noEnv, ledger: { ...ledger, exe: "" }, ctx: absent }).stale.why,
+    ).toContain("real executable path not recorded in the ledger");
+    // A `pid:` owner is dead *only if* the table cannot find it, so the absent
+    // table refuses there too rather than guessing `gone`.
+    const pidLedger = { ...ledger, owner: `pid:700@${LSTART}` };
+    const pid = orphanDecision({ row, env: noEnv, ledger: pidLedger, ctx: absent });
+    expect(pid.entry.proven).toBe(false);
+    expect(pid.stale.why).toContain("missing process table");
+    // Over-memory keeps its threshold arm first (`:434`), then reports the refusal.
+    const big = new Map([[500, { mem: 9000, cmprs: 10 }]]);
+    const mem = orphanDecision({ row, env: noEnv, ledger, ctx: { ...absent, top: big } });
+    expect(mem.overmem.eligible).toBe(false);
+    expect(mem.overmem.why).toContain("missing process table");
+    expect(
+      orphanDecision({ row, env: noEnv, ledger: { ...ledger, exe: "" }, ctx: absent }).overmem.why,
+    ).toBe("footprint 40 MB <= 4096 MB");
   });
 
   it("refuses a wait helper with an unreadable env in the table", () => {

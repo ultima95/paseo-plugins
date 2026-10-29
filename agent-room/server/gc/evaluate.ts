@@ -669,10 +669,10 @@ export function overmemDecision(entry: DecisionEntry, ctx: DecisionContext): Dec
 // Two properties matter more than tidiness:
 //
 // 1. **The order is the proof** (`:419-426`): protection, an env/ledger owner
-//    contradiction, a missing recorded executable, the comm allowlist, the
-//    dead-owner proof, `orphanedAt == 0`, the minimum age, then proven. Every arm
-//    before the last one is a refusal, and the dead-owner arm is the only place
-//    the agent index and the process table have to agree.
+//    contradiction, a missing recorded executable, the comm allowlist, a missing
+//    process table, the dead-owner proof, `orphanedAt == 0`, the minimum age, then
+//    proven. Every arm before the last one is a refusal, and the dead-owner arm is
+//    the only place the agent index and the process table have to agree.
 // 2. **`ldead` fails closed at every unknown** (`:393-395`): no owner, an
 //    unreadable environment anywhere in the agent family, an index that is empty
 //    or incomplete, a record that says `live` — each one means "treat the owner
@@ -705,8 +705,8 @@ export interface OrphanTableRow {
  * The optional fields are the ones the reference computes from inputs a single
  * row cannot carry. Each defaults to the reading its own doc states: the two that
  * can only *withhold* a proof (`agents`, `agentIndexOk`) default to the closed
- * answer, and the one that can *widen* one (`procs`) is documented as the tick's
- * table, which Task 12 must pass.
+ * answer, and `procs` — the one input whose absence could *widen* a proof — is
+ * required rather than defaulted, so it can never be forgotten.
  */
 export interface OrphanContext {
   /** `$now`: epoch seconds, read once by the caller. */
@@ -740,17 +740,16 @@ export interface OrphanContext {
    * it — the agent-class owner scan in `ldead` (`:395`), `$blindAgents` (`:392`)
    * and the live half of a `pid:<n>@<lstart>` owner (`:394`).
    *
-   * `$liveSet` is built from every `ps` row in the reference (`:343`); only a row
-   * with that exact pid *and* lstart can answer it, and such a row is the agent
-   * process the `pid:` owner names — an `agentish` row with a class of its own,
-   * which is always in `$ours` and therefore always in `procs`. So the built
-   * table answers the question exactly.
-   *
-   * **Absent means an empty table**: no agent-class process carries any owner and
-   * no `pid:` owner is live. That is right for a tick that saw no agents and
-   * wrong for a caller that merely forgot the table, so Task 12 must pass it.
+   * **Required**, because those three answers are the whole of the fail-closed
+   * arm: absent, the table would clear all three at once (nothing is blind, no
+   * `pid:` owner is live, no agent-class process carries any id), which is the
+   * one direction a proof must never move. A required field can still arrive as
+   * `undefined` from a JavaScript caller, so `orphanDecision` refuses on that
+   * explicitly (`proven: false`, a "missing process table" reason) instead of
+   * reading it as an empty table; pass `[]` for a tick that genuinely saw no
+   * agent-class process. Task 12 must pass `buildProcTable().procs`.
    */
-  procs?: readonly OrphanTableRow[];
+  procs: readonly OrphanTableRow[];
   /** `$invoker`: the invoking agent's id, or null/"" when the GC was run by hand. */
   invoker?: string | null;
   /** `$invOwnerPid`: `pid:<n>@<lstart>` of the invoking agent, or null. */
@@ -846,6 +845,7 @@ export interface OrphanInput {
  * | 2 | the current env contradicts the ledger owner | `:420` |
  * | 3 | no real executable path recorded in the ledger | `:421` |
  * | 4 | the recorded comm is not in `SLP_GC_KILL_COMMS` | `:422` |
+ * | 4a | the process table is absent (`ctx.procs === undefined`) | — (the port's own guard; see `OrphanContext.procs`) |
  * | 5 | `ldead($owner)` — the owner is treated as live (fail closed) | `:423` |
  * | 6 | `orphanedAt == 0`: no ledger ppid-1 first-seen yet | `:424` |
  * | 7 | `now - orphanedAt < SLP_GC_ORPHAN_MIN_AGE_MIN * 60` | `:425` |
@@ -853,9 +853,14 @@ export interface OrphanInput {
  *
  * Arms 1-7 are refusals. Protection comes first because it is the only arm that
  * needs nothing but the row; the owner contradiction comes next because a ledger
- * row and an env that name two different agents prove nothing about either; and
- * the dead-owner arm comes after the cheap syntactic arms so that a process we
+ * row and an env that name two different agents prove nothing about either; the
+ * dead-owner arm comes after the cheap syntactic arms so that a process we
  * would never signal costs no owner lookup.
+ *
+ * Arm 4a sits immediately before the arm it protects because arms 1-4 answer
+ * from the row, the env and the ledger alone: a caller that never supplied the
+ * table still gets each of those arms' own sentence, and only the answers that
+ * *need* the table refuse on its absence.
  *
  * The candidate check is the reference's `select` (`:399`, `:403`), which drops
  * a row rather than judging it. Here it refuses instead, so a caller that hands
@@ -867,7 +872,14 @@ export interface OrphanInput {
 export function orphanDecision(input: OrphanInput): OrphanDecision {
   const { row, env, ctx } = input;
   const ledger = input.ledger ?? null;
-  const procs = ctx.procs ?? [];
+  // `procs` is required in the type, but a required field is still `undefined` at
+  // runtime when a JavaScript caller forwards an optional value (`procs: tbl`).
+  // An absent table must never be read as an empty one: it would clear three
+  // owner guards at once (blindness, a live `pid:` owner, an agent-class
+  // carrier), so the verdict refuses on it below. The `?? []` only keeps the two
+  // derived sets total for the arms that never consult them.
+  const table = ctx.procs as readonly OrphanTableRow[] | undefined;
+  const procs = table ?? [];
   const top = ctx.top ?? new Map<number, TopRow>();
   const invoker = ctx.invoker === null || ctx.invoker === undefined || ctx.invoker === ""
     ? null
@@ -920,6 +932,17 @@ export function orphanDecision(input: OrphanInput): OrphanDecision {
     procs.some((proc) => isAgentFamily(proc.class) && !proc.envRead);
 
   // `$liveSet`'s keys, as the built table can answer them (see `OrphanContext.procs`).
+  //
+  // The equivalence holds only for the `pid:` tokens the record tick itself
+  // writes: `$liveSet` in the reference is built from **every** `ps` row (`:343`),
+  // while this set is built from the filtered table (`$ours`, `:303`), which
+  // holds only rows with a class or an agent-class ancestor. For a token naming a
+  // row outside that filter the two would read differently — the reference would
+  // find the row live and this set would not — so a foreign `pid:` token (one
+  // written by something other than the record tick) is a known divergence, in
+  // the "calls it dead" direction. The record tick writes the token from the
+  // agent process it just observed, which always has a class of its own, so the
+  // token the port actually produces is always in the table.
   const liveKeys = new Set(procs.map((proc) => ledgerKey(proc.pid, proc.lstart)));
 
   /**
@@ -1005,6 +1028,15 @@ export function orphanDecision(input: OrphanInput): OrphanDecision {
       return {
         proven: false,
         why: `report only: executable "${exePath}" (comm "${comm}") is not in SLP_GC_KILL_COMMS`,
+      };
+    }
+    // The table is what arms 5's three answers are made of, so its absence is
+    // refused immediately before them — every arm above answers from the row, the
+    // env and the ledger alone and keeps its own sentence.
+    if (table === undefined) {
+      return {
+        proven: false,
+        why: "missing process table (ctx.procs is undefined): the owner-liveness checks (blind agent family, pid:N@lstart, agent-class carrier) cannot run without it: no proof",
       };
     }
     if (!deadOwner(owner)) {
