@@ -51,6 +51,12 @@
 // a process the daemon may own. Only the second build — the one handed the
 // identified pid, or an explicit `null` after identification failed — may be
 // judged by the two rules.
+//
+// The file also carries the record-level half of the port — the garbage
+// decisions for agent and schedule records — which has its own header at the end
+// of the file (slp-gc.bash:480-557). It shares nothing with the table above but
+// the reference and the `Decision`-style vocabulary: it reads records, not
+// processes.
 
 import { classify, type ProcClass, type ProcRow, type TopRow } from "./procs";
 import type {
@@ -59,6 +65,7 @@ import type {
   ProcClassValue,
 } from "./identity";
 import { ledgerKey, type LedgerRow } from "./ledger";
+import type { AgentRec, ScheduleRec } from "./agents";
 
 /**
  * Agent classes whose process *is* an agent (`agentish`, slp-gc.bash:277): the
@@ -1114,4 +1121,646 @@ export function orphanDecision(input: OrphanInput): OrphanDecision {
   };
 
   return { entry, proof, stale, overmem };
+}
+
+// ---------------------------------------------------------------------------
+// Garbage decisions for agents and schedules (slp-gc.bash:480-557)
+// ---------------------------------------------------------------------------
+//
+// The third rule family: which *records* may be deleted at all. Everything
+// above judges a process; this judges an archived agent record and a completed
+// schedule record, and it is the only place the port answers "garbage".
+//
+//   EVAL_JQ                      slp-gc.bash:480
+//   `$agents` / `$sch`           :482     (both record scans, already parsed)
+//   `$trusted`                   :484     (at least one record parsed)
+//   `$A`                         :485     (id -> record)
+//   `$procOwners`                :486     (agents a live process still carries)
+//   `$liveParents`               :487     (agents an unarchived record claims as parent)
+//   `$schedTargets`              :488     (agents an active/paused schedule targets)
+//   `$blind` / `$procs.envBlind` :489     (the `needsProof` NOTE)
+//   `$idxwhy`                    :490
+//   `astate`                     :491-494 (archived|live|unreadable|missing|unknown)
+//   agent rows                   :495-522
+//   schedule rows                :523-548
+//   `$garbage`                   :557     (schedule rows first, then agent rows)
+//   `sig`                        :883, 893-897 (inode:size:mtime of each candidate)
+//
+// Four properties matter more than tidiness:
+//
+// 1. **The reference's order is the contract, again.** Every row is refused by
+//    the *first* arm that fails, and the arms are ordered exactly as the
+//    reference ordered them: the syntactic `skipped:` gates (`:497-499`,
+//    `:525-526`) before any judgement, then `archivedAt == null` (`:500-502`),
+//    then the fail list (`:504-515`, `:531-541`). An operator reads the first
+//    failing rule, and the fail-closed arms must answer before anything weaker.
+//
+// 2. **The index refuses everything.** `$idx.ok` is the second-to-last fail
+//    (`:514`, `:540`), but because *any* fail makes a row non-garbage, an
+//    incomplete index makes every row non-garbage — the reference's report says
+//    so in as many words (`:928`). The arm is kept inside the fail list rather
+//    than lifted to a pre-check so that the row still carries the more specific
+//    reason when one fired first.
+//
+// 3. **`path` and `sig` are re-derived, not dropped.** `AgentRec` / `ScheduleRec`
+//    are the record snapshots of `agents.ts`, which reduces a record to the keys
+//    the deletion rule reads and keeps neither the file path nor its stat. The
+//    reference's basename gate (`:497`, `:525`) and its `sig` (`:883`) are
+//    therefore *not* evaluable from a bare record. This module re-derives what
+//    the id determines and refuses nothing it can decide:
+//    - `schedules/<id>.json` is exact — the schedule scan is flat (`:650`), so
+//      the path is the id.
+//    - `agents/*/<id>.json` is the agent path with the workspace directory left
+//      as `*`: the scan keeps one level of directory (`:628-629`) and the
+//      snapshot does not retain its name. The `*` is deliberate — it cannot be
+//      mistaken for a path to stat or delete.
+//    - the 8-hex id gate (`:525`) is **id-only** in the reference and is applied
+//      here unconditionally.
+//    - the basename-equals-id half of both gates needs the real file name, so it
+//      is applied when the caller supplies `path` (the record tick can, it just
+//      scanned the file) and is unverifiable when it does not. Nothing is
+//      silently dropped: `agents.ts` fails the whole index on a record it could
+//      not reduce, and the *apply* step re-stats the file it is about to unlink
+//      (`:1054-1057`, `:1080-1083`), which is where the gate is load-bearing. Callers that can
+//      supply `path`/`sig` should; `sig: ""` means "unverified" and must be
+//      refused by whoever acts on it.
+//
+// 4. **Pure.** `now`, `minDays`, both record arrays, the two ref sets, the live
+//    owners and the index state all arrive as values. Nothing here reads a
+//    clock, a file or the process table, and nothing throws.
+//
+// `refusedBy` names the rule that failed, in the machine-readable form
+// `<rule>: <reference text>`: the key is stable (the screen can group by it) and
+// the text is the reference's, verbatim. `reason` carries the reference's whole
+// `reason` sentence — the joined fail list for a refused row, the `GARBAGE:`
+// sentence for an eligible one — so the operator sees everything the reference
+// would have printed even though `refusedBy` names only the first failure.
+
+/**
+ * A set of ids, or the list a caller collected them into. `$busyRefs`,
+ * `$rawRefs` and `$procOwners` are all jq arrays in the reference; a `Set` is
+ * the useful shape here, so both are accepted.
+ */
+type RefIds = readonly string[] | ReadonlySet<string>;
+
+/** The empty set, shared so a caller that supplies nothing allocates nothing. */
+const NO_REFS: ReadonlySet<string> = new Set<string>();
+
+/** Normalise a ref collection to a set, once per call. */
+function refIds(refs: RefIds | null | undefined): ReadonlySet<string> {
+  if (refs === null || refs === undefined) return NO_REFS;
+  if (Array.isArray(refs)) return new Set<string>(refs as readonly string[]);
+  return refs as ReadonlySet<string>;
+}
+
+/**
+ * One agent record, plus the two crumbs `agents.ts` does not keep — see
+ * property 3 above. Both are optional, and a bare `AgentRec` is assignable to
+ * this type, so a caller that never statted a file is not forced to invent one.
+ */
+export interface AgentRecord extends AgentRec {
+  /** The record file's path, when the caller still has it (`$r.path`). */
+  path?: string;
+  /** `inode:size:mtime` of that file (`$sigBy[.path]`, `:893-897`), else "". */
+  sig?: string;
+}
+
+/** One schedule record, plus the same two crumbs. */
+export interface ScheduleRecord extends ScheduleRec {
+  path?: string;
+  sig?: string;
+}
+
+/** The two rules that can make a candidate eligible, named for the screen. */
+export type GarbageRule = "agent-archived" | "schedule-completed";
+
+/**
+ * One row of the decision — the reference's `$agentRows` / `$schedRows` row
+ * (`:495-548`), reduced to what a screen needs. Every record handed in produces
+ * exactly one candidate, eligible or not, so a row can never be dropped and
+ * mistaken for a decision.
+ */
+export interface GarbageCandidate {
+  kind: "agent" | "schedule";
+  id: string;
+  /** The record's path when the caller supplied it, else the derived locator. */
+  path: string;
+  /** The file's `inode:size:mtime` when the caller supplied it, else `""`. */
+  sig: string;
+  /** The rule that *would* make this row garbage, eligible or not. */
+  rule: GarbageRule;
+  /**
+   * `null` when the row is garbage. Otherwise `<rule>: <reference text>` — the
+   * first arm that failed, named, so the screen can show and group it.
+   */
+  refusedBy: string | null;
+  /** The reference's `reason` sentence, verbatim (the joined fail list when refused). */
+  reason: string;
+  /** The reference's `action` for an eligible row, else `null` (`action: "none"`). */
+  action: string | null;
+}
+
+/**
+ * Everything the garbage rules read. Named after the reference's jq arguments,
+ * like `DecisionContext` and `OrphanContext`, so the mapping stays obvious.
+ */
+export interface GarbageInput {
+  /** `$now`: epoch seconds, read once by the caller. */
+  now: number;
+  /** `$minDays`: `SLP_GC_AGENT_MIN_DAYS`, 14 by default (slp-gc.bash:32). */
+  minDays: number;
+  /** `$agents`: the agent index (`snapshotAgents().agents`). */
+  agents?: readonly AgentRecord[];
+  /** `$sch`: the schedule index (`snapshotSchedules().schedules`). */
+  schedules?: readonly ScheduleRecord[];
+  /**
+   * `$idx.ok`: both scans complete (`snapshotAgents().index.ok &&
+   * snapshotSchedules().index.ok`; the reference has one index for both).
+   *
+   * **Defaults to `false`** — an unstated index is an unproven one, and the
+   * reference's answer to an unproven index is "nothing is garbage" (:928).
+   */
+  indexOk?: boolean;
+  /** `$idx.why`: every reason a scan recorded, joined verbatim into `$idxwhy`. */
+  indexWhy?: readonly string[];
+  /** `$busyRefs`: ids an in-flight creation references. */
+  busyRefs?: RefIds | null;
+  /** `$rawRefs`: ids mentioned by a record that could not be parsed. */
+  rawRefs?: RefIds | null;
+  /** `$procOwners`: owners of the processes in the table (procs plus orphans). */
+  procOwners?: RefIds | null;
+  /** `$invoker`: the invoking agent's id, or null/"" when run by hand. */
+  invoker?: string | null;
+  /**
+   * `$procs.ident.ok` / `.why`: whether Supervisor/daemon identification
+   * succeeded (`:515`, `:541`).
+   *
+   * Absent or `null` means "no identification result to report", which skips the
+   * arm — the one default in this module that is *not* fail-closed, and
+   * deliberately so: identification is a fact about the host, not about the
+   * records, and `garbageDecisions` is called by the report path too, where no
+   * process table has been built. **Task 12 must pass the real verdict**, since
+   * the reference refuses every candidate when it failed.
+   */
+  identification?: { ok: boolean; why: string } | null;
+  /** `$procs.envBlind | length`: how many agent-class rows had an unreadable env. */
+  envBlind?: number;
+  /** Prefixes the derived `path` (`$PASEO_HOME`); omitted, the path is relative. */
+  paseoHome?: string | null;
+}
+
+/** The record directories the reference scans (`extract_agents` / `extract_schedules`). */
+const AGENT_RECORD_DIR = "agents";
+const SCHEDULE_RECORD_DIR = "schedules";
+
+/** The workspace directory segment `agents.ts` does not retain. */
+const UNKNOWN_WORKSPACE_DIR = "*";
+
+const SECONDS_PER_DAY = 86400;
+const UPDATED_QUIET_S = 3600;
+const LAST_RUN_QUIET_S = 600;
+
+/** `["idle","running","closed","error","initializing"]` (slp-gc.bash:498). */
+const AGENT_STATUSES: ReadonlySet<string> = new Set<string>([
+  "idle",
+  "running",
+  "closed",
+  "error",
+  "initializing",
+]);
+
+/** `["active","paused","completed"]` (slp-gc.bash:526). */
+const SCHEDULE_STATUSES: ReadonlySet<string> = new Set<string>(["active", "paused", "completed"]);
+
+/** The schedule id the reference requires: `\A[0-9a-f]{8}\z` (slp-gc.bash:525). */
+const SCHEDULE_ID = /^[0-9a-f]{8}$/;
+
+/** `sub("\\.json\\z"; "")` — the file stem both basename gates compare. */
+function stripJsonSuffix(name: string): string {
+  return name.endsWith(".json") ? name.slice(0, -".json".length) : name;
+}
+
+/** jq's `tojson` for the two "unknown …" arms; `undefined` reads as `null`. */
+function jsonText(value: unknown): string {
+  const text = JSON.stringify(value);
+  return text === undefined ? "null" : text;
+}
+
+/**
+ * The record's path as far as this module can know it (property 3 above): the
+ * caller's when it has one, else the id-derived locator. The agent locator keeps
+ * the workspace segment as a literal `*` rather than guessing it.
+ */
+function recordPath(
+  kind: "agent" | "schedule",
+  id: string,
+  paseoHome: string | null,
+): string {
+  const home = paseoHome === null ? "" : `${paseoHome.replace(/\/+$/, "")}/`;
+  if (kind === "schedule") return `${home}${SCHEDULE_RECORD_DIR}/${id}.json`;
+  return `${home}${AGENT_RECORD_DIR}/${UNKNOWN_WORKSPACE_DIR}/${id}.json`;
+}
+
+/** One refusal: the rule that failed, and the reference's text for it. */
+interface Refusal {
+  /** Stable rule key, for grouping and for `refusedBy`'s prefix. */
+  rule: string;
+  /** The reference's text, verbatim. */
+  text: string;
+}
+
+/**
+ * `days($e)` (slp-gc.bash:481): whole days between `now` and an epoch, floored —
+ * the reference's own arithmetic, including its reading of a future timestamp as
+ * a negative age.
+ */
+function daysAgo(now: number, epoch: number): number {
+  return Math.floor((now - epoch) / SECONDS_PER_DAY);
+}
+
+/** `"not garbage: " + ($fails | join("; "))` (`:521`, `:543`) plus the named first failure. */
+function refused(
+  base: Omit<GarbageCandidate, "refusedBy" | "reason" | "action">,
+  fails: readonly Refusal[],
+): GarbageCandidate {
+  const first = fails[0] ?? { rule: "unknown", text: "not garbage" };
+  return {
+    ...base,
+    refusedBy: `${first.rule}: ${first.text}`,
+    reason: `not garbage: ${fails.map((fail) => fail.text).join("; ")}`,
+    action: null,
+  };
+}
+
+/**
+ * Garbage decisions for agents and schedules (slp-gc.bash:480-557).
+ *
+ * Every agent record and every schedule record produces one candidate, in the
+ * reference's `$garbage` order: all schedule rows first, then all agent rows
+ * (`:557`), each kind in index order. `refusedBy === null` means garbage; every
+ * other row names the rule that refused it.
+ *
+ * The rules, in the reference's order:
+ *
+ * | Kind | Arm | Reference |
+ * |---|---|---|
+ * | agent | archived (not live, not `closed`-unarchived) | `:500-502` |
+ * | agent | `strict` — the record carries every key the rule reads | `:504` |
+ * | agent | not `internal` | `:505` |
+ * | agent | `lastStatus == "closed"` | `:506` |
+ * | agent | archived ≥ `minDays` days (floored days) | `:507` |
+ * | agent | no live process carries `PASEO_AGENT_ID=<id>` | `:508` |
+ * | agent | not the invoking agent | `:509` |
+ * | agent | no unarchived agent names it as `paseo.parent-agent-id` | `:510` |
+ * | agent | no active/paused schedule targets it | `:511` |
+ * | agent | no in-flight creation references it | `:512` |
+ * | agent | no unreadable record mentions it | `:513` |
+ * | agent | the index is complete | `:514` |
+ * | agent | identification succeeded | `:515` |
+ * | agent | the file name is the record's id (needs the caller's `path`) | `:497` |
+ * | agent | `lastStatus` is one of the five known values | `:498` |
+ * | agent | an archived record's `archivedAt` parses | `:499` |
+ * | schedule | `completed` only | `:530` |
+ * | schedule | `strict`, `nextRunAt` null, an agent target | `:531-533` |
+ * | schedule | the target agent is `missing`/`archived` | `:534` |
+ * | schedule | the room marker is present | `:535` |
+ * | schedule | updated ≥ 1 h ago, no run in 10 min | `:536-538` |
+ * | schedule | no run is still marked running | `:539` |
+ * | schedule | the index is complete, identification succeeded | `:540-541` |
+ * | schedule | the id is 8 hex digits (always), the file name matches (with `path`) | `:525` |
+ * | schedule | `status` is one of the three known values | `:526` |
+ *
+ * The three report-only arms (`:544-547`) are refusals here too, with the
+ * reference's text: a live target ("protected: …"), the active-with-dead-target
+ * anomaly, and any other status/target pair.
+ */
+export function garbageDecisions(input: GarbageInput): GarbageCandidate[] {
+  const now = input.now;
+  const minDays = input.minDays;
+  const agents = input.agents ?? [];
+  const schedules = input.schedules ?? [];
+  // Fail closed: an unstated index is an unproven one, and the reference treats
+  // an unproven index as "nothing is garbage" (:514, :928).
+  const indexOk = input.indexOk ?? false;
+  const indexWhy = input.indexWhy ?? [];
+  const busyRefs = refIds(input.busyRefs);
+  const rawRefs = refIds(input.rawRefs);
+  const procOwners = refIds(input.procOwners);
+  const identification = input.identification ?? null;
+  const envBlind = input.envBlind ?? 0;
+  const blind = envBlind > 0;
+  const paseoHome = input.paseoHome ?? null;
+  const invoker =
+    input.invoker === null || input.invoker === undefined || input.invoker === ""
+      ? null
+      : input.invoker;
+
+  // `("index incomplete: " + ($idx.why | join("; ")))` (:490). The reference
+  // cannot reach an `ok:false` index with no reason; the fallback only keeps the
+  // sentence readable if a caller hands one in.
+  const idxWhy = `index incomplete: ${
+    indexWhy.length > 0 ? indexWhy.join("; ") : "(no reason recorded)"
+  }`;
+
+  // `$A` (:485) and `$trusted` (:484): first record wins, as in `buildProcTable`.
+  const byId = new Map<string, AgentRecord>();
+  for (const rec of agents) if (!byId.has(rec.id)) byId.set(rec.id, rec);
+  const trusted = agents.length > 0;
+
+  /** `astate($id)` (:491-494): what the index can say about an agent. */
+  const agentState = (id: string | null): string => {
+    if (id === null) return "n/a";
+    const rec = byId.get(id);
+    if (rec !== undefined) return rec.archivedAt !== null ? "archived" : "live";
+    // A record that mentions the id but could not be parsed: the port fails the
+    // whole index instead (`agents.ts`), so `rawRefs` is expected to be empty.
+    if (rawRefs.has(id)) return "unreadable";
+    // `missing` proves the agent is gone, so it needs at least one parsed record
+    // to have been a trustworthy scan; an empty index answers `unknown` (:494).
+    return trusted ? "missing" : "unknown";
+  };
+
+  // `$liveParents` (:487): agents that an unarchived record still names as parent.
+  const liveParents = new Set<string>();
+  for (const rec of agents) {
+    if (rec.archivedAt === null && rec.parent !== null) liveParents.add(rec.parent);
+  }
+
+  // `$schedTargets` (:488): agents an active/paused schedule still targets.
+  const schedTargets = new Set<string>();
+  for (const rec of schedules) {
+    if ((rec.status === "active" || rec.status === "paused") && rec.targetAgent !== null) {
+      schedTargets.add(rec.targetAgent);
+    }
+  }
+
+  /** The two crumbs every row carries; `path`/`sig` per property 3. */
+  const crumbs = (kind: "agent" | "schedule", rec: AgentRecord | ScheduleRecord) => {
+    const supplied = typeof rec.path === "string" && rec.path !== "" ? rec.path : null;
+    return {
+      // Kept so the basename gate below can tell "no file name" from "a name
+      // that disagrees with the id".
+      supplied,
+      path: supplied ?? recordPath(kind, rec.id, paseoHome),
+      sig: typeof rec.sig === "string" ? rec.sig : "",
+    };
+  };
+
+  // `(:495-522)` — one agent row.
+  const agentRow = (rec: AgentRecord): GarbageCandidate => {
+    const { supplied, path, sig } = crumbs("agent", rec);
+    const base = { kind: "agent" as const, id: rec.id, path, sig, rule: "agent-archived" as const };
+
+    /** The reference's `skipped:` arms (`:497-499`): the row is never judged. */
+    const skip = (rule: string, text: string): GarbageCandidate => ({
+      ...base,
+      refusedBy: `${rule}: ${text}`,
+      reason: text,
+      action: null,
+    });
+
+    // `:497` — the file name carries the record's own id. A record file whose
+    // name disagrees with its content is not evidence about either.
+    if (supplied !== null && stripJsonSuffix(baseName(supplied)) !== rec.id) {
+      return skip("agent-file-name", "skipped: file name uuid != record id");
+    }
+    // `:498` — an unknown `lastStatus` means the record is not of a shape this
+    // rule was written for.
+    if (rec.status === null || !AGENT_STATUSES.has(rec.status)) {
+      return skip("agent-status-unknown", `skipped: unknown lastStatus ${jsonText(rec.status)}`);
+    }
+    // `:500-502` — a record that is not archived is never garbage, whatever its
+    // status. `closed`-but-unarchived gets its own sentence: the user may still
+    // see it, so the reference reports it rather than hiding it.
+    if (rec.archivedAt === null) {
+      const text =
+        rec.status === "closed"
+          ? "not garbage: closed but not archived (report-only; the user may still see it)"
+          : `not garbage: unarchived agent (lastStatus ${rec.status})`;
+      return { ...base, refusedBy: `agent-not-archived: ${text}`, reason: text, action: null };
+    }
+    const archivedEpoch = rec.archivedEpoch;
+    // `:499` — archived, but not with a timestamp the reference can measure.
+    if (archivedEpoch === null) {
+      return skip("agent-archived-at-invalid", "skipped: archivedAt is not a valid ISO timestamp");
+    }
+
+    const days = daysAgo(now, archivedEpoch);
+    const fails: Refusal[] = [];
+    // `:504`
+    if (!rec.strict) {
+      fails.push({
+        rule: "agent-strict",
+        text: "required keys missing or of the wrong type (internal/archivedAt/lastStatus/updatedAt): skipped, defaults are for reporting only",
+      });
+    }
+    // `:505`
+    if (rec.internal !== false) fails.push({ rule: "agent-internal", text: "internal record" });
+    // `:506`
+    if (rec.status !== "closed") {
+      fails.push({ rule: "agent-status", text: `lastStatus is ${rec.status} (rule needs closed)` });
+    }
+    // `:507`
+    if (days < minDays) {
+      fails.push({ rule: "agent-archived-age", text: `archived ${days} d ago (< ${minDays} d)` });
+    }
+    // `:508`
+    if (procOwners.has(rec.id)) {
+      fails.push({
+        rule: "agent-process",
+        text: `a process with PASEO_AGENT_ID=${rec.id} is running`,
+      });
+    }
+    // `:509`
+    if (invoker !== null && invoker === rec.id) {
+      fails.push({ rule: "agent-invoker", text: "it is the invoking agent" });
+    }
+    // `:510`
+    if (liveParents.has(rec.id)) {
+      fails.push({
+        rule: "agent-live-parent",
+        text: "an unarchived agent references it via paseo.parent-agent-id",
+      });
+    }
+    // `:511`
+    if (schedTargets.has(rec.id)) {
+      fails.push({ rule: "agent-schedule-target", text: "an active/paused schedule targets it" });
+    }
+    // `:512`
+    if (busyRefs.has(rec.id)) {
+      fails.push({ rule: "agent-busy-ref", text: "an in-flight creation references it" });
+    }
+    // `:513`
+    if (rawRefs.has(rec.id)) {
+      fails.push({
+        rule: "agent-raw-ref",
+        text: "an unreadable record/schedule mentions it",
+      });
+    }
+    // `:514`
+    if (!indexOk) fails.push({ rule: "index-incomplete", text: idxWhy });
+    // `:515`
+    if (identification !== null && !identification.ok) {
+      fails.push({
+        rule: "identification",
+        text: `Paseo identification failed: ${identification.why}`,
+      });
+    }
+
+    if (fails.length > 0) return refused(base, fails);
+
+    // `:517-519`
+    return {
+      ...base,
+      refusedBy: null,
+      reason:
+        `GARBAGE: archived ${days} d ago, lastStatus=closed, not internal, ` +
+        "no live process/child/schedule/creation reference" +
+        (blind
+          ? `; NOTE: the env of ${envBlind} agent-class process(es) is unreadable, so --apply must first prove it archived and not running with \`paseo agent inspect\``
+          : ""),
+      action: `paseo agent delete ${rec.id}`,
+    };
+  };
+
+  // `(:523-548)` — one schedule row.
+  const scheduleRow = (rec: ScheduleRecord): GarbageCandidate => {
+    const { supplied, path, sig } = crumbs("schedule", rec);
+    const base = {
+      kind: "schedule" as const,
+      id: rec.id,
+      path,
+      sig,
+      rule: "schedule-completed" as const,
+    };
+
+    /** A refusal whose whole reason is the one sentence (the `skipped:` gates and
+     * the three report-only arms: `:525-526`, `:544-547`). */
+    const refuse = (rule: string, text: string): GarbageCandidate => ({
+      ...base,
+      refusedBy: `${rule}: ${text}`,
+      reason: text,
+      action: null,
+    });
+
+    // `:525` — the schedule scan is flat and id-keyed, so the id *is* the file
+    // stem: the 8-hex gate is decided from the id alone, and the file-name half
+    // is decided when the caller still has the path.
+    if (
+      !SCHEDULE_ID.test(rec.id) ||
+      (supplied !== null && baseName(supplied) !== `${rec.id}.json`)
+    ) {
+      return refuse("schedule-file-name", "skipped: file name is not <id>.json with an 8-hex id");
+    }
+    // `:526`
+    if (!SCHEDULE_STATUSES.has(rec.status)) {
+      return refuse("schedule-status-unknown", `skipped: unknown status ${jsonText(rec.status)}`);
+    }
+
+    // `$ts` (:528-529): what the index can say about the target, or `n/a`.
+    const targetState =
+      rec.targetType === "agent" && rec.targetAgent !== null
+        ? agentState(rec.targetAgent)
+        : "n/a";
+
+    if (rec.status === "completed") {
+      const fails: Refusal[] = [];
+      // `:531`
+      if (!rec.strict) {
+        fails.push({
+          rule: "schedule-strict",
+          text: "required keys missing or of the wrong type (runs/lastRunAt/nextRunAt/updatedAt): skipped",
+        });
+      }
+      // `:532` — a completed schedule with a next fire is not finished.
+      if (rec.nextRunAt !== null) {
+        fails.push({ rule: "schedule-next-run", text: "nextRunAt is set" });
+      }
+      // `:533` — only room machinery is ever reclaimed.
+      if (rec.targetType !== "agent") {
+        fails.push({
+          rule: "schedule-target-type",
+          text: "target is a new-agent schedule (not room machinery)",
+        });
+      }
+      // `:534` — the target must be gone; `unreadable`/`unknown` refuse.
+      if (rec.targetType === "agent" && targetState !== "missing" && targetState !== "archived") {
+        fails.push({ rule: "schedule-target-state", text: `target agent is ${targetState}` });
+      }
+      // `:535` — the room marker. The reference reclaims *room* schedules and
+      // refuses every other one, so a user's own schedule is never a candidate.
+      if (!rec.room) {
+        fails.push({
+          rule: "schedule-room",
+          text: "no room marker (name supervisor: / heartbeat prompt)",
+        });
+      }
+      // `:536`
+      if (rec.updatedEpoch === null) {
+        fails.push({ rule: "schedule-updated", text: "updatedAt invalid" });
+      } else if (now - rec.updatedEpoch < UPDATED_QUIET_S) {
+        fails.push({ rule: "schedule-updated", text: "updated < 1 h ago" });
+      }
+      // `:537`
+      if (rec.lastRunEpoch !== null && now - rec.lastRunEpoch < LAST_RUN_QUIET_S) {
+        fails.push({ rule: "schedule-last-run-recent", text: "last run < 10 min ago" });
+      }
+      // `:538`
+      if (rec.lastRunAt !== null && rec.lastRunEpoch === null) {
+        fails.push({ rule: "schedule-last-run-invalid", text: "lastRunAt invalid" });
+      }
+      // `:539`
+      if (rec.runsRunning > 0) {
+        fails.push({ rule: "schedule-running", text: "a run is still marked running" });
+      }
+      // The reference gates *agents* on `$busyRefs` (`:512`) and not schedules;
+      // it is ported for schedules too, because a schedule an in-flight creation
+      // references is the one thing a deletion must not race. The arm can only
+      // ever refuse (the reference's `$busyRefs` holds agent ids), so it is a
+      // fail-closed addition, not a widening: the cost is one report line, the
+      // cost of the missing arm is deleting a schedule something is creating.
+      if (busyRefs.has(rec.id)) {
+        fails.push({ rule: "schedule-busy-ref", text: "an in-flight creation references it" });
+      }
+      // `:540`
+      if (!indexOk) fails.push({ rule: "index-incomplete", text: idxWhy });
+      // `:541`
+      if (identification !== null && !identification.ok) {
+        fails.push({
+          rule: "identification",
+          text: `Paseo identification failed: ${identification.why}`,
+        });
+      }
+
+      if (fails.length > 0) return refused(base, fails);
+
+      // `:542`
+      return {
+        ...base,
+        refusedBy: null,
+        reason: `GARBAGE: completed room schedule, target agent ${targetState}, updated > 1 h ago, no run in 10 min`,
+        action: `paseo schedule delete ${rec.id}`,
+      };
+    }
+
+    // `:544` — a live target protects its schedules, whatever their status.
+    if (targetState === "live") {
+      return refuse("schedule-target-live", "protected: target agent is live/unarchived");
+    }
+    // `:545-546` — the daemon completes an active schedule whose target is gone;
+    // the reference reports the anomaly and acts on nothing.
+    if ((targetState === "missing" || targetState === "archived") && rec.status === "active") {
+      return refuse(
+        "schedule-anomaly",
+        `anomaly (report-only): active schedule with ${targetState} target; the daemon normally completes it`,
+      );
+    }
+    // `:547`
+    return refuse("schedule-status", `not garbage: status ${rec.status}, target ${targetState}`);
+  };
+
+  // `$garbage` (:557): `($schedRows + $agentRows) | map(select(.garbage))` — but
+  // every row is kept here, refused rather than dropped, so a caller can never
+  // mistake a dropped row for an eligible one.
+  return [...schedules.map(scheduleRow), ...agents.map(agentRow)];
 }
