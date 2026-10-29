@@ -1,1 +1,6 @@
 node_modules/
+
+# GC fixture scratch: the reference is pointed at this dir (SLP_GC_STATE_DIR),
+# and a captured ledger must never be committed. Only .gitkeep is tracked.
+server/gc/__fixtures__/state/*
+!server/gc/__fixtures__/state/.gitkeep

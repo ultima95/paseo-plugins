@@ -1,0 +1,10 @@
+# SYNTHETIC — NOT CAPTURED. Hand-written rows only for parser coverage; see PROVENANCE.md.
+# Format: "<pid> <mem> <cmprs>" as `top -l 1 -stats pid,mem,cmprs` prints it after the
+# 12-line header: raw K/M/G (or B) suffixes, optionally followed by top's "+"/"-" state
+# marker, which `top_parse` (docs/gc-port/slp-gc.bash:605-612) strips before converting.
+# The live capture on this machine produced no G value and no +/- marker at all, so those
+# cases cannot be captured; they are exercised here instead. Lines starting with "#" are
+# skipped by the parser (it keys on `$1 ~ /^[0-9]+$/`).
+9001 2G 3G
+9002 512K+ 1M-
+9003 7M- 2048K+
