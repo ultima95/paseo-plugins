@@ -93,6 +93,7 @@ rather than a decision. Everything not listed here is compared as it is.
 | `procs.procs`, `procs.orphans`, `garbage` | compared as **sets** keyed `pid` + `lstart` (garbage rows: `category` + `id`); a row on one side only is skipped and counted per section in the `rows on one side only (skipped)` line (`ROW_SECTIONS`, `alignRowSections`) | a process that exits or a record file that appears between the two captures is a row on one side only, not a decision; a pid alone is recycled by the kernel and `lstart` alone can repeat, so the pair names one process. A section with **no** row in common is refused, not skipped — an empty section against a populated one, or two disjoint populations, is not churn |
 | `why` | `<number> MB` → `<MB>` in every `why` sentence (`WHY_MB`, `EQUIVALENT.why`) | both sides quote a `top` sample taken seconds apart (`footprint 114.0 MB` vs `115.0 MB`); only the numbers go, and the sentence, its `<=`/`>` and the eligibility it states stay compared. The threshold inside the sentence collapses with them, so the thresholds are compared separately as the `warnMb` / `killMb` numbers the report carries |
 | `tree.totalMb`, `tree.appMb`, `tree.orphanMb`, `retention[].kb`, `retention[].count`, `transcripts[].bytes`, `daemonMetrics[].time`, `daemonMetrics[].rss`, `daemonMetrics[].heapUsed` | dropped (`IGNORE`, second block) | sums and sizes *of* the dropped samples: the same instant one level up, and a sum of dropped inputs could only ever fail. What they decide stays compared — `tree.over`, `overall.*`, `totals[].n`, and the thresholds `warnMb`, `killMb`, `treeWarnMb` |
+| `daemonMetrics[].timelineStats` | replaced by `<live counter>` on both sides (`normalizeDaemonCounters`), **after asserting the section's shape**: `daemonMetrics` must be an array of objects, each carrying a `time` key and a `timelineStats` key, and each `timelineStats` an object or `null` | the daemon's own timeline counters, which grow with every agent turn: the 17:59Z re-run read `totalItems` 3748 against the 17:54:32Z report's 3745. Dropping the key by name would drop the section's shape with it, so the object is *replaced* and its shape asserted first — a missing, non-array or restructured `daemonMetrics` fails by path. Verified on three scratched copies of the 17:54:32Z report: an entry with no `timelineStats`, `daemonMetrics` set to a string, and an entry set to a string each printed `DIFFERS at daemonMetrics…`, exit 1 |
 | `procs.ledgerNext` | the port's side is dropped **only when the reference's side is exactly `null`** — asserted on every run (`REPORT_MODE_ONLY`, `reconcileReportMode`) | the reference's `report` verb never computes a ledger: `WANT_LEDGER=1` is set in exactly one place, `do_record` (`slp-gc.bash:1188`), reachable only from `tick` (`:1344`), so its `ledgerNext` is `null` on every host — while the port's file is a *tick's* report and carries the 6 rows that tick wrote (`server/gc/tick.ts:1752`). `null` here is the artifact's zero value, not "no rows" against "rows". This is the one section where the two artifacts are not the same artifact, the exemption is **asserted rather than ignored**, and it covers no rule: a reference that ever produced ledger rows keeps them and is compared normally. The ledger's own rules are pinned by `server/gc/ledger.test.ts` against the same jq, since no reference CLI emits a ledger |
 
 There is no `pct` field in either report (`grep -n "pct" server/gc/report.ts shared/gc.ts`
@@ -138,14 +139,62 @@ The harness sorts both sides by `id` (`ORDER_INSENSITIVE`), because order is not
 decision: every row, every field of it and the row count are still compared, and nothing is
 dropped or matched up.
 
-One caveat on repeating the check: the verdict is **per capture instant**, since the
-reference side is captured live. Re-running the same command on the same report at
-17:59:39Z, five minutes after the tick, names
-`daemonMetrics[1].timelineStats.totalItems (3748 vs 3745)` —
-the daemon's own timeline counters, which grow with every agent turn and are compared as
-values (only `time`, `rss` and `heapUsed` are dropped). That is live daemon state and not a
-rule; every section earlier in the key order (`procs`, `agents`, `schedules`, `index`,
-`garbage`, `transcripts`) still agreed on that re-run.
+### Repeatability: the daemon counters no longer move the verdict
+
+`daemonMetrics[].timelineStats` — the counters behind the 17:59Z re-run's
+`daemonMetrics[1].timelineStats.totalItems (3748 vs 3745)` — is now **normalised on both
+sides, with the section's shape asserted first** (`normalizeDaemonCounters`,
+`scripts/gc-equivalence.mts`): `daemonMetrics` must be an array of objects, every entry
+carrying a `time` key and a `timelineStats` key, and every `timelineStats` an object or
+`null`. Only then is the counter object replaced by `<live counter>`. A section that goes
+missing, stops being an array or loses either key fails by path instead of passing quietly
+(three scratched copies of the 17:54:32Z report — an entry without `timelineStats`,
+`daemonMetrics: "none"`, an entry that is a string — each printed `DIFFERS at
+daemonMetrics…`, exit 1). With that in place the same harness was re-run against two stored
+reports, without touching `.last-report` and without reloading the plugin:
+
+```
+$ cd agent-room && node --experimental-strip-types scripts/gc-equivalence.mts \
+    /Users/ultima/.paseo/plugin-data/agent-room/gc/reports/20261029T175431Z.json
+EQUIVALENT (… 20261029T175431Z.json, written 2026-10-29T17:54:32.127Z)                     exit=0
+
+$ cd agent-room && node --experimental-strip-types scripts/gc-equivalence.mts \
+    /Users/ultima/.paseo/plugin-data/agent-room/gc/reports/20261029T174931Z.json
+DIFFERS at retention[38].note ("live agent cwd: dirty=1 unpushed=no-upstream; never garbage"
+                           vs "live agent cwd: dirty=0 unpushed=no-upstream; never garbage")  exit=1
+```
+
+The daemon counters are gone from both runs: `20261029T175431Z.json` is `EQUIVALENT`, and
+`20261029T174931Z.json` gets past `daemonMetrics` and names `retention[38].note` instead. That
+field is **a live `git status` reading of `/Users/ultima/Workspace/paseo-plugins`**, not a
+decision: `git_state` (`slp-gc.bash:829-833`, port `gitState`) counts the non-empty lines of
+`git -C <cwd> status --porcelain`, and the workspace genuinely changed between the two ticks —
+clean at 17:49:31Z and one dirty file at 17:54:32Z (this record, committed at 18:04:30Z as
+`ba1cd86`). Both re-runs above were taken with the harness change uncommitted, i.e. with that
+one file as the tree's single dirty entry — the state the 17:54:32Z tick recorded. So the two
+stored reports *recorded different live states*, and a live re-read can match only one of them
+at a time: with a clean tree the same `note` makes the older report `EQUIVALENT` and the
+newer one `DIFFERS`. It is report-only — the row is `other-worktree`, `count` 1, its own note
+says "never garbage", and no rule, gate or verdict reads `retention` — so it is a live host
+reading and not port drift. **It is not normalised**: this task's remit was the daemon
+counters, so the field is compared as a value and the residual difference is recorded here
+rather than dropped, which is why the older report does *not* print `EQUIVALENT` and the
+two-report claim is not made. Every other section (`procs`, `agents`, `schedules`, `index`,
+`garbage`, `transcripts`, and `daemonMetrics`' row shape) agreed on both runs.
+
+Both commands were run a second time with this fix committed (clean tree), which is the 17:49:31Z
+tick's state — the pair simply trades places on that one live field:
+
+```
+20261029T174931Z.json                                                                       exit=0
+EQUIVALENT (… 20261029T174931Z.json, written 2026-10-29T17:49:32.145Z)
+20261029T175431Z.json                                                                       exit=1
+DIFFERS at retention[38].note ("live agent cwd: dirty=0 …" vs "live agent cwd: dirty=1 …")
+```
+
+So the daemon counters are settled — no run of either report has named `daemonMetrics` since —
+and the one field that still makes the verdict depend on when it is taken is a live `git status`
+reading outside the daemon counters this task covered.
 
 ## 4. Protected classes — the tests that pin them
 

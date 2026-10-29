@@ -53,6 +53,15 @@
 //    (`REPORT_MODE_ONLY`): the reference's `report` verb does not compute a ledger, and
 //    the port's report is a *tick's* report, which does. The exemption is asserted, not
 //    assumed, and covers no rule.
+// 6. **`daemonMetrics[].timelineStats` is replaced on both sides, its entry shape asserted
+//    first** (`normalizeDaemonCounters`): the section is the daemon's own last three
+//    `ws_runtime_metrics` records, so its counters are live samples too — `totalItems` grows
+//    with every agent turn (a re-run five minutes after the tick read `3748` against the
+//    report's `3745`). `time`, `pid`, `rss` and `heapUsed` are dropped by name in `IGNORE`;
+//    `timelineStats` is dropped as a *whole value* instead, because its own shape is what the
+//    comparison must keep: the section is asserted to be an array of objects, each with a
+//    `time` key and a `timelineStats` key, and a missing, non-array or restructured section
+//    fails by path rather than passing quietly.
 //
 // Nothing else about a row is normalised: an empty section on one side against a
 // non-empty one on the other, a different class or owner, a different `why` sentence
@@ -102,8 +111,10 @@ const IGNORE = new Set([
   "bytes", // a transcript file's size
   // --- the daemon's own samples: the report carries the last three `ws_runtime_metrics`
   // lines of `daemon.log`, and two captures read them seconds apart, so the three newest
-  // lines are three *different* samples. The row shape, the pid and the timeline counts
-  // are still compared.
+  // lines are three *different* samples. The row shape and the pid are still compared. The
+  // counters themselves — `agents.timelineStats`, which grows with every agent turn — are
+  // not listed here: they are replaced as a whole object by `normalizeDaemonCounters`,
+  // which asserts each entry's shape before doing it.
   "time",
   "rss",
   "heapUsed",
@@ -391,6 +402,80 @@ function reconcileReportMode(
   }
 }
 
+/** The section of live daemon counters, and the one counter object inside each of its rows. */
+const DAEMON_METRICS = "daemonMetrics";
+const TIMELINE_STATS = "timelineStats";
+
+/** The one value both sides become: "a live counter, whose value is an instant, not a ruling". */
+const LIVE_COUNTER = "<live counter>";
+
+/**
+ * Replace `daemonMetrics[].timelineStats` on both sides — the daemon's live timeline counters
+ * — after asserting every entry's shape.
+ *
+ * `daemonMetrics` is the last three `ws_runtime_metrics` records of `daemon.log`, collected by
+ * both sides from the same log (`collect_metrics`, `slp-gc.bash:811-817`;
+ * `collectDaemonMetrics`, `server/gc/report.ts:420`) at two instants, so each side reads three
+ * *different* records. `time`, `pid`, `rss` and `heapUsed` are samples and are dropped by name
+ * in `IGNORE`; `timelineStats` (`agents.timelineStats`) is an object of counters that grows
+ * with every agent turn — a re-run five minutes after the tick that wrote the report read
+ * `totalItems` 3748 against the report's 3745 — so its *values* cannot be compared either.
+ * Dropping the key by name would also drop the section's shape, so the whole object is
+ * replaced on both sides instead, and what is asserted first is what a restructure would
+ * break:
+ *
+ *  - `daemonMetrics` exists on both sides and is an **array** (an absent section, or one that
+ *    became a scalar or an object, is a refusal — not a silently equal pair);
+ *  - every entry is a non-null **object** (not an array, not a scalar);
+ *  - every entry carries a **`time`** key and a **`timelineStats`** key;
+ *  - every `timelineStats` value is an **object or `null`** — the two shapes the daemon's own
+ *    metrics record can have (`agents.timelineStats`, absent until an agent has a timeline).
+ *
+ * A failure in any of those is returned as the path it refused, so it prints as `DIFFERS at
+ * daemonMetrics[1] (…)` and the run exits 1. Nothing else about the section is touched: the
+ * row count is still compared (`firstDifference` fails on a length mismatch), and so is every
+ * other field of every entry. `null` on one side against an object on the other is *not*
+ * asserted away — that is a live difference in the sample window and stays a difference.
+ */
+function normalizeDaemonCounters(
+  reference: Record<string, unknown>,
+  plugin: Record<string, unknown>,
+): string | null {
+  const sides: readonly (readonly [string, Record<string, unknown>])[] = [
+    ["reference", reference],
+    ["plugin", plugin],
+  ];
+  for (const [label, side] of sides) {
+    const metrics = side[DAEMON_METRICS];
+    if (!Array.isArray(metrics)) {
+      return `${DAEMON_METRICS} (${label} side is not an array: ${JSON.stringify(metrics) ?? "<absent>"})`;
+    }
+    for (let index = 0; index < metrics.length; index += 1) {
+      const entry = metrics[index] as unknown;
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        return `${DAEMON_METRICS}[${String(index)}] (${label} side is not an object)`;
+      }
+      const row = entry as Record<string, unknown>;
+      if (!Object.hasOwn(row, "time")) {
+        return `${DAEMON_METRICS}[${String(index)}] (${label} side has no time key)`;
+      }
+      if (!Object.hasOwn(row, TIMELINE_STATS)) {
+        return `${DAEMON_METRICS}[${String(index)}] (${label} side has no ${TIMELINE_STATS} key)`;
+      }
+      const stats = row[TIMELINE_STATS];
+      if (stats !== null && (typeof stats !== "object" || Array.isArray(stats))) {
+        return `${DAEMON_METRICS}[${String(index)}].${TIMELINE_STATS} (${label} side is neither an object nor null)`;
+      }
+    }
+  }
+  for (const [, side] of sides) {
+    for (const entry of side[DAEMON_METRICS] as readonly Record<string, unknown>[]) {
+      entry[TIMELINE_STATS] = LIVE_COUNTER;
+    }
+  }
+  return null;
+}
+
 /** The one-line log of what the set comparison skipped, e.g. `procs 1/21 vs 2/21`. */
 function ignoredLine(ignored: readonly RowCount[]): string {
   const parts = ignored.map(
@@ -509,10 +594,11 @@ function main(): void {
   console.log(ignoredLine(aligned.ignored));
   sortRowLists(reference, plugin);
   reconcileReportMode(reference, plugin);
+  // The daemon's live counters, replaced only once both sides' shapes are asserted to hold.
+  const counters = normalizeDaemonCounters(reference, plugin);
 
   const difference =
-    aligned.refusal ??
-    firstDifference(normalize(reference), normalize(plugin));
+    aligned.refusal ?? counters ?? firstDifference(normalize(reference), normalize(plugin));
   if (difference !== null) {
     console.log(`DIFFERS at ${difference}`);
     console.log(`  plugin report: ${pluginPath}`);
