@@ -7,7 +7,7 @@
 //
 // Importing is never allowed to break the plugin: a missing, unreadable or
 // malformed conf logs and yields the defaults. Nothing here throws.
-import { readFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 
 import { DEFAULT_KILL_COMMS, type GcSettings } from "../../shared/gc";
 
@@ -119,6 +119,27 @@ const KILL_COMMS_KEYS = new Set(["SLP_GC_KILL_COMMS", "SLP_GC_ORPHAN_COMMS"]);
 const UINT = /^\d{1,12}$/;
 
 /**
+ * One kill-comm token (slp-gc.bash:92): `''|*[!A-Za-z0-9._+-]*` is rejected, so
+ * a token is valid only when every character is in that set. Quotes, spaces,
+ * globs and shell metacharacters all disqualify the whole list.
+ */
+const KILL_COMM_TOKEN = /^[A-Za-z0-9._+-]+$/;
+
+/**
+ * `norm_thresholds`'s kill rule (slp-gc.bash:83-84). A kill value is kept only
+ * when it is at least the 1024 MB floor *and* at least the warn threshold;
+ * every other case resets to 4096 MB, and only then is raised to warn if warn
+ * is the larger. So `warn=2048, kill=1024` is 4096 (not 2048), while
+ * `warn=8192, kill=1024` is 8192.
+ */
+function normKillMb(warnMb: number, killMb: number | undefined): number {
+  if (killMb !== undefined && killMb >= MEM_KILL_FLOOR_MB && killMb >= warnMb) {
+    return killMb;
+  }
+  return Math.max(DEFAULT_GC_SETTINGS.memKillMb, warnMb);
+}
+
+/**
  * Strip one layer of surrounding quotes, as `read_config` does with
  * `${v#\"}` / `${v%\"}` / `${v#'}` / `${v%'}` (slp-gc.bash:1251).
  */
@@ -136,7 +157,9 @@ function unquote(value: string): string {
  * key wins, and a flag is on only when its value is exactly `1`. Numbers that
  * are not unsigned integers, or that are below the reference's floor, are
  * reported as problems and dropped so the default applies (the reference
- * resets them the same way). Never throws.
+ * resets them the same way). A kill-comm list with any token outside
+ * `[A-Za-z0-9._+-]`, or with no tokens at all, is dropped whole so the default
+ * list applies, exactly as `norm_thresholds` resets `KILL_COMMS`. Never throws.
  *
  * `values` holds only the keys the file actually set, clamped, so it can be
  * spread over `DEFAULT_GC_SETTINGS`. `problems` is the same list that is logged.
@@ -178,6 +201,17 @@ export function parseConf(
         delete values.killComms;
         continue;
       }
+      // One bad token poisons the whole list (slp-gc.bash:92-95): the reference
+      // resets all of `KILL_COMMS` to `DEF_KILL_COMMS` rather than dropping just
+      // the bad entries, so a partially valid list is never half-honoured.
+      const invalid = comms.filter((comm) => !KILL_COMM_TOKEN.test(comm));
+      if (invalid.length > 0) {
+        problems.push(
+          `invalid process name(s) for ${key}: ${invalid.join(" ")}; using the default comm list`,
+        );
+        delete values.killComms;
+        continue;
+      }
       values.killComms = comms;
       continue;
     }
@@ -194,15 +228,14 @@ export function parseConf(
     values[spec.field] = Number(value);
   }
 
-  // `norm_thresholds`: the kill threshold never sits below the warning one, and
-  // never below the 1024 MB floor. With kill unset, the reference default is
-  // raised to the warn value when warn is the larger.
-  if (values.memWarnMb !== undefined && values.memKillMb === undefined) {
-    values.memKillMb = Math.max(values.memWarnMb, DEFAULT_GC_SETTINGS.memKillMb);
-  }
-  if (values.memKillMb !== undefined) {
-    const floor = Math.max(MEM_KILL_FLOOR_MB, values.memWarnMb ?? DEFAULT_GC_SETTINGS.memWarnMb);
-    values.memKillMb = Math.max(floor, values.memKillMb);
+  // `norm_thresholds` (slp-gc.bash:82-84): the warn threshold defaults to 3072,
+  // and the kill threshold is only kept when it clears both the 1024 MB floor and
+  // warn — otherwise it resets to 4096 and is then raised to warn if needed.
+  if (values.memWarnMb !== undefined || values.memKillMb !== undefined) {
+    values.memKillMb = normKillMb(
+      values.memWarnMb ?? DEFAULT_GC_SETTINGS.memWarnMb,
+      values.memKillMb,
+    );
   }
 
   const warn = logFn(log, "warn");
@@ -217,6 +250,8 @@ export interface GcSettingsReaderInput {
   log: GcLog;
   /** Test seam: replaces the `node:fs/promises` read. */
   readFile?: (path: string) => Promise<string>;
+  /** Test seam: replaces the `node:fs/promises` lstat used for the symlink refusal. */
+  lstat?: (path: string) => Promise<{ isSymbolicLink(): boolean }>;
 }
 
 /**
@@ -233,15 +268,33 @@ function freshDefaults(): GcSettings {
 
 /**
  * Import the conf once and merge it over `DEFAULT_GC_SETTINGS`. A missing or
- * unreadable file logs `gc conf absent` and yields the defaults; a malformed one
- * yields the keys that parsed. Never rejects.
+ * unreadable file logs `gc conf absent` and yields the defaults; a symlinked one
+ * is refused the way `read_config` refuses it (slp-gc.bash:1245) and also yields
+ * the defaults; a malformed one yields the keys that parsed. Never rejects.
  */
 export function createGcSettingsReader(input: GcSettingsReaderInput): Promise<GcSettings> {
   const cached = imported.get(input.confPath);
   if (cached !== undefined) return cached;
 
   const read = input.readFile ?? ((path: string) => readFile(path, "utf8"));
+  const stat = input.lstat ?? ((path: string) => lstat(path));
   const pending = (async (): Promise<GcSettings> => {
+    // `read_config` refuses a symlinked conf: `[ -f "$file" ] && [ ! -L "$file" ]`
+    // (slp-gc.bash:1245). A stow/dotfile-managed link therefore yields the
+    // defaults and its target is never read at all.
+    try {
+      const info = await stat(input.confPath);
+      if (info.isSymbolicLink()) {
+        logFn(input.log, "warn")("gc conf is a symlink; using defaults", {
+          path: input.confPath,
+        });
+        return freshDefaults();
+      }
+    } catch {
+      // Not statable (absent, EACCES, a directory): the read below reports it, so
+      // the "absent" path stays a single log line.
+    }
+
     let text: string;
     try {
       text = await read(input.confPath);

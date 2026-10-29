@@ -4,10 +4,11 @@
 // The live conf lives at ~/.config/slp-room/slp-gc.conf. These tests never touch
 // it: they use inline strings, an injected `readFile`, or the byte-identical copy
 // captured in `docs/gc-port/slp-gc.conf` (Task 1).
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_KILL_COMMS, gcSettings } from "../../shared/gc";
 import { createGcSettingsReader, DEFAULT_GC_SETTINGS, parseConf } from "./settings";
@@ -48,8 +49,21 @@ describe("gc settings import", () => {
   });
 
   it("clamps kill below warn and to the 1024 floor", () => {
+    // slp-gc.bash:83-84: kill=1024 fails the `>= warn` test, so it is RESET to
+    // 4096 — not clamped up to warn — and 4096 is already above warn.
     const { values } = parseConf(conf, vi.fn());
-    expect(values.memKillMb).toBe(2048);
+    expect(values.memKillMb).toBe(4096);
+  });
+
+  it("raises the 4096 fallback to warn when warn is the larger", () => {
+    // warn=8192, kill=1024: reset to 4096, then raised to warn (slp-gc.bash:84).
+    const { values } = parseConf("SLP_GC_MEM_WARN_MB=8192\nSLP_GC_MEM_KILL_MB=1024\n", vi.fn());
+    expect(values.memKillMb).toBe(8192);
+  });
+
+  it("keeps a kill that clears both the floor and warn", () => {
+    const { values } = parseConf("SLP_GC_MEM_WARN_MB=2048\nSLP_GC_MEM_KILL_MB=6144\n", vi.fn());
+    expect(values.memKillMb).toBe(6144);
   });
 
   it("logs unknown keys and invalid numbers instead of throwing", () => {
@@ -151,6 +165,23 @@ describe("gc conf parsing details", () => {
     const { values, problems } = parseConf("SLP_GC_KILL_COMMS=\n", quietLog());
     expect(values.killComms).toBeUndefined();
     expect(problems.join("\n")).toContain("SLP_GC_KILL_COMMS");
+  });
+
+  it("resets the whole list when any kill-comm token is not a legal process name", () => {
+    // slp-gc.bash:92-95: each token must be `[A-Za-z0-9._+-]`; one bad token sets
+    // `bad=1` and the whole list becomes `DEF_KILL_COMMS`, not the good tokens.
+    const log = quietLog();
+    const { values, problems } = parseConf('SLP_GC_KILL_COMMS=node "bad token"\n', log);
+    expect(values.killComms).toBeUndefined();
+    expect({ ...DEFAULT_GC_SETTINGS, ...values }.killComms).toEqual(DEFAULT_KILL_COMMS);
+    expect(problems.join("\n")).toContain("SLP_GC_KILL_COMMS");
+    expect(log.warn).toHaveBeenCalled();
+  });
+
+  it("keeps a clean custom kill-comm list, punctuation and all", () => {
+    const { values, problems } = parseConf("SLP_GC_KILL_COMMS=node my-app.node_1+v2\n", quietLog());
+    expect(problems).toEqual([]);
+    expect(values.killComms).toEqual(["node", "my-app.node_1+v2"]);
   });
 
   it("survives unparseable lines and a bare newline-only file", () => {
@@ -278,5 +309,49 @@ describe("createGcSettingsReader", () => {
     expect(readFileSync(join(__dirname, "../../docs/gc-port/slp-gc.conf"), "utf8")).toContain(
       "SLP_GC_APPLY=0",
     );
+  });
+});
+
+describe("a symlinked conf is refused", () => {
+  // slp-gc.bash:1245 — `[ -f "$file" ] && [ ! -L "$file" ] || return 0`: a
+  // symlinked conf silently yields the defaults and its target is never read.
+  const dir = mkdtempSync(join(tmpdir(), "gc-conf-symlink-"));
+  const target = join(dir, "slp-gc.conf");
+  writeFileSync(
+    target,
+    "# settings that WOULD apply if the link were followed\nSLP_GC_APPLY=1\nSLP_GC_MAX_KILLS=4\n",
+  );
+  const linkNamed = (name: string) => {
+    const link = join(dir, name);
+    symlinkSync(target, link);
+    return link;
+  };
+  // Distinct link paths: the reader memoises per confPath.
+  const viaSeam = linkNamed("seam.conf");
+  const viaFs = linkNamed("fs.conf");
+
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("uses the defaults and never reads the link target", async () => {
+    const log = quietLog();
+    const readFile = vi.fn(async () => readFileSync(target, "utf8"));
+    const settings = await createGcSettingsReader({ confPath: viaSeam, log, readFile });
+
+    expect(settings).toEqual(DEFAULT_GC_SETTINGS);
+    // The target was never read: not through the seam, not through the defaults.
+    expect(readFile).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledTimes(1);
+    expect(log.warn).toHaveBeenCalledWith("gc conf is a symlink; using defaults", {
+      path: viaSeam,
+    });
+    expect(log.info).not.toHaveBeenCalled();
+  });
+
+  it("does not follow the link through the real fs reader either", async () => {
+    const settings = await createGcSettingsReader({ confPath: viaFs, log: quietLog() });
+    // The target would flip `apply` and `maxKills` if it were read, so equality
+    // with the defaults is itself the proof that it was not.
+    expect(settings).toEqual(DEFAULT_GC_SETTINGS);
+    expect(readFileSync(target, "utf8")).toContain("SLP_GC_MAX_KILLS=4");
   });
 });
