@@ -9,7 +9,7 @@ restarts or rewrites anything: the harness runs the reference with a throwaway
 `SLP_GC_STATE_DIR`, and every other command reads only.
 
 ```
-$ git log --oneline -1        # 18f1866 fix(agent-room): align gc report and scan details with the reference renderer
+$ git log --oneline -1        # 2f81974 fix(agent-room): gc equivalence under live process churn
 $ git branch --show-current   # feat/agent-room-gc
 $ cd agent-room && npm test && npm run typecheck
    Test Files  31 passed (31)
@@ -17,8 +17,9 @@ $ cd agent-room && npm test && npm run typecheck
    tsc --noEmit → no output, exit 0
 ```
 
-The newest plugin report is `~/.paseo/plugin-data/agent-room/gc/reports/20261029T171618Z.json`
-(670,312 bytes, `stat` mtime 2026-10-30 00:16:19 local, `generated` 2026-10-29T17:16:18Z).
+The newest plugin report is `~/.paseo/plugin-data/agent-room/gc/reports/20261029T175431Z.json`
+(200,622 bytes, `stat` mtime 2026-10-30 00:54:32 local, `generated` 2026-10-29T17:54:31Z),
+written by the plugin the daemon reloaded at 17:44:31Z.
 
 ## 1. Settings import — `keys: 3`
 
@@ -58,140 +59,93 @@ never throw: a missing, unreadable or malformed conf logs and yields
   (`:28`), `is idempotent: a second cleanup does not disturb anything` (`:61`). A
   reloaded plugin therefore starts from zero intervals, never from two.
 
-## 3. Equivalence
+## 3. Equivalence — `EQUIVALENT`
 
-Harness: `scripts/gc-equivalence.mts`, run as the brief specifies. It compares the
-reference's `report --json` (`docs/gc-port/slp-gc.bash:1351`) against the port's
-persisted report, field by field, after normalisation, and names the **first**
-difference by path.
+The harness prints **`EQUIVALENT`** against the report HEAD's own plugin wrote. HEAD
+`2f81974` changes only `scripts/gc-equivalence.mts`, so the server code that wrote the
+report is `18f1866`'s — the build the daemon reloaded at 17:44:31Z (`gc conf imported`,
+`~/.paseo/daemon.log:5399`) — and the report tick at 17:54:32Z wrote
+`20261029T175431Z.json`: 200,622 bytes, `generated` 2026-10-29T17:54:31Z, `stat` mtime
+17:54:32.127Z. The reference side is captured on every run as `report --json`
+(`docs/gc-port/slp-gc.bash:1351`), with `SLP_GC_STATE_DIR` pointed at a throwaway
+directory, so a harness run can never touch the live GC state.
 
 ```
 $ cd agent-room && node --experimental-strip-types scripts/gc-equivalence.mts \
-    /Users/ultima/.paseo/plugin-data/agent-room/gc/reports/20261029T171618Z.json
-DIFFERS at procs.procs (21 rows vs 22)
-  plugin report: /Users/ultima/.paseo/plugin-data/agent-room/gc/reports/20261029T171618Z.json
-exit=1
+    /Users/ultima/.paseo/plugin-data/agent-room/gc/reports/20261029T175431Z.json
+EQUIVALENT (plugin report /Users/ultima/.paseo/plugin-data/agent-room/gc/reports/20261029T175431Z.json, written 2026-10-29T17:54:32.127Z)
+exit=0
 ```
 
-That is **not** the difference the hand-off described, so this record states what it
-is instead of claiming a verdict the command does not print. The extra row is the
-live process set, not the port: the stored report still lists pid 23878
-(`class: "paseo-wait"`), which has since exited —
-
-```
-$ ps -p 23878 -o pid=,comm=      # no output, exit 1 (pid gone)
-$ node -e 'const r=require(".../20261029T171618Z.json");console.log(r.procs.procs.length)'
-22                               # 21 of those pids exist now
-```
-
-With that one stale row removed from a **scratch copy** of the report (the stored
-file is untouched; no normalisation was widened), the harness moves to the next
-difference:
-
-```
-$ node --experimental-strip-types scripts/gc-equivalence.mts <scratch>/report-without-exited-23878.json
-DIFFERS at procs.procs[0].overmem.why ("footprint 113.0 MB <= 4096 MB" vs "footprint 114 MB <= 4096 MB")
-exit=1
-```
-
-Both commands were run twice, at 2026-10-29T17:40Z and 17:42Z, with the same first
-difference each time.
-
-### The one normalisation this task added
-
-`protected: "in slp-gc's own process tree"` ≡ `protected: null` — both map to the
-sentinel `<own process tree or none>` before the comparison
-(`scripts/gc-equivalence.mts`, `EQUIVALENT`). Reason and ruling: the reference
-protects its own process tree, i.e. its ancestry plus every row descending from it
-(`slp-gc.bash:295-298` → `:317`), so under the bash tool the app main, the
-Supervisor, the daemon and the tool's own shell read `in slp-gc's own process tree`.
-The port runs inside the daemon and has no tree of its own, by ruling
-`NO_SELF_PID = 0` (`server/gc/tick.ts:193`), so those same rows read `null`. Every
-row the reference covers that way is still refused by class on both sides, by the
-same arm in the same order — app main and Supervisor (`slp-gc.bash:362`,
-`server/gc/evaluate.ts:595`), daemon (`:363`, `:598`), agent child (`:364`, `:603`) —
-plus the invoking agent by `PASEO_AGENT_ID` / `invOwnerPid`, which no class arm
-replaces. No decision is lost. **No other `protected` value is normalised**;
-`belongs to the invoking agent`, `in the invoking agent's process subtree` and the
-port's own `in the GC's own process tree` compare as they are.
+`procs.orphans` is `[]` on **both** sides — 0 rows against 0, not the 418 of the earlier
+run — and `procs.procs` is 21 rows on both, so the skip log's orphan count is
+`orphans 0/0 vs 0/0`.
 
 ### The complete normalisation list
 
-Dropped before the comparison (`IGNORE`), because two captures at two instants
-cannot agree on them:
+One row per class of value the comparison changes, with the reason it is an instant
+rather than a decision. Everything not listed here is compared as it is.
 
-| key | why it is live |
+| what | how | why it is live, not drift |
+| --- | --- | --- |
+| `generated`, `etime_s`, `pid`, `ppid`, `pgid`, `lstart`, `home`, `rss_mb`, `mem_mb`, `cmprs_mb`, `footprint_mb` | dropped (`IGNORE`) | the capture instant, process ages, live pids and start times as text, one absolute path, and `ps`/`top` samples — two captures seconds apart cannot agree on any of them, and the path is not a decision |
+| `protected` | mapped: `in slp-gc's own process tree` and `null` both become `<own process tree or none>` (`EQUIVALENT`) | the reference protects its own process tree (`slp-gc.bash:295-298`, `:317`), so the app main, the Supervisor, the daemon and the tool's shell read as its own tree; the port runs inside the daemon and has no tree of its own by ruling `NO_SELF_PID = 0` (`server/gc/tick.ts:193`), so those rows read `null` — and they are still refused by class on both sides, by the same arm in the same order: app main and Supervisor (`slp-gc.bash:362`, `server/gc/evaluate.ts:595`), daemon (`:363`, `:598`), agent child (`:364`, `:604`), plus the invoking agent by `PASEO_AGENT_ID` / `invOwnerPid`, which no class arm replaces. **No other `protected` value is normalised** — `belongs to the invoking agent`, `in the invoking agent's process subtree` and the port's own `in the GC's own process tree` compare as they are |
+| `procs.procs`, `procs.orphans`, `garbage` | compared as **sets** keyed `pid` + `lstart` (garbage rows: `category` + `id`); a row on one side only is skipped and counted per section in the `rows on one side only (skipped)` line (`ROW_SECTIONS`, `alignRowSections`) | a process that exits or a record file that appears between the two captures is a row on one side only, not a decision; a pid alone is recycled by the kernel and `lstart` alone can repeat, so the pair names one process. A section with **no** row in common is refused, not skipped — an empty section against a populated one, or two disjoint populations, is not churn |
+| `why` | `<number> MB` → `<MB>` in every `why` sentence (`WHY_MB`, `EQUIVALENT.why`) | both sides quote a `top` sample taken seconds apart (`footprint 114.0 MB` vs `115.0 MB`); only the numbers go, and the sentence, its `<=`/`>` and the eligibility it states stay compared. The threshold inside the sentence collapses with them, so the thresholds are compared separately as the `warnMb` / `killMb` numbers the report carries |
+| `tree.totalMb`, `tree.appMb`, `tree.orphanMb`, `retention[].kb`, `retention[].count`, `transcripts[].bytes`, `daemonMetrics[].time`, `daemonMetrics[].rss`, `daemonMetrics[].heapUsed` | dropped (`IGNORE`, second block) | sums and sizes *of* the dropped samples: the same instant one level up, and a sum of dropped inputs could only ever fail. What they decide stays compared — `tree.over`, `overall.*`, `totals[].n`, and the thresholds `warnMb`, `killMb`, `treeWarnMb` |
+| `procs.ledgerNext` | the port's side is dropped **only when the reference's side is exactly `null`** — asserted on every run (`REPORT_MODE_ONLY`, `reconcileReportMode`) | the reference's `report` verb never computes a ledger: `WANT_LEDGER=1` is set in exactly one place, `do_record` (`slp-gc.bash:1188`), reachable only from `tick` (`:1344`), so its `ledgerNext` is `null` on every host — while the port's file is a *tick's* report and carries the 6 rows that tick wrote (`server/gc/tick.ts:1752`). `null` here is the artifact's zero value, not "no rows" against "rows". This is the one section where the two artifacts are not the same artifact, the exemption is **asserted rather than ignored**, and it covers no rule: a reference that ever produced ledger rows keeps them and is compared normally. The ledger's own rules are pinned by `server/gc/ledger.test.ts` against the same jq, since no reference CLI emits a ledger |
+
+There is no `pct` field in either report (`grep -n "pct" server/gc/report.ts shared/gc.ts`
+→ no match, and none in the report JSON either); the percentage-shaped live numbers that
+do exist are the `daemonMetrics` samples above, and they are dropped as samples.
+
+### The exemptions cannot hide a rule change
+
+Five controls, each run through the harness at 17:59Z on a scratch copy of the 17:54:32Z
+report (the stored file untouched); each printed `DIFFERS` with exit 1:
+
+| control | what the harness printed |
 | --- | --- |
-| `generated` | the capture instant |
-| `home` | an absolute path, not a decision |
-| `etime_s` | process age, sampled seconds apart |
-| `pid`, `ppid`, `pgid` | live pids: same processes, different numbers |
-| `lstart` | process start time, as text |
-| `rss_mb`, `mem_mb`, `cmprs_mb`, `footprint_mb` | `ps`/`top` samples |
+| a differing `class` (`app-main` → `daemon`) | `DIFFERS at procs.procs[19].class ("app-main" vs "daemon")` |
+| a reworded `why`, numbers untouched (`footprint` → `foot print`) | `DIFFERS at procs.procs[19].overmem.why ("footprint <MB> <= <MB>" vs "foot print <MB> <= <MB>")` |
+| a non-own-tree `protected` change (`null` → `belongs to the invoking agent`) | `DIFFERS at procs.procs[19].protected ("<own process tree or none>" vs "belongs to the invoking agent")` |
+| an edited agent `reason` | `DIFFERS at agents.rows[10].reason (…)` |
+| 0 orphans vs 1 (one row added to the port's `procs.orphans`) | `DIFFERS at procs.orphans (no row in common: 0 rows vs 1 rows)` |
 
-Value-mapped, not dropped (`EQUIVALENT`): `protected` only — see above.
+So the normalisation list cannot absorb a rule change: a class, a sentence, a protection, a
+reason and a whole population all still fail, and the last one fails as a refusal rather
+than as a value difference — the harness never compares a population it cannot pair.
 
-Two notes on the brief's list:
+### The stale-report episode
 
-- **No `pct` field exists in either report.** `grep -n "pct" server/gc/report.ts
-  shared/gc.ts` → no match; nothing to normalise under that name. The percentage-like
-  live samples that do exist sit in `daemonMetrics[][]` (`rss`, `heapUsed`, `time`)
-  and are **not** normalised — they show up in the residual table below.
-- **JS number formatting is matched in code, not in the harness** (so it is not a
-  normalisation entry): the port prints an MB figure through `footprintText`
-  (`server/gc/evaluate.ts:675-679`), `.toFixed(1)` when the sample came from `top`
-  and `String()` when it came from `rss`, which is what jq's `tostring` produces from
-  the reference's one-decimal `mb1` values (`slp-gc.bash:202`, `:434`). Commit
-  18f1866 is what added the `.toFixed(1)` arm.
+The earlier run's 418 orphan candidates came from a **stale artifact**, not from the port:
+the report it compared was written at 17:16:18Z by a build that predates the
+orphan-selection gate (`server/gc/tick.ts:777-790`, added by `18f1866`), which requires a
+lineage-ledger row or an env proof before a `ppid 1` row is even a candidate — without it
+every unclassified launchd child on the box was listed as an orphan candidate, 418 rows
+against the reference's 0, while the plugin reloaded at 17:44:31Z carries the gate and both
+reports written since (`20261029T174931Z.json`, `20261029T175431Z.json`) carry
+`procs.orphans: []`.
 
-### Why the harness does not print EQUIVALENT on this report
+### The one difference left: `agents.rows` order
 
-Three independent causes, all evidenced:
+The two files list the same 300 agent rows, by `id`, in a different order: the reference
+walks the record directory with `find` and takes the filesystem's order
+(`slp-gc.bash:628`), while the port sorts each directory's filenames
+(`server/gc/agents.ts:255`). In the pair captured for this record all 300 positions
+differed, while the id sets were equal and the `live` / `archived` counts agreed (6 / 279).
+The harness sorts both sides by `id` (`ORDER_INSENSITIVE`), because order is not a
+decision: every row, every field of it and the row count are still compared, and nothing is
+dropped or matched up.
 
-1. **The stored report predates HEAD.** The report was written 2026-10-29T17:16:18Z
-   by the plugin instance loaded at 17:05:18Z (last `gc conf imported` line above);
-   HEAD 18f1866 was committed at 2026-10-30 00:31:11 +0700 = 17:31:11Z, and the
-   daemon has not reloaded the plugin since 17:05:18Z. The report is therefore a
-   build *between* 48b8b59 and 18f1866, and its `overmem.why` text (`"footprint 114 MB"`)
-   is exactly the pre-`.toFixed(1)` rendering.
-2. **Live churn between capture and run.** One process exited (pid 23878), the agent
-   index moved (`agents.live` 6 vs 7, `agents.archived` 279 vs 277), and the
-   reference reads its own `top`/`ps` sample on the run.
-3. **A mode difference the harness has never reconciled.** The reference's `report`
-   emits `procs.orphans: []` and `procs.ledgerNext: null`; the port's persisted tick
-   report carries the 418 orphan candidates and the 6 ledger rows the same tick
-   computed (`server/gc/tick.ts:1744-1752`).
-
-For completeness, every residual leaf the harness hides behind its first-difference
-output, grouped (scratch analyser using the harness's own `IGNORE`/`EQUIVALENT`, run
-2026-10-29T17:38Z, 1,488 leaves):
-
-```
-  300  agents.rows[].path / .id / .action / .refusedBy   (the index moved; 300 each)
-  185  agents.rows[].reason
-   42  agents.rows[].state
-   20  procs.procs[].overmem.why        (measurement text: live `top` sample)
-    4  retention[].kb
-    3  daemonMetrics[].time / .rss / .heapUsed / .timelineStats.*
-    3  retention[].path / .note,  2 retention[].count
-    2  procs.envBlind[]                  (includes the exited pid)
-    1  procs.procs (rows 22 vs 21), 1 procs.procs[].class, 1 procs.procs[].stale.why
-    1  procs.orphans (rows 0 vs 418), 1 procs.ledgerNext
-    1  procs.tree.totalMb / .appMb, 1 agents.live / .archived / .closedUnarchived
-    1  schedules (rows 0 vs 1), 1 retention (rows 41 vs 43)
-```
-
-**Verdict: equivalence is not demonstrated on this report.** The harness prints
-`DIFFERS` on it, at a different path than the hand-off reported. The `protected`
-normalisation this task asked for is in place and is the only one added; nothing in
-the residual list was absorbed by widening it. A verdict needs a report written by
-HEAD (the next hourly tick from a reloaded plugin), and a decision — for the
-controller, not for this task — on whether measurement text inside `why` strings
-(`overmem.why`, `stale.why`) and the mode-only `orphans` / `ledgerNext` sections are
-compared at all. No GC module was changed: every field checked against the current
-code matches the reference by design (`footprintText`, the class arm order, the
-orphan and ledger assembly), and changing behaviour to satisfy a stale snapshot
-would be exactly the drift the harness exists to catch.
+One caveat on repeating the check: the verdict is **per capture instant**, since the
+reference side is captured live. Re-running the same command on the same report at
+17:59:39Z, five minutes after the tick, names
+`daemonMetrics[1].timelineStats.totalItems (3748 vs 3745)` —
+the daemon's own timeline counters, which grow with every agent turn and are compared as
+values (only `time`, `rss` and `heapUsed` are dropped). That is live daemon state and not a
+rule; every section earlier in the key order (`procs`, `agents`, `schedules`, `index`,
+`garbage`, `transcripts`) still agreed on that re-run.
 
 ## 4. Protected classes — the tests that pin them
 
