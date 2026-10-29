@@ -36,13 +36,17 @@
 //    is the harmless direction. The stamp is written before the alert is recorded, as the
 //    reference does (:1224 before :1230).
 //
-// 4. **Nothing here can fail the caller for a reason outside the sample itself.** `rotate` answers
-//    a boolean and throws to nobody; `notify` is called inside a `try` that swallows everything
-//    (the reference's `|| true`, :1232), and its failure cannot change the returned alert text. A
-//    daemon-less machine, a missing `osascript`, a notification centre that is not running: each
-//    costs a popup, never the alert line. The two writes that *are* the record — the state
-//    directory and the append — do reject, because a tick that could not record must not believe
-//    it did.
+// 4. **A write that is the record can reject; everything else is swallowed.** `rotate` answers a
+//    boolean and throws to nobody, and `notify` runs inside a `try` that swallows everything (the
+//    reference's `|| true`, :1232), so a daemon-less machine, a missing `osascript` or a
+//    notification centre that is not running costs a popup, never the alert line. But the four
+//    writes that *are* the record reject out of `recordSample`: the state directory (`mkdir`; a
+//    refused `chmod` is ignored), the `memory.jsonl` append, the stamp (`writeStamp`, :1224) and
+//    the `alerts.log` append (:1230). A tick must therefore wrap its `recordSample` call in a
+//    `try`: a rejection means a sample or an alert that is not on disk, and letting it escape kills
+//    the tick. Whatever landed before the rejection stays landed — the stamp is written before the
+//    alert line, so a failed `alerts.log` append still rate-limits the next tick instead of
+//    re-alerting on it.
 //
 // The `system` block is the one input this module cannot derive: the reference reads `vm_stat`
 // and `sysctl vm.swapusage` itself (:1194-1202), which the port does through its exec seam in the
@@ -52,7 +56,7 @@
 
 import { spawnSync } from "node:child_process";
 import { appendFile, chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { renameSync, statSync } from "node:fs";
+import { lstatSync, renameSync } from "node:fs";
 import { join } from "node:path";
 
 import { DEFAULT_GC_SETTINGS } from "./settings";
@@ -125,10 +129,21 @@ export function rotate(file: string, maxBytes: number, incomingBytes: number): b
   }
 }
 
-/** `fsize` (:51-55) without following symlinks; `null` when it cannot be read. */
+/**
+ * `fsize` (:51-55): the size of the file at the path, **without** following a symlink.
+ *
+ * That is the reference's own semantics, not a strengthening: its `stat` defaults to `lstat(2)` on
+ * both branches — GNU's `stat -c %s` and BSD's `stat -f %z` only follow a link under `-L`, which
+ * `fsize` never passes — so `lstatSync` is the match. A symlink at the path therefore reads as "no
+ * regular file" and no rotation is attempted on it, which is what the reference's small link-size
+ * comparison amounts to.
+ *
+ * `null` when it cannot be read, and for anything that is not a regular file: the caller then
+ * simply appends, so a directory or a symlink at the path costs a rotation, never the sample.
+ */
 function fileSize(file: string): number | null {
   try {
-    const info = statSync(file);
+    const info = lstatSync(file);
     return info.isFile() ? info.size : null;
   } catch {
     return null;
@@ -496,7 +511,13 @@ async function readStamp(path: string): Promise<number> {
   return UINT.test(trimmed) ? Number(trimmed) : 0;
 }
 
-/** `echo "$NOW" > "$STATE/.alert-stamp"` (:1224), mode `0600`: the stamp is this tool's alone. */
+/**
+ * `echo "$NOW" > "$STATE/.alert-stamp"` (:1224), mode `0600`: the stamp is this tool's alone.
+ *
+ * This is one of the writes that *is* the record, so it rejects when the state dir will not take
+ * it — see `recordSample`. A rejected stamp happens before `alerts.log` is touched, so it costs the
+ * alert line, never a sample.
+ */
 async function writeStamp(path: string, now: number): Promise<void> {
   await writeFile(path, `${now}\n`, { encoding: "utf8", mode: 0o600 });
 }
@@ -519,13 +540,24 @@ async function writeStamp(path: string, now: number): Promise<void> {
  * prints on stdout (:1231), and `null` when no arm tripped *or* the window suppressed it. Those two
  * silences are deliberately indistinguishable to a caller: neither is an error, and the stamp says
  * which happened. A `notify` that throws changes neither the written line nor the return value.
+ *
+ * **Rejections.** Four writes can reject out of this function and a tick must catch all of them
+ * (see the module header): the state dir (`mkdir`), the `memory.jsonl` append, `writeStamp` and the
+ * `alerts.log` append. Each happens in the order above, so a rejection leaves everything earlier
+ * done — a failed `alerts.log` append still leaves the stamp written, and the next tick inside the
+ * window stays silent rather than re-alerting.
  */
 export async function recordSample(input: RecordSampleInput): Promise<RecordSampleResult> {
   const { stateDir, now } = input;
   await ensureStateDir(stateDir);
 
   const report = input.report;
-  const warnMb = numOrNull((report as RecordReport)?.procs?.warnMb) ?? DEFAULT_GC_SETTINGS.memWarnMb;
+  // A threshold of 0 (or a negative one) is not a threshold: `footprint >= 0` matches every
+  // process, so the report's value is read as absent and the settings default applies, exactly as
+  // it does when the report carries none.
+  const reportedWarnMb = numOrNull((report as RecordReport)?.procs?.warnMb);
+  const warnMb =
+    reportedWarnMb !== null && reportedWarnMb > 0 ? reportedWarnMb : DEFAULT_GC_SETTINGS.memWarnMb;
   const line = buildSample(report, now, input.system);
   const text = `${JSON.stringify(line)}\n`;
 

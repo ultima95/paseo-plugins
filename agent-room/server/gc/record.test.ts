@@ -7,7 +7,16 @@
 // The three tests from the task brief come first, unmodified in substance; the rest pin the
 // properties the brief's self-review asks about — the sample's shape, each alert reason, the
 // window, rotation with a predecessor, and a rotation that fails.
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -15,6 +24,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ReportOrphanRow, ReportProcRow } from "./report";
 import {
   ALERTS_FILE,
+  ALERTS_MAX_BYTES,
   ALERT_STAMP_FILE,
   ALERT_WINDOW_MINUTES,
   MEMORY_FILE,
@@ -122,10 +132,20 @@ function orphan(fields: Partial<ReportOrphanRow> & { pid: number; footprint_mb: 
 }
 
 /** A report whose process section is exactly what a case needs. */
-function reportWith(procs: readonly ReportProcRow[], orphans: readonly ReportOrphanRow[] = [], tree = {}): RecordReport {
+function reportWith(
+  procs: readonly ReportProcRow[],
+  orphans: readonly ReportOrphanRow[] = [],
+  tree = {},
+  warnMb?: number,
+): RecordReport {
   return {
     generated: "2027-01-15T08:00:00Z",
-    procs: { procs: [...procs], orphans: [...orphans], tree: tree as never },
+    procs: {
+      procs: [...procs],
+      orphans: [...orphans],
+      tree: tree as never,
+      ...(warnMb === undefined ? {} : { warnMb }),
+    },
   };
 }
 
@@ -269,6 +289,47 @@ describe("recordSample — alert reasons", () => {
     const quiet = reportWith([proc({ pid: 9, footprint_mb: 3071 })]);
     expect((await recordSample({ stateDir: below, report: quiet, now: 1_800_000_000, ...QUIET })).alert).toBeNull();
     expect(alertLines(below)).toEqual([]);
+  });
+
+  it("joins two over-threshold processes with '; ' inside the warn arm", async () => {
+    const dir = tmpDir("gc-warn2-");
+    // Both rows clear 3072: one alert, one arm, the rows joined by `join("; ")` (:1216) — not by
+    // the ` | ` that separates the arms (:1225-1227).
+    const trip = reportWith([
+      proc({ pid: 9, class: "daemon", footprint_mb: 4096 }),
+      proc({ pid: 8, class: "claude-child", footprint_mb: 3072 }),
+    ]);
+    const result = await recordSample({ stateDir: dir, report: trip, now: 1_800_000_000, ...QUIET });
+
+    expect(result.alert).toBe(
+      "2027-01-15T08:00:00Z ALERT footprint >= 3072 MB: daemon pid 9 4096 MB; " +
+        "claude-child pid 8 3072 MB",
+    );
+    // The separator itself, asserted on its own: a comma, a bare `;` or a second ` | ` fails here.
+    expect(result.alert).toContain("; ");
+    expect(result.alert?.split(" | ")).toHaveLength(1);
+    expect(alertLines(dir)).toEqual([result.alert as string]);
+  });
+
+  it("reads a non-positive report threshold as absent", async () => {
+    // `footprint >= 0` would match every process, so a report carrying `warnMb: 0` must not turn
+    // each row into an alert: the value reads as absent and the default 3072 applies.
+    const zero = tmpDir("gc-warn0-");
+    const ordinary = reportWith([proc({ pid: 7, footprint_mb: 10 })], [], {}, 0);
+    const quiet = await recordSample({ stateDir: zero, report: ordinary, now: 1_800_000_000, ...QUIET });
+    expect(quiet.alert).toBeNull();
+    expect(alertLines(zero)).toEqual([]);
+
+    const negative = tmpDir("gc-warnneg-");
+    const belowZero = reportWith([proc({ pid: 7, footprint_mb: 10 })], [], {}, -4096);
+    const alsoQuiet = await recordSample({ stateDir: negative, report: belowZero, now: 1_800_000_000, ...QUIET });
+    expect(alsoQuiet.alert).toBeNull();
+
+    // The fallback is the default, and the arm names it: a genuinely large row still trips.
+    const tripDir = tmpDir("gc-warn0-");
+    const large = reportWith([proc({ pid: 9, footprint_mb: 4096 })], [], {}, 0);
+    const tripped = await recordSample({ stateDir: tripDir, report: large, now: 1_800_000_000, ...QUIET });
+    expect(tripped.alert).toBe("2027-01-15T08:00:00Z ALERT footprint >= 3072 MB: daemon pid 9 4096 MB");
   });
 
   it("trips on the Paseo tree once its own over flag is set", async () => {
@@ -462,6 +523,27 @@ describe("recordSample — rotation", () => {
     expect(result.line.epoch).toBe(1_800_000_000);
   });
 
+  it("does not follow a symlink at the rotation path, as the reference's stat does not", async () => {
+    const dir = tmpDir("gc-symlink-");
+    const file = join(dir, MEMORY_FILE);
+    // A file over the cap sitting behind a symlink: a size read that followed the link would see
+    // the thickness and rotate the link away. The reference's `stat` is an `lstat`, so the path is
+    // not a regular file, no rotation is attempted, and the append follows the link.
+    const target = join(dir, "genuine.jsonl");
+    const old = "x".repeat(MEMORY_MAX_BYTES - 1);
+    writeFileSync(target, old);
+    symlinkSync(target, file);
+
+    const quiet = reportWith([proc({ pid: 1, footprint_mb: 10 })]);
+    const result = await recordSample({ stateDir: dir, report: quiet, now: 1_800_000_000, ...QUIET });
+
+    expect(lstatSync(file).isSymbolicLink()).toBe(true);
+    expect(existsSync(`${file}.1`)).toBe(false);
+    const grown = readFileSync(target, "utf8");
+    expect(grown.startsWith(old)).toBe(true);
+    expect(JSON.parse(grown.slice(old.length)) as MemorySample).toEqual(result.line);
+  });
+
   it("writes the state files 0600", async () => {
     const dir = tmpDir("gc-mode-");
     const trip = reportWith([proc({ pid: 9, footprint_mb: 4096 })]);
@@ -469,6 +551,79 @@ describe("recordSample — rotation", () => {
     for (const name of [MEMORY_FILE, ALERTS_FILE, ALERT_STAMP_FILE]) {
       expect(statSync(join(dir, name)).mode & 0o777).toBe(0o600);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// alerts.log's own rotation (slp-gc.bash:1229)
+// ---------------------------------------------------------------------------
+
+describe("recordSample — alerts.log rotation", () => {
+  const NOW = 1_800_000_000;
+  /** The one arm this fixture trips: fixed text, so the file can be sized to the byte. */
+  const TRIP_ALERT = "2027-01-15T08:00:00Z ALERT footprint >= 3072 MB: daemon pid 9 4096 MB";
+
+  it("rotates alerts.log at its own 1 MB cap, within one line of it", async () => {
+    const dir = tmpDir("gc-alertrot-");
+    expect(ALERTS_MAX_BYTES).toBe(1_048_576);
+    const alertsPath = join(dir, ALERTS_FILE);
+    // A live file one byte short of the cap *once the alert line lands* (`size + incoming > max`):
+    // as close to 1 MB as a file can be and still have to rotate.
+    const old = `${"x".repeat(ALERTS_MAX_BYTES - TRIP_ALERT.length)}\n`;
+    expect(Buffer.byteLength(old)).toBe(ALERTS_MAX_BYTES - TRIP_ALERT.length + 1);
+    writeFileSync(alertsPath, old);
+
+    const trip = reportWith([proc({ pid: 9, footprint_mb: 4096 })]);
+    const result = await recordSample({ stateDir: dir, report: trip, now: NOW, ...QUIET });
+
+    expect(result.alert).toBe(TRIP_ALERT);
+    // `rotate "$STATE/alerts.log" 1048576 ${#msg}` (:1229) is load-bearing: the old file is the
+    // predecessor, and the live path holds only the new line.
+    expect(readFileSync(`${alertsPath}.1`, "utf8")).toBe(old);
+    expect(readFileSync(alertsPath, "utf8")).toBe(`${TRIP_ALERT}\n`);
+    expect(existsSync(`${alertsPath}.1.1`)).toBe(false);
+    // The rotation is what kept the file under its cap.
+    expect(readFileSync(alertsPath, "utf8").length).toBeLessThan(ALERTS_MAX_BYTES);
+  });
+
+  it("leaves alerts.log alone while the line still fits", async () => {
+    const dir = tmpDir("gc-alertrot2-");
+    const alertsPath = join(dir, ALERTS_FILE);
+    // `size + incoming === max` is not over the cap: appended in place, no predecessor.
+    const old = `${"x".repeat(ALERTS_MAX_BYTES - TRIP_ALERT.length - 1)}\n`;
+    expect(Buffer.byteLength(old)).toBe(ALERTS_MAX_BYTES - TRIP_ALERT.length);
+    writeFileSync(alertsPath, old);
+
+    const trip = reportWith([proc({ pid: 9, footprint_mb: 4096 })]);
+    await recordSample({ stateDir: dir, report: trip, now: NOW, ...QUIET });
+
+    expect(existsSync(`${alertsPath}.1`)).toBe(false);
+    expect(readFileSync(alertsPath, "utf8")).toBe(`${old}${TRIP_ALERT}\n`);
+    // `${#msg}` is the line without its newline (:1229), so the appended file lands one byte over
+    // the cap — the reference's own accounting, kept as it is.
+    expect(readFileSync(alertsPath, "utf8").length).toBe(ALERTS_MAX_BYTES + 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The stamp before the alert line (slp-gc.bash:1224 before :1229-1230)
+// ---------------------------------------------------------------------------
+
+describe("recordSample — the stamp lands before the alert line", () => {
+  const NOW = 1_800_000_000;
+
+  it("leaves the stamp written when the alerts.log append fails", async () => {
+    const dir = tmpDir("gc-stampfirst-");
+    // A directory where alerts.log goes makes the append reject, so the alert line is lost ...
+    mkdirSync(join(dir, ALERTS_FILE), { recursive: true });
+    const trip = reportWith([proc({ pid: 9, footprint_mb: 4096 })]);
+
+    await expect(recordSample({ stateDir: dir, report: trip, now: NOW, ...QUIET })).rejects.toThrow();
+    // ... but :1224 ran before :1230, so the stamp already holds the new window: one failed alert
+    // file cannot turn the next tick inside the window into another alert ...
+    expect(readFileSync(join(dir, ALERT_STAMP_FILE), "utf8").trim()).toBe(String(NOW));
+    // ... and the sample itself is on disk — a failed alert never costs the history.
+    expect(sampleAt(dir).epoch).toBe(NOW);
   });
 });
 
