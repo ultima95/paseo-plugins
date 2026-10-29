@@ -11,6 +11,7 @@ import {
   AGENT_MIN_DAYS,
   buildStatus,
   collectProcsPhase,
+  emptyStatus,
   NO_SELF_PID,
   runTick,
   type TickDeps,
@@ -321,8 +322,8 @@ const DESCENDANT_CMD = "node /repo/build.mjs";
 const LSTART = "Thu Oct 29 11:43:21 2026";
 
 /** One `ps -axww -o pid=,ppid=,pgid=,etime=,rss=,lstart=,command=` line. */
-function psLine(input: { pid: number; ppid: number; rssKb: number; cmd: string }): string {
-  return `${input.pid} ${input.ppid} ${input.pid} 600 ${input.rssKb} ${LSTART} ${input.cmd}`;
+function psLine(input: { pid: number; ppid: number; rssKb: number; cmd: string; etime?: string }): string {
+  return `${input.pid} ${input.ppid} ${input.pid} ${input.etime ?? "600"} ${input.rssKb} ${LSTART} ${input.cmd}`;
 }
 
 /**
@@ -334,7 +335,7 @@ function machineExec(paseoHome: string): GcExec {
   const table = [
     psLine({ pid: 100, ppid: 1, rssKb: 2_097_152, cmd: APP_CMD }),
     psLine({ pid: 150, ppid: 100, rssKb: 2_097_152, cmd: SUP_CMD }),
-    psLine({ pid: 200, ppid: 150, rssKb: 3_145_728, cmd: DAEMON_CMD }),
+    psLine({ pid: 200, ppid: 150, rssKb: 3_145_728, cmd: DAEMON_CMD, etime: "2-03:04:05" }),
     psLine({ pid: 400, ppid: 200, rssKb: 2_097_152, cmd: CLAUDE_CMD }),
     psLine({ pid: process.pid, ppid: 400, rssKb: 4_194_304, cmd: DESCENDANT_CMD }),
   ].join("\n");
@@ -554,5 +555,105 @@ describe("runTick — the acting phases, with something to act on", () => {
     expect(status.candidates).toEqual([
       { kind: "agent", id: GARBAGE_ID, rule: "agent-archived", refusedBy: null },
     ]);
+    // The status the screen needs, from the same captured result: the identified
+    // daemon and its `ps` etime, the ledger it wrote back, the tick's index
+    // verdict, and when the report it just wrote is stamped.
+    expect(status.daemonPid).toBe(200);
+    expect(status.uptimeS).toBe(2 * 86400 + 3 * 3600 + 4 * 60 + 5);
+    expect(status.treeWarnMb).toBe(DEFAULT_GC_SETTINGS.treeWarnMb);
+    expect(status.ledger).toEqual({ note: null, rows: expect.any(Number) as number });
+    expect(status.index).toEqual({ ok: true, why: [] });
+    expect(status.lastReportAt).toBe(result.at);
+    // This tick's own memory alert is in the tail it publishes, stamped with the
+    // tick's instant.
+    expect(status.alerts).toHaveLength(1);
+    expect(status.alerts[0]?.at).toBe(result.at);
+    expect(status.alerts[0]?.text).toContain("ALERT");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The status fields added for the screen (fix round 1)
+// ---------------------------------------------------------------------------
+
+describe("the GC screen's status fields", () => {
+  it("publishes an honest empty status before any tick has run", () => {
+    const status = emptyStatus(settings());
+
+    expect(status.daemonPid).toBeNull();
+    expect(status.uptimeS).toBeNull();
+    expect(status.treeWarnMb).toBeNull();
+    expect(status.ledger).toEqual({ note: null, rows: 0 });
+    expect(status.index).toEqual({ ok: false, why: ["no tick has run yet"] });
+    expect(status.lastReportAt).toBeNull();
+    expect(status.alerts).toEqual([]);
+    // The acting block is unchanged and complete.
+    expect(status.settings).toEqual({
+      apply: false,
+      killStale: false,
+      killMemory: false,
+      memWarnMb: 3072,
+      memKillMb: 4096,
+    });
+  });
+
+  it("says no uptime, ledger rows or report while no tick has run", async () => {
+    // A failed settings/exec-free tick is still a tick: after it, the status is
+    // the tick's answer and not the empty status.
+    const test = await harness();
+    const status = buildStatus(await runTick(test.deps));
+
+    expect(status.daemonPid).toBeNull();
+    expect(status.uptimeS).toBeNull();
+    expect(status.ledger).toEqual({ note: null, rows: 0 });
+    expect(status.index).toEqual({ ok: true, why: [] });
+    // The first tick writes a report (no `.last-report` yet), so the stamp moves.
+    expect(status.lastReportAt).toBe(status.lastTickAt);
+  });
+
+  it("publishes the newest alerts.log lines, newest first, capped at 20", async () => {
+    // A tree threshold high enough that this tick's own sample adds no alert, so
+    // the file's contents are the only thing under test.
+    const test = await harness({}, { treeWarnMb: 999_999 });
+    await mkdir(test.deps.stateDir, { recursive: true, mode: 0o700 });
+    const lines = Array.from(
+      { length: 25 },
+      (_, index) => `2027-01-15T08:${String(index).padStart(2, "0")}:00Z ALERT line ${String(index)}`,
+    );
+    await writeFile(join(test.deps.stateDir, "alerts.log"), `${lines.join("\n")}\n`, "utf8");
+
+    const status = buildStatus(await runTick(test.deps));
+
+    expect(status.alerts).toHaveLength(20);
+    expect(status.alerts[0]).toEqual({ at: "2027-01-15T08:24:00Z", text: "ALERT line 24" });
+    expect(status.alerts[19]).toEqual({ at: "2027-01-15T08:05:00Z", text: "ALERT line 5" });
+  });
+
+  it("keeps an unstamped alerts.log line rather than dropping it", async () => {
+    const test = await harness({}, { treeWarnMb: 999_999 });
+    await mkdir(test.deps.stateDir, { recursive: true, mode: 0o700 });
+    await writeFile(
+      join(test.deps.stateDir, "alerts.log"),
+      "not a stamped line\n2027-01-15T08:00:00Z ALERT 1 arm\n",
+      "utf8",
+    );
+
+    const status = buildStatus(await runTick(test.deps));
+
+    expect(status.alerts).toEqual([
+      { at: "2027-01-15T08:00:00Z", text: "ALERT 1 arm" },
+      { at: "", text: "not a stamped line" },
+    ]);
+  });
+
+  it("degrades an unreadable alerts file to no alerts instead of failing", async () => {
+    const test = await harness({}, { treeWarnMb: 999_999 });
+    // A directory where the file belongs: reads and appends reject, the tick and
+    // the status do not.
+    await mkdir(join(test.deps.stateDir, "alerts.log"), { recursive: true, mode: 0o700 });
+
+    const status = buildStatus(await runTick(test.deps));
+
+    expect(status.alerts).toEqual([]);
   });
 });

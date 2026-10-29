@@ -137,15 +137,71 @@ export const gcActionSchema = z.object({
 export type GcAction = z.infer<typeof gcActionSchema>;
 
 /**
+ * One `alerts.log` line as the screen shows it: the line's own ISO stamp and the
+ * text after it. A line without a recognisable stamp keeps `at: ""` and its text
+ * verbatim — the file is the reference's, and a line this port cannot parse is
+ * still a line a person should see.
+ */
+export const gcAlertSchema = z.object({
+  at: z.string(),
+  text: z.string(),
+});
+
+export type GcAlert = z.infer<typeof gcAlertSchema>;
+
+/**
  * The GC screen's one read model: identification, when the last tick ran, when
  * the next report is due, the settings the tick acted on, the process rows it
  * judged and every record candidate it considered (refused ones included, so the
  * screen can show *why* something was not reclaimed).
+ *
+ * Everything the design's status block and history list ask for is published
+ * here, and every field that can be unknown for the current state is `null`/empty
+ * rather than filled with a plausible default: before the first tick the screen
+ * has to be able to say "no data yet", and a fabricated value would read as a
+ * measurement. The `daemonPid`/`uptimeS`, `ledger`, `index`, `lastReportAt` and
+ * `alerts` additions are the status-payload widening the screen needs — they
+ * describe the last tick and change no rule, decision, gate or action.
  */
 export const gcStatusSchema = z.object({
   ident: z.object({ ok: z.boolean(), why: z.string() }),
   lastTickAt: z.string().nullable(),
   nextReportAt: z.string().nullable(),
+  /**
+   * The identified daemon's pid (`Identity.daemonPid`), or `null` when the tick
+   * did not identify one. Not the same thing as the `daemon` process row: a row
+   * can be classified `daemon` while identification refuses it.
+   */
+  daemonPid: z.number().nullable(),
+  /**
+   * The identified daemon's uptime in seconds, from that process row's `ps`
+   * `etime` (`ProcEntry.etime_s`); `null` when no row was matched or the field
+   * could not be read (`etime_s` is `-1` then).
+   */
+  uptimeS: z.number().nullable(),
+  /**
+   * The tree warn threshold the last tick used (`SLP_GC_TREE_WARN_MB`), or `null`
+   * when it is "half of physical RAM". It sits beside `settings` rather than in
+   * it because no decision rule compares against it — it is the report's alert
+   * line — while `settings` is the acting block the rules read.
+   */
+  treeWarnMb: z.number().nullable(),
+  /**
+   * The lineage ledger the last tick read and wrote back: its row count and the
+   * reader's own note (`null` when it had none). `rows: 0` before any tick, and
+   * after a tick whose process phase failed.
+   */
+  ledger: z.object({ note: z.string().nullable(), rows: z.number() }),
+  /**
+   * The last tick's index verdict — both record scans complete — with the scans'
+   * own reasons. This is the tick's `index`, not a conclusion drawn from the
+   * candidates' refusal strings.
+   */
+  index: z.object({ ok: z.boolean(), why: z.array(z.string()) }),
+  /** When the last report text was written (`<state>/reports/*.txt`), or `null`. */
+  lastReportAt: z.string().nullable(),
+  /** The newest `alerts.log` lines, newest first, at most `ALERTS_STATUS_LIMIT`. */
+  alerts: z.array(gcAlertSchema),
   settings: z.object({
     apply: z.boolean(),
     killStale: z.boolean(),

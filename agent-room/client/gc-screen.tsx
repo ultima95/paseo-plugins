@@ -6,10 +6,17 @@ import { Pressable, ScrollView, Text, View } from "react-native";
 
 import { gcSettingsDefinition, type GcAction, type GcSettingsDocument } from "../shared/gc";
 import { gcRunRpc, gcStatusRpc } from "../shared/rpc";
-import type { RuleKey, StatusTone } from "./gc-view-model";
-import { actionRows, ruleConfirm, ruleValue, toGcRows } from "./gc-view-model";
+import type { RuleKey, StatusTone, ThresholdDraft, ThresholdKey } from "./gc-view-model";
+import {
+  actionRows,
+  ruleConfirm,
+  ruleValue,
+  thresholdDraft,
+  toGcRows,
+  validateThresholds,
+} from "./gc-view-model";
 import type { Surface, Theme } from "./seat-editor";
-import { ActionButton, Section, describeError, paddingFor } from "./seat-editor";
+import { ActionButton, Section, TextEntry, describeError, paddingFor } from "./seat-editor";
 
 /** The tick runs every minute; the screen only has to keep up with the clock. */
 const POLL_INTERVAL_MS = 2000;
@@ -38,6 +45,33 @@ const RULES: { key: RuleKey; label: string; hint: string }[] = [
     hint: "Signals the one proven orphan above the memory kill threshold.",
   },
 ];
+
+/**
+ * The three thresholds the design says are editable through settings. The
+ * reference's `SLP_GC_MEM_WARN_MB`, `SLP_GC_MEM_KILL_MB` and
+ * `SLP_GC_TREE_WARN_MB`, in whole megabytes.
+ */
+const THRESHOLDS: { key: ThresholdKey; label: string; placeholder: string; hint: string }[] = [
+  {
+    key: "memWarnMb",
+    label: "Warn per process (MB)",
+    placeholder: "3072",
+    hint: "A process at or above this footprint is flagged in the tables and in the alert.",
+  },
+  {
+    key: "memKillMb",
+    label: "Memory kill (MB)",
+    placeholder: "4096",
+    hint: "At least 1024 MB, and never below the warn threshold. The daemon is never memory-killed.",
+  },
+  {
+    key: "treeWarnMb",
+    label: "Warn for the Paseo tree (MB)",
+    placeholder: "half of RAM",
+    hint: "Blank means half of physical RAM, which is the reference's default.",
+  },
+];
+
 
 /** One `gc.run` the user started from this screen. */
 interface RunEntry {
@@ -85,18 +119,23 @@ function StatusLine(props: { surface: Surface; label: string; value: string; ton
 
 /**
  * The GC screen: what the last tick saw, what it would do, and the three rules
- * that decide whether it does it.
+ * and three thresholds that decide whether it does it.
  *
  * The screen is a window on `gc.status` — the last tick's captured result,
  * re-read every 2 s — plus two buttons that run one tick now (`gc.run`). It
  * starts nothing on its own, and it never re-derives a verdict the tick already
- * made: the candidate and process lists carry the tick's own refusals and its
- * own warn flags, so what is shown here is what a scheduled tick would do.
+ * made: the candidate and process lists, the index verdict, the ledger and the
+ * alert history all carry the tick's own answers, so what is shown here is what a
+ * scheduled tick would do. A field the tick has published as unknown reads "no
+ * data yet", which is the fresh-install state.
  *
- * Rules are saved to the plugin's `gc` settings document, which is layered over
- * the imported `slp-gc.conf`. A toggle only moves after its confirmation is
- * accepted; cancelling leaves the stored value exactly as it was. Turning a rule
- * on is the destructive direction, so its panel names the targets precisely.
+ * Rules and thresholds are saved to the plugin's `gc` settings document, which is
+ * layered over the imported `slp-gc.conf`. A toggle only moves after its
+ * confirmation is accepted; cancelling leaves the stored value exactly as it was.
+ * Turning a rule on is the destructive direction, so its panel names the targets
+ * precisely. A threshold is saved only when the draft passes `validateThresholds`
+ * — the reference's floors and the kill-above-warn rule — and an invalid draft
+ * shows its error inline instead of being clamped behind the user's back.
  */
 export function GcScreen(props: PluginScreenProps) {
   const { theme, layout } = props;
@@ -118,6 +157,8 @@ export function GcScreen(props: PluginScreenProps) {
   /** The rule whose confirmation is open, and the value it would save. */
   const [pending, setPending] = useState<{ rule: RuleKey; next: boolean } | null>(null);
   const [saveError, setSaveError] = useState("");
+  const [thresholds, setThresholds] = useState<ThresholdDraft | null>(null);
+  const [thresholdError, setThresholdError] = useState("");
   const [busy, setBusy] = useState<"" | "report" | "act">("");
   const [runError, setRunError] = useState("");
   const [runs, setRuns] = useState<RunEntry[]>([]);
@@ -136,6 +177,13 @@ export function GcScreen(props: PluginScreenProps) {
 
   const applyOn = ruleOn("apply");
 
+  // The threshold fields keep their own draft while they are being edited: the
+  // status poll re-renders every 2 s, and re-seeding the fields from it would
+  // delete what the user is typing. An untouched draft is null, so the fields
+  // follow the stored document and the last tick.
+  const thresholdFields: ThresholdDraft = thresholds ?? thresholdDraft(data, overrides);
+  const thresholdCheck = validateThresholds(thresholdFields);
+
   async function saveRule(rule: RuleKey, next: boolean): Promise<void> {
     if (revision === null || settings.saving) return;
     setSaveError("");
@@ -148,6 +196,26 @@ export function GcScreen(props: PluginScreenProps) {
       return;
     }
     // Re-read so the toggles show what the store holds, not the draft they saved.
+    await settings.reload();
+  }
+
+  async function saveThresholds(): Promise<void> {
+    if (revision === null || settings.saving) return;
+    // The validation is also a rendered gate (the button is disabled), but the
+    // save path checks it too: a keystroke that raced the render must not write
+    // a threshold the daemon would clamp behind the user's back.
+    const checked = validateThresholds(thresholdFields);
+    if (!checked.ok) {
+      setThresholdError(checked.error);
+      return;
+    }
+    setThresholdError("");
+    const saved = await settings.save({ ...overrides, ...checked.values }, revision);
+    if (!saved) {
+      setThresholdError(settings.saveError ?? "The thresholds were not saved. Reopen the screen and try again.");
+      return;
+    }
+    setThresholds(null);
     await settings.reload();
   }
 
@@ -213,8 +281,9 @@ export function GcScreen(props: PluginScreenProps) {
               </View>
             )}
             <Text style={muted}>
-              gc.status carries no report or alert history and no daemon uptime; those rows say so rather than guess.
-              Reports are written to the plugin's gc state directory.
+              Daemon pid and uptime, the ledger, the index verdict, the last report and the alerts all come from the
+              last tick's own answer. A row that says "no data yet" is a fresh install: nothing has run, so nothing is
+              reported.
             </Text>
           </Section>
 
@@ -324,6 +393,63 @@ export function GcScreen(props: PluginScreenProps) {
             {settings.saveError !== null || saveError.length > 0 ? (
               <Text style={danger}>{settings.saveError ?? saveError}</Text>
             ) : null}
+
+            <View
+              style={{
+                backgroundColor: theme.colors.surface2,
+                borderColor: theme.colors.border,
+                borderWidth: 1,
+                borderRadius: 8,
+                padding: pad,
+                gap: 6,
+              }}
+            >
+              <Text style={{ color: theme.colors.foreground, fontSize: 13, fontWeight: "600" }}>Thresholds</Text>
+              <Text style={muted}>
+                Saved to the same gc settings document, over slp-gc.conf. Whole megabytes; a change takes effect on the
+                next tick.
+              </Text>
+              {THRESHOLDS.map((field) => (
+                <View key={field.key} style={{ gap: 2 }}>
+                  <Text style={muted}>{field.label}</Text>
+                  <TextEntry
+                    surface={surface}
+                    value={thresholdFields[field.key]}
+                    placeholder={field.placeholder}
+                    disabled={revision === null || settings.saving}
+                    onChangeText={(text) => {
+                      setThresholdError("");
+                      setThresholds({ ...thresholdFields, [field.key]: text });
+                    }}
+                  />
+                  <Text style={muted}>{field.hint}</Text>
+                </View>
+              ))}
+              {thresholdCheck.ok ? null : <Text style={danger}>{thresholdCheck.error}</Text>}
+              {thresholdError ? <Text style={danger}>{thresholdError}</Text> : null}
+              <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: pad }}>
+                <ActionButton
+                  surface={surface}
+                  label={settings.saving ? "Saving…" : "Save thresholds"}
+                  disabled={revision === null || settings.saving || !thresholdCheck.ok}
+                  onPress={() => void saveThresholds()}
+                />
+                {thresholds === null ? null : (
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={() => {
+                      setThresholdError("");
+                      setThresholds(null);
+                    }}
+                  >
+                    <Text style={{ color: theme.colors.foregroundMuted }}>Discard changes</Text>
+                  </Pressable>
+                )}
+              </View>
+              {revision === null ? (
+                <Text style={warning}>The settings have not loaded, so the thresholds cannot be saved yet.</Text>
+              ) : null}
+            </View>
 
             <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: pad }}>
               <ActionButton
@@ -438,8 +564,45 @@ export function GcScreen(props: PluginScreenProps) {
 
           <Section
             surface={surface}
-            title="Runs from this screen"
-            subtitle="Each gc.run answer, newest first: what it acted on, and every row it refused."
+            title="History"
+            subtitle="The newest alerts.log lines, as gc.status publishes them: newest first, at most 20."
+          >
+            {rows === null || rows.alerts.length === 0 ? (
+              <Text style={muted}>
+                No alerts recorded yet. alerts.log is empty on a fresh install; the first alert appears when a memory
+                or orphan threshold trips.
+              </Text>
+            ) : null}
+            {rows?.alerts.map((alert) => (
+              <View
+                key={alert.key}
+                style={{
+                  backgroundColor: theme.colors.surface2,
+                  borderColor: theme.colors.statusWarning,
+                  borderWidth: 1,
+                  borderRadius: 8,
+                  padding: pad,
+                  gap: 2,
+                }}
+              >
+                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }} numberOfLines={1}>
+                  {alert.at}
+                </Text>
+                <Text style={{ color: theme.colors.foreground, fontSize: 12 }} numberOfLines={3}>
+                  {alert.text}
+                </Text>
+              </View>
+            ))}
+            <Text style={muted}>
+              The tail of the plugin's gc state alerts.log; the report texts themselves are files in the same
+              directory.
+            </Text>
+          </Section>
+
+          <Section
+            surface={surface}
+            title="Run results (this session)"
+            subtitle="Each gc.run answer this screen started, newest first: what it acted on, and every row it refused."
           >
             {runs.length === 0 ? (
               <Text style={muted}>Nothing run from here yet in this session.</Text>
@@ -478,8 +641,8 @@ export function GcScreen(props: PluginScreenProps) {
               );
             })}
             <Text style={muted}>
-              gc.status publishes no alert or report history, so this list is what this screen ran; the reports
-              themselves are files in the plugin's gc state directory.
+              Feedback for the two buttons above, kept in memory only. The history is the alert list, which comes from
+              alerts.log through gc.status.
             </Text>
           </Section>
         </View>

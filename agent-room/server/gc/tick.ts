@@ -102,7 +102,7 @@ import {
   type ReportTree,
   type ReportTreeRow,
 } from "./report";
-import { recordSample, type MemorySampleSystem, type Notify } from "./record";
+import { ALERTS_FILE, recordSample, type MemorySampleSystem, type Notify } from "./record";
 import { renderReport } from "./render";
 import { migrateState, type MigrateResult } from "./migrate";
 import { DEFAULT_GC_SETTINGS, type GcLog } from "./settings";
@@ -150,6 +150,16 @@ export const EXE_LOOKUP_CAP = 40;
 
 /** `ls -1 "$STATE/reports" | sort -r | tail -n +49` (slp-gc.bash:1327): 48 reports kept. */
 export const REPORTS_KEPT = 48;
+
+/**
+ * How many `alerts.log` lines `gc.status` publishes: the newest 20, newest first.
+ *
+ * The file is the reference's history surface (`:1229`) and rotates at 1 MB, so it
+ * can hold thousands of lines; the screen shows a tail, and a tail of a fixed size
+ * is the whole point of it. This is a status limit only — nothing in the GC's
+ * rules reads it, and the file itself is untouched.
+ */
+export const ALERTS_STATUS_LIMIT = 20;
 
 /**
  * The `selfPid` the tick passes when the caller supplies none: a sentinel that
@@ -1222,8 +1232,52 @@ export interface TickResult {
   settings: GcSettings;
   /** When the next report is due, ISO, or `null` when the interval is unreadable. */
   nextReportAt: string | null;
+  /**
+   * When a report text was last written, ISO: this tick's own `startedAt` when it
+   * wrote one (`.last-report` accepted it), else the `.last-report` stamp it read,
+   * else `null`. Read-only status: nothing in the tick's decisions reads it.
+   */
+  lastReportAt: string | null;
+  /** The newest `alerts.log` lines, newest first (`ALERTS_STATUS_LIMIT`), for the status. */
+  alerts: GcStatus["alerts"];
   /** The migration's answer on the tick that ran it, else `null`. */
   migrated: MigrateResult | null;
+}
+
+/**
+ * The newest `alerts.log` lines as `gc.status` publishes them, newest first.
+ *
+ * The file is append-only (`:1229`, after `recordSample`'s rotation), so the tail
+ * is the history: the last `limit` non-blank lines, reversed. A line reads
+ * `<iso> ALERT <arms>` — the reference's own shape — and is split at its first
+ * space: the stamp becomes `at`, the rest stays verbatim as `text`. A line whose
+ * first token is not an ISO stamp is kept whole with `at: ""`, because a line this
+ * port cannot parse is still an alert a person should see.
+ *
+ * An absent or unreadable file is `[]`: a fresh install has no alerts, and a
+ * status read must never fail over one.
+ */
+export async function readAlertTail(
+  stateDir: string,
+  limit: number = ALERTS_STATUS_LIMIT,
+): Promise<GcStatus["alerts"]> {
+  if (limit <= 0) return [];
+  let text: string;
+  try {
+    text = await readFile(join(stateDir, ALERTS_FILE), "utf8");
+  } catch {
+    return [];
+  }
+  const lines = text.split("\n").filter((line) => line.trim() !== "");
+  const tail = lines.slice(Math.max(0, lines.length - limit)).reverse();
+  return tail.map((line) => {
+    const space = line.indexOf(" ");
+    const head = space < 0 ? line : line.slice(0, space);
+    const stamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(head.trim());
+    return stamp
+      ? { at: head.trim(), text: line.slice(space + 1).trim() }
+      : { at: "", text: line.trim() };
+  });
 }
 
 /** Run one phase, logging and falling back instead of throwing (property 1). */
@@ -1563,6 +1617,10 @@ export async function runTick(
 
   const lastReport = await readLastReport(deps.stateDir);
   const reportDue = startedAt - lastReport >= settings.reportIntervalMin * 60;
+  // The `.last-report` stamp as this tick leaves it. Status only: it is what the
+  // screen's "last report" row shows, and it moves only when the file really
+  // landed (see the report phase below).
+  let reportedAt = lastReport;
 
   const tree = buildTree({
     rows: procsPhase.ps.rows,
@@ -1656,6 +1714,9 @@ export async function runTick(
         encoding: "utf8",
         mode: 0o600,
       });
+      // Only a report that landed moves the stamp: a failed write leaves the
+      // previous one, exactly as the file on disk does.
+      reportedAt = startedAt;
     }, undefined);
   }
 
@@ -1770,6 +1831,11 @@ export async function runTick(
       ? isoUtc((reportDue ? startedAt : lastReport) + settings.reportIntervalMin * 60)
       : null;
 
+  // --- the status tail (`alerts.log`, :1229). Read last, so an alert this tick
+  // just wrote is in it. Status only: no rule reads the file, and an unreadable
+  // one is an empty tail rather than a failed tick.
+  const alerts = await phase(log, "alerts tail", () => readAlertTail(deps.stateDir), []);
+
   return {
     at: isoUtc(epoch),
     epoch,
@@ -1779,6 +1845,8 @@ export async function runTick(
     acted,
     settings,
     nextReportAt,
+    lastReportAt: reportedAt > 0 ? isoUtc(reportedAt) : null,
+    alerts,
     migrated,
   };
 }
@@ -2073,12 +2141,27 @@ export function mergeGcSettings(
 // The screen's read model
 // ---------------------------------------------------------------------------
 
-/** The status a screen sees before the first tick has finished. */
+/**
+ * The status a screen sees before the first tick has finished.
+ *
+ * Every field the tick would fill is the honest empty value: no pid, no uptime, no
+ * ledger rows, an index that is *not* ok (with the reason being that nothing has
+ * run), no report and no alerts. The design's screen has to distinguish "a fresh
+ * install" from "a tick that saw nothing", and "not ok because no tick has run" is
+ * that distinction — a zero or an `ok: true` here would be a fabricated reading.
+ */
 export function emptyStatus(settings: GcSettings): GcStatus {
   return {
     ident: { ok: false, why: "no tick has run yet" },
     lastTickAt: null,
     nextReportAt: null,
+    daemonPid: null,
+    uptimeS: null,
+    treeWarnMb: settings.treeWarnMb,
+    ledger: { note: null, rows: 0 },
+    index: { ok: false, why: ["no tick has run yet"] },
+    lastReportAt: null,
+    alerts: [],
     settings: {
       apply: settings.apply,
       killStale: settings.killStale,
@@ -2097,12 +2180,39 @@ export function emptyStatus(settings: GcSettings): GcStatus {
  * The process rows are the report's own (already decisions-attached, `cmd`
  * stripped); the candidates are the *unfiltered* list, so a refused row arrives
  * with its rule key and the screen can say why nothing happened to it.
+ *
+ * The daemon identity, the ledger and the index are read off that same captured
+ * result — `ident.daemonPid`, the `daemon` row's `etime_s`, `ledgerNext` /
+ * `ledgerNote`, and the tick's one `index` verdict. Nothing here re-judges: the
+ * ledger row count is the ledger the tick wrote back, and `index` is the scans'
+ * own answer, not a conclusion drawn from refusal strings.
  */
 export function buildStatus(result: TickResult): GcStatus {
+  const ident = result.report.procs.ident;
+  const daemonRow =
+    ident.daemonPid === null
+      ? undefined
+      : result.report.procs.procs.find((row) => row.pid === ident.daemonPid);
+  const ledgerNext: unknown = result.report.procs.ledgerNext;
+  const ledgerNote = result.report.procs.ledgerNote;
+
   return {
     ident: { ok: result.report.procs.ident.ok, why: result.report.procs.ident.why },
     lastTickAt: result.at,
     nextReportAt: result.nextReportAt,
+    daemonPid: ident.daemonPid,
+    // `etime_s` is `-1` for a field `ps` did not give: unknown, not zero.
+    uptimeS: daemonRow === undefined || daemonRow.etime_s < 0 ? null : daemonRow.etime_s,
+    treeWarnMb: result.settings.treeWarnMb,
+    ledger: {
+      note: ledgerNote === "" ? null : ledgerNote,
+      // The tick always asks for the next ledger (`wantLedger: true`); `null` here
+      // means the process phase failed, and a failed phase recorded no rows.
+      rows: Array.isArray(ledgerNext) ? ledgerNext.length : 0,
+    },
+    index: { ok: result.report.index.ok, why: [...result.report.index.why] },
+    lastReportAt: result.lastReportAt,
+    alerts: result.alerts.map((alert) => ({ at: alert.at, text: alert.text })),
     settings: {
       apply: result.settings.apply,
       killStale: result.settings.killStale,

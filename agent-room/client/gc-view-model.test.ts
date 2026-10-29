@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
 
-import type { GcStatus } from "../shared/gc";
-import { actionRows, mbText, ruleConfirm, ruleValue, toGcRows } from "./gc-view-model";
+import type { GcSettingsDocument, GcStatus } from "../shared/gc";
+import {
+  actionRows,
+  mbText,
+  ruleConfirm,
+  ruleValue,
+  thresholdDraft,
+  toGcRows,
+  uptimeText,
+  validateThresholds,
+} from "./gc-view-model";
 
 const SETTINGS: GcStatus["settings"] = {
   apply: false,
@@ -17,11 +26,34 @@ function status(over: Partial<GcStatus> = {}): GcStatus {
     ident: { ok: true, why: "ok" },
     lastTickAt: "2027-01-15T08:00:00Z",
     nextReportAt: null,
+    daemonPid: null,
+    uptimeS: null,
+    treeWarnMb: 6144,
+    ledger: { note: null, rows: 0 },
+    index: { ok: true, why: [] },
+    lastReportAt: null,
+    alerts: [],
     settings: { ...SETTINGS },
     procs: [],
     candidates: [],
     ...over,
   };
+}
+
+/** A fresh install: `emptyStatus()`, field for field. */
+function freshStatus(over: Partial<GcStatus> = {}): GcStatus {
+  return status({
+    ident: { ok: false, why: "no tick has run yet" },
+    lastTickAt: null,
+    nextReportAt: null,
+    daemonPid: null,
+    uptimeS: null,
+    ledger: { note: null, rows: 0 },
+    index: { ok: false, why: ["no tick has run yet"] },
+    lastReportAt: null,
+    alerts: [],
+    ...over,
+  });
 }
 
 function row(rows: ReturnType<typeof toGcRows>, label: string) {
@@ -34,6 +66,13 @@ describe("toGcRows", () => {
       ident: { ok: true, why: "ok" },
       lastTickAt: "2027-01-15T08:00:00Z",
       nextReportAt: null,
+      daemonPid: null,
+      uptimeS: null,
+      treeWarnMb: null,
+      ledger: { note: null, rows: 0 },
+      index: { ok: true, why: [] },
+      lastReportAt: null,
+      alerts: [],
       settings: { apply: false, killStale: false, killMemory: false, memWarnMb: 3072, memKillMb: 4096 },
       procs: [],
       candidates: [{ kind: "agent", id: "a1", refusedBy: "archived 3d < 14d" }],
@@ -50,6 +89,13 @@ describe("toGcRows", () => {
       ident: { ok: false, why: "paseo.pid missing" },
       lastTickAt: null,
       nextReportAt: null,
+      daemonPid: null,
+      uptimeS: null,
+      treeWarnMb: null,
+      ledger: { note: null, rows: 0 },
+      index: { ok: false, why: ["no tick has run yet"] },
+      lastReportAt: null,
+      alerts: [],
       settings: { apply: false, killStale: false, killMemory: false, memWarnMb: 3072, memKillMb: 4096 },
       procs: [],
       candidates: [],
@@ -104,16 +150,17 @@ describe("toGcRows", () => {
   });
 
   it("survives an empty status and says no tick has run instead of inventing one", () => {
-    const rows = toGcRows(
-      status({ ident: { ok: false, why: "no tick has run yet" }, lastTickAt: null, nextReportAt: null }),
-    );
+    const rows = toGcRows(freshStatus());
     expect(rows.procs).toEqual([]);
     expect(rows.candidates).toEqual([]);
+    expect(rows.alerts).toEqual([]);
     expect(row(rows, "identification")?.value).toContain("no tick has run yet");
     expect(row(rows, "last tick")?.value).toBe("no tick has run yet");
     expect(row(rows, "daemon")?.value).toContain("no daemon row");
-    // An unread index is not reported as ok.
+    // The index is the tick's verdict, and "no tick has run" is not "ok".
+    expect(row(rows, "index")?.value).toBe("no tick has run yet");
     expect(row(rows, "index")?.value).not.toContain("ok");
+    expect(row(rows, "index")?.tone).toBe("muted");
   });
 
   it("formats MB values and the footprint against both thresholds", () => {
@@ -168,21 +215,101 @@ describe("toGcRows", () => {
     expect(row(rows, "processes over warn")?.value).toBe("1 of 2 process rows at or above 3072 MB");
   });
 
-  it("shows an index refusal from the candidates that carry it", () => {
+  it("shows the daemon pid identification named and the uptime the tick read for it", () => {
     const rows = toGcRows(
       status({
+        daemonPid: 1320,
+        uptimeS: 3 * 86400 + 4 * 3600 + 5 * 60 + 6,
+        procs: [{ pid: 1320, class: "daemon", owner: null, footprintMb: 1609.44, warn: false }],
+      }),
+    );
+    expect(row(rows, "daemon")?.value).toBe("pid 1320 · 1609.4 MB");
+    expect(row(rows, "daemon uptime")).toMatchObject({ value: "3 d 04:05:06", tone: "normal" });
+  });
+
+  it("prefers the identified pid over a row that merely classified as daemon", () => {
+    const rows = toGcRows(
+      status({
+        daemonPid: 200,
+        procs: [
+          { pid: 190, class: "daemon", owner: null, footprintMb: 10, warn: false },
+          { pid: 200, class: "daemon", owner: null, footprintMb: 900, warn: false },
+        ],
+      }),
+    );
+    expect(row(rows, "daemon")?.value).toBe("pid 200 · 900 MB");
+  });
+
+  it("says no data yet for the uptime, the report and the history of a fresh install", () => {
+    const rows = toGcRows(freshStatus());
+    expect(row(rows, "daemon uptime")?.value).toContain("no data yet");
+    expect(row(rows, "daemon uptime")?.tone).toBe("muted");
+    expect(row(rows, "last report")?.value).toBe("no report has been written yet");
+    expect(row(rows, "ledger")).toMatchObject({ value: "no ledger rows yet", tone: "muted" });
+  });
+
+  it("formats the uptime and refuses to invent one from a negative etime", () => {
+    expect(uptimeText(null)).toBe("no data yet");
+    expect(uptimeText(-1)).toBe("no data yet");
+    expect(uptimeText(0)).toBe("00:00");
+    expect(uptimeText(65)).toBe("01:05");
+    expect(uptimeText(3725)).toBe("01:02:05");
+    expect(uptimeText(90061)).toBe("1 d 01:01:01");
+  });
+
+  it("shows the ledger's row count and the reader's own note", () => {
+    const rows = toGcRows(status({ ledger: { note: null, rows: 12 } }));
+    expect(row(rows, "ledger")).toMatchObject({ value: "12 rows", tone: "normal" });
+
+    const complained = toGcRows(status({ ledger: { note: "lineage.tsv unreadable (mode 0644)", rows: 4 } }));
+    expect(row(complained, "ledger")).toMatchObject({
+      value: "4 rows · lineage.tsv unreadable (mode 0644)",
+      tone: "warning",
+    });
+  });
+
+  it("reads the index verdict from the tick, not from the candidates' refusal strings", () => {
+    const refused = toGcRows(
+      status({ index: { ok: false, why: ["agents/ unreadable", "schedules/ unreadable"] } }),
+    );
+    expect(row(refused, "index")).toMatchObject({
+      value: "refused: agents/ unreadable; schedules/ unreadable",
+      tone: "danger",
+    });
+
+    // A candidate refused by an index-incomplete rule does not decide the
+    // verdict: the tick's own index answer does.
+    const ticked = toGcRows(
+      status({
+        index: { ok: true, why: [] },
         candidates: [
           { kind: "agent", id: "a1", rule: "agent-archived", refusedBy: "index-incomplete: agents/ unreadable" },
         ],
       }),
     );
-    expect(row(rows, "index")).toMatchObject({ value: "refused: agents/ unreadable", tone: "danger" });
+    expect(row(ticked, "index")).toMatchObject({ value: "ok — both record scans completed", tone: "normal" });
+    expect(row(ticked, "index")?.tone).not.toBe("danger");
   });
 
-  it("does not publish what gc.status does not carry", () => {
-    const rows = toGcRows(status());
-    expect(row(rows, "daemon uptime")?.value).toBe("not published by gc.status");
-    expect(row(rows, "ledger")?.value).toBe("not published by gc.status");
+  it("shows the last report's clock when the tick published one", () => {
+    const rows = toGcRows(status({ lastReportAt: "2027-01-15T08:05:00Z" }));
+    expect(row(rows, "last report")?.value).toMatch(/^\d{2}:\d{2}:\d{2}$/);
+    expect(row(rows, "last report")?.tone).toBe("normal");
+  });
+
+  it("draws the alert tail as history, newest first, with a date and a stamp per line", () => {
+    const rows = toGcRows(
+      status({
+        alerts: [
+          { at: "2027-01-15T09:00:00Z", text: "ALERT 1 agent descendant(s) > 1024 MB: pid 500 node" },
+          { at: "", text: "a line this port could not stamp" },
+        ],
+      }),
+    );
+    expect(rows.alerts).toHaveLength(2);
+    expect(rows.alerts[0]?.text).toContain("ALERT");
+    expect(rows.alerts[0]?.at).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+    expect(rows.alerts[1]).toMatchObject({ at: "no stamp", text: "a line this port could not stamp" });
   });
 });
 
@@ -250,5 +377,64 @@ describe("actionRows", () => {
 
   it("returns no rows for an empty run", () => {
     expect(actionRows([])).toEqual([]);
+  });
+});
+
+describe("thresholdDraft", () => {
+  it("lets the saved document win and the last tick supply the rest", () => {
+    const document: GcSettingsDocument = { memKillMb: 6144, treeWarnMb: 8192 };
+    expect(thresholdDraft(status(), document)).toEqual({
+      memWarnMb: "3072",
+      memKillMb: "6144",
+      treeWarnMb: "8192",
+    });
+  });
+
+  it("follows the acted settings before any document override exists", () => {
+    expect(thresholdDraft(status({ treeWarnMb: null }), {})).toEqual({
+      memWarnMb: "3072",
+      memKillMb: "4096",
+      treeWarnMb: "",
+    });
+  });
+
+  it("leaves the fields blank before a status has answered, rather than inventing defaults", () => {
+    expect(thresholdDraft(null, null)).toEqual({ memWarnMb: "", memKillMb: "", treeWarnMb: "" });
+  });
+});
+
+describe("validateThresholds", () => {
+  it("accepts the reference's own shape and returns numbers", () => {
+    expect(validateThresholds({ memWarnMb: "3072", memKillMb: "4096", treeWarnMb: "6144" })).toEqual({
+      ok: true,
+      values: { memWarnMb: 3072, memKillMb: 4096, treeWarnMb: 6144 },
+    });
+  });
+
+  it("reads a blank tree threshold as the reference's null (half of RAM)", () => {
+    expect(validateThresholds({ memWarnMb: "3072", memKillMb: "4096", treeWarnMb: "" })).toEqual({
+      ok: true,
+      values: { memWarnMb: 3072, memKillMb: 4096, treeWarnMb: null },
+    });
+  });
+
+  it("refuses a kill threshold below 1024 MB and nothing is saved", () => {
+    const checked = validateThresholds({ memWarnMb: "512", memKillMb: "900", treeWarnMb: "" });
+    expect(checked.ok).toBe(false);
+    expect(checked.ok ? "" : checked.error).toContain("1024 MB");
+  });
+
+  it("refuses a kill threshold below the warn threshold", () => {
+    const checked = validateThresholds({ memWarnMb: "3072", memKillMb: "2048", treeWarnMb: "" });
+    expect(checked.ok).toBe(false);
+    expect(checked.ok ? "" : checked.error).toContain("at least the warn threshold (3072 MB, got 2048 MB)");
+  });
+
+  it("refuses anything that is not a whole number of megabytes", () => {
+    expect(validateThresholds({ memWarnMb: "", memKillMb: "4096", treeWarnMb: "" }).ok).toBe(false);
+    expect(validateThresholds({ memWarnMb: "3.5", memKillMb: "4096", treeWarnMb: "" }).ok).toBe(false);
+    expect(validateThresholds({ memWarnMb: "0", memKillMb: "4096", treeWarnMb: "" }).ok).toBe(false);
+    expect(validateThresholds({ memWarnMb: "3072", memKillMb: "4096", treeWarnMb: "0" }).ok).toBe(false);
+    expect(validateThresholds({ memWarnMb: "3072", memKillMb: "4096", treeWarnMb: "lots" }).ok).toBe(false);
   });
 });
