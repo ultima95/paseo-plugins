@@ -1,44 +1,75 @@
 // The agent and schedule index: the two reads whose completeness every deletion
-// depends on.
+// depends on, built from on-disk records exactly as the reference builds them.
 //
-// Every case here is a mock of the SDK's own shapes (`@getpaseo/client`): the
-// agent list returns `{ entries: [{ agent }], pageInfo }` and the schedule list
-// returns `{ schedules, error }`. No live daemon, agent or schedule is touched
-// and the reference tool is never run. The derivations under test are the
-// reference's `AGENT_JQ` (slp-gc.bash:212-225) and `SCHED_JQ` (slp-gc.bash:228-252).
-import type { PaseoApi } from "@getpaseo/client";
-import { describe, expect, it, vi } from "vitest";
+// Every case writes synthetic records into a fresh temp directory shaped like
+// the daemon's home (`agents/<workspace>/<id>.json`, `schedules/<id>.json`). No
+// live `~/.paseo` directory is read, no daemon, agent or schedule is touched, and
+// the reference tool is never run. The derivations under test are the
+// reference's `AGENT_JQ` (slp-gc.bash:212-225), `SCHED_JQ` (slp-gc.bash:228-252)
+// and the two scans `extract_agents` / `extract_schedules` (slp-gc.bash:623-661).
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
-import {
-  isoEpoch,
-  snapshotAgents,
-  snapshotSchedules,
-  type AgentsApi,
-  type SchedulesApi,
-} from "./agents";
+import { afterAll, describe, expect, it, vi } from "vitest";
+
+import { isoEpoch, snapshotAgents, snapshotSchedules } from "./agents";
 
 /** A fixed clock: the reference's epoch-second comparisons are all `NOW`-relative. */
 const NOW = 1_800_000_000;
 
 const iso = (seconds: number): string => new Date(seconds * 1000).toISOString();
 
-/** A fake `paseo` carrying only the agent list, cast like the SDK's own surface. */
-function agentsPaseo(list: (options?: unknown) => Promise<unknown>): AgentsApi {
-  return { agents: { list: vi.fn(list) } } as unknown as AgentsApi;
+// ---------------------------------------------------------------------------
+// temp homes
+// ---------------------------------------------------------------------------
+
+const homes: string[] = [];
+
+/** A fresh `$PASEO_HOME` stand-in; removed after the file finishes. */
+async function makeHome(): Promise<string> {
+  const home = await mkdtemp(join(tmpdir(), "gc-agents-"));
+  homes.push(home);
+  return home;
 }
 
-/** A fake `paseo` for the schedule surface (or for one that is missing). */
-function schedulesPaseo(api: Record<string, unknown>): SchedulesApi {
-  return api as unknown as SchedulesApi;
+afterAll(async () => {
+  await Promise.all(homes.map((home) => rm(home, { recursive: true, force: true })));
+});
+
+/** Write one file, creating its parents; a string is written verbatim (for corrupt records). */
+async function put(home: string, relative: string, value: unknown): Promise<string> {
+  const path = join(home, relative);
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, typeof value === "string" ? value : JSON.stringify(value, null, 2));
+  return path;
 }
 
-/** One agent snapshot with every key the deletion rule reads (AGENT_JQ:217-225). */
+/** `agents/<workspace>/<name>` — the depth `extract_agents` scans (slp-gc.bash:628). */
+function putAgent(home: string, workspace: string, name: string, value: unknown): Promise<string> {
+  return put(home, join("agents", workspace, name), value);
+}
+
+/** `schedules/<name>` — flat, `mindepth 1 -maxdepth 1` (slp-gc.bash:650). */
+function putSchedule(home: string, name: string, value: unknown): Promise<string> {
+  return put(home, join("schedules", name), value);
+}
+
+// ---------------------------------------------------------------------------
+// record factories, shaped like the daemon's own files
+// ---------------------------------------------------------------------------
+
+/**
+ * One agent record with every key the deletion rule reads. `id`, `provider`,
+ * `lastStatus`, `archivedAt` (null), `internal`, `updatedAt`, `cwd`, `labels`
+ * and `runtimeInfo.sessionId` are the keys observed in a real record.
+ */
 function agent(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id: "a1",
     provider: "claude",
     cwd: "/tmp",
-    status: "idle",
+    lastStatus: "idle",
     updatedAt: iso(NOW - 60),
     archivedAt: null,
     internal: false,
@@ -47,23 +78,16 @@ function agent(over: Record<string, unknown> = {}): Record<string, unknown> {
   };
 }
 
-/** One `FetchAgentsEntry`: the snapshot plus the project it sits in. */
-function entry(over: Record<string, unknown> = {}): Record<string, unknown> {
-  return { agent: agent(over), project: null };
-}
-
-function page(entries: unknown[], hasMore = false, nextCursor: string | null = null) {
-  return { entries, pageInfo: { hasMore, nextCursor, prevCursor: null } };
-}
-
-/** One schedule summary (protocol `ScheduleSummary`) with its runs for the test. */
+/** One schedule record with every key SCHED_JQ reads. */
 function schedule(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    id: "s1",
+    id: "cff78540",
     name: null,
     prompt: "sweep the room",
     status: "active",
     target: { type: "agent", agentId: "a1" },
+    cadence: { type: "cron", expression: "*/2 * * * *" },
+    createdAt: iso(NOW - 7200),
     updatedAt: iso(NOW - 7200),
     lastRunAt: null,
     nextRunAt: null,
@@ -98,95 +122,61 @@ describe("isoEpoch", () => {
 });
 
 describe("snapshotAgents", () => {
-  it("maps API records and marks index ok", async () => {
-    const paseo = agentsPaseo(async () =>
-      page([
-        entry({ id: "a1", archivedAt: null }),
-        entry({
-          id: "a2",
-          provider: "command-code",
-          cwd: null,
-          archivedAt: "2026-10-01T00:00:00Z",
-        }),
-      ]),
+  it("maps the records on disk and marks the index ok", async () => {
+    const home = await makeHome();
+    await putAgent(home, "workspace-one", "a1.json", agent({ id: "a1", archivedAt: null }));
+    await putAgent(
+      home,
+      "workspace-two",
+      "a2.json",
+      agent({
+        id: "a2",
+        provider: "command-code",
+        cwd: null,
+        archivedAt: "2026-10-01T00:00:00Z",
+      }),
     );
 
-    const { agents, index } = await snapshotAgents(paseo);
+    const { agents, index } = await snapshotAgents(home);
 
-    expect(index.ok).toBe(true);
+    expect(index).toEqual({ ok: true, why: [] });
     expect(agents.map((a) => a.id)).toEqual(["a1", "a2"]);
     expect(agents[1].archivedEpoch).toBe(Date.parse("2026-10-01T00:00:00Z") / 1000);
     expect(agents[0].archivedEpoch).toBeNull();
+    expect(agents[0]).toMatchObject({ provider: "claude", cwd: "/tmp", status: "idle" });
   });
 
-  it("a failed read yields an incomplete index and no agents", async () => {
-    const log = { warn: vi.fn() };
-    const paseo = agentsPaseo(async () => {
-      throw new Error("boom");
-    });
+  it("reads `status` out of the record's `lastStatus`, as AGENT_JQ does", async () => {
+    const home = await makeHome();
+    await putAgent(home, "w", "a1.json", agent({ lastStatus: "closed" }));
+    // A record that carries `status` but no `lastStatus` gets a null status and
+    // fails strict: the reference reads `.lastStatus` only.
+    await putAgent(home, "w", "a2.json", agent({ id: "a2", lastStatus: undefined, status: "closed" }));
 
-    const { agents, index } = await snapshotAgents(paseo, { log });
+    const { agents } = await snapshotAgents(home);
 
-    expect(agents).toEqual([]);
-    expect(index.ok).toBe(false);
-    expect(index.why.join()).toContain("boom");
-    // The failure is logged as well as reported: a silent refusal would look
-    // like a healthy empty home.
-    expect(log.warn).toHaveBeenCalled();
+    expect(agents[0].status).toBe("closed");
+    expect(agents[1].status).toBeNull();
+    expect(agents[1].strict).toBe(false);
   });
 
-  it("asks for archived and internal records, as the reference's file scan does", async () => {
-    const list = vi.fn(async (_request?: unknown) => page([entry()]));
-    const paseo = { agents: { list } } as unknown as AgentsApi;
-
-    await snapshotAgents(paseo);
-
-    expect(list.mock.calls[0][0]).toMatchObject({
-      filter: { includeArchived: true, includeInternal: true },
-    });
-  });
-
-  it("follows pageInfo until the daemon has no more agents", async () => {
-    // A partial index is the one thing reclamation cannot tolerate: a missing
-    // record hides a live parent or a targeting schedule.
-    const list = vi
-      .fn()
-      .mockResolvedValueOnce(page([entry({ id: "a1" })], true, "cursor-2"))
-      .mockResolvedValueOnce(page([entry({ id: "a2" })], false));
-    const paseo = { agents: { list } } as unknown as AgentsApi;
-
-    const { agents, index } = await snapshotAgents(paseo);
-
-    expect(index.ok).toBe(true);
-    expect(agents.map((a) => a.id)).toEqual(["a1", "a2"]);
-    expect(list.mock.calls[1][0]).toMatchObject({ page: { cursor: "cursor-2" } });
-  });
-
-  it("an unreachable next page fails the index instead of truncating it", async () => {
-    const list = vi.fn(async () => page([entry({ id: "a1" })], true, null));
-    const paseo = { agents: { list } } as unknown as AgentsApi;
-
-    const { index } = await snapshotAgents(paseo);
-
-    expect(index.ok).toBe(false);
-    expect(index.why.join()).toContain("cursor");
-  });
-
-  it("reads the decision fields of one snapshot", async () => {
-    const paseo = agentsPaseo(async () =>
-      page([
-        entry({
-          id: "child",
-          status: "closed",
-          archivedAt: iso(NOW - 20 * 86400),
-          internal: false,
-          labels: { "paseo.parent-agent-id": "parent", other: "value" },
-          runtimeInfo: { provider: "claude", sessionId: "sess-1" },
-        }),
-      ]),
+  it("reads the decision fields of one record", async () => {
+    const home = await makeHome();
+    await putAgent(
+      home,
+      "w",
+      "child.json",
+      agent({
+        id: "child",
+        lastStatus: "closed",
+        archivedAt: iso(NOW - 20 * 86400),
+        internal: false,
+        labels: { "paseo.parent-agent-id": "parent", other: "value" },
+        runtimeInfo: { provider: "claude", sessionId: "sess-1" },
+      }),
     );
 
-    const { agents } = await snapshotAgents(paseo);
+    const { agents } = await snapshotAgents(home);
 
     expect(agents[0]).toMatchObject({
       id: "child",
@@ -202,9 +192,10 @@ describe("snapshotAgents", () => {
   });
 
   it("defaults a missing label map and a missing runtime info", async () => {
-    const paseo = agentsPaseo(async () => page([entry({ labels: "nope" })]));
+    const home = await makeHome();
+    await putAgent(home, "w", "a1.json", agent({ labels: "nope", runtimeInfo: undefined }));
 
-    const { agents } = await snapshotAgents(paseo);
+    const { agents } = await snapshotAgents(home);
 
     expect(agents[0].labels).toEqual({});
     expect(agents[0].parent).toBeNull();
@@ -221,91 +212,198 @@ describe("snapshotAgents", () => {
     ["no archivedAt key", { archivedAt: undefined }, false],
     ["a numeric archivedAt", { archivedAt: 1790000000 }, false],
     ["a null archivedAt", { archivedAt: null }, true],
-    ["no status", { status: undefined }, false],
+    ["no lastStatus", { lastStatus: undefined }, false],
     ["no updatedAt", { updatedAt: undefined }, false],
   ];
   it.each(strictCases)("strict is %s -> %s", async (_label, over, expected) => {
-    const record = agent(over);
-    for (const [key, value] of Object.entries(over)) {
-      if (value === undefined) delete record[key];
-    }
-    const paseo = agentsPaseo(async () => page([{ agent: record }]));
+    const home = await makeHome();
+    await putAgent(home, "w", "a1.json", agent(over));
 
-    const { agents } = await snapshotAgents(paseo);
+    const { agents } = await snapshotAgents(home);
 
+    expect(agents).toHaveLength(1);
     expect(agents[0].strict).toBe(expected);
   });
 
-  it("flags an internal record without making it strict", async () => {
-    const paseo = agentsPaseo(async () => page([entry({ internal: true })]));
+  it("flags an internal record without making it non-strict", async () => {
+    const home = await makeHome();
+    await putAgent(home, "w", "a1.json", agent({ internal: true }));
 
-    const { agents } = await snapshotAgents(paseo);
+    const { agents } = await snapshotAgents(home);
 
     expect(agents[0].internal).toBe(true);
     expect(agents[0].strict).toBe(true);
   });
 
   it("an invalid archivedAt yields a null epoch, never NaN", async () => {
-    const paseo = agentsPaseo(async () =>
-      page([entry({ archivedAt: "2026-10-01T00:00:00+02:00" })]),
-    );
+    const home = await makeHome();
+    await putAgent(home, "w", "a1.json", agent({ archivedAt: "2026-10-01T00:00:00+02:00" }));
 
-    const { agents } = await snapshotAgents(paseo);
+    const { agents } = await snapshotAgents(home);
 
     expect(agents[0].archivedAt).toBe("2026-10-01T00:00:00+02:00");
     expect(agents[0].archivedEpoch).toBeNull();
   });
 
-  it("drops a record it cannot identify and fails the index", async () => {
-    // The reference keeps such a record as `unreadable` and lets its id block
-    // deletions; here the whole index refuses instead, which is the same
-    // fail-closed answer for a caller that has no path to file contents.
-    const paseo = agentsPaseo(async () =>
-      page([entry({ id: "a1" }), { agent: { provider: "claude" } }, { agent: { id: "" } }]),
-    );
+  it("a corrupt record fails the index but still returns the good ones", async () => {
+    // The ruling: a record that fails to parse sets `index.ok: false` with the
+    // reason, and the records that did parse still come back. The failed index
+    // is what refuses reclamation downstream.
+    const home = await makeHome();
+    await putAgent(home, "w", "a1.json", agent({ id: "a1" }));
+    const bad = await putAgent(home, "w", "a2.json", '{"id": "a2", ');
 
-    const { agents, index } = await snapshotAgents(paseo);
+    const log = { warn: vi.fn() };
+    const { agents, index } = await snapshotAgents(home, { log });
 
     expect(agents.map((a) => a.id)).toEqual(["a1"]);
     expect(index.ok).toBe(false);
-    expect(index.why.join()).toContain("id");
+    expect(index.why.join("\n")).toContain(bad);
+    expect(index.why.join("\n")).toContain("invalid JSON");
+    // A silent `ok:false` would look like a healthy, empty home.
+    expect(log.warn).toHaveBeenCalled();
   });
 
-  it("fails the index when a record has no provider", async () => {
-    const paseo = agentsPaseo(async () =>
-      page([{ agent: { id: "a1", status: "idle", updatedAt: iso(NOW) } }]),
-    );
+  it("drops a record it cannot identify, fails the index, and keeps the rest", async () => {
+    const home = await makeHome();
+    await putAgent(home, "w", "a1.json", agent({ id: "a1" }));
+    await putAgent(home, "w", "no-id.json", agent({ id: undefined }));
+    await putAgent(home, "w", "empty-id.json", agent({ id: "" }));
+    await putAgent(home, "w", "no-provider.json", agent({ id: "a3", provider: undefined }));
+    await putAgent(home, "w", "not-an-object.json", "[]");
 
-    const { agents, index } = await snapshotAgents(paseo);
+    const { agents, index } = await snapshotAgents(home);
+
+    expect(agents.map((a) => a.id)).toEqual(["a1"]);
+    expect(index.ok).toBe(false);
+    const why = index.why.join("\n");
+    expect(why).toContain("missing id");
+    expect(why).toContain("missing provider");
+    expect(why).toContain("not a JSON object");
+  });
+
+  it("an absent agents directory is a healthy, empty index", async () => {
+    // slp-gc.bash:627 — `[ ! -d "$PHOME/agents" ]` answers `[]` and no error.
+    const home = await makeHome();
+
+    const { agents, index } = await snapshotAgents(home);
 
     expect(agents).toEqual([]);
+    expect(index).toEqual({ ok: true, why: [] });
+  });
+
+  it("treats a non-directory at the agents path as absent, like `[ ! -d ]`", async () => {
+    const home = await makeHome();
+    await put(home, "agents", "not a directory");
+
+    const { agents, index } = await snapshotAgents(home);
+
+    expect(agents).toEqual([]);
+    expect(index.ok).toBe(true);
+  });
+
+  it("scans only `<workspace>/<name>.json` at the reference's depth and suffix", async () => {
+    const home = await makeHome();
+    await putAgent(home, "w", "kept.json", agent({ id: "kept" }));
+    // `-mindepth 2`: a record sitting directly in agents/ is not scanned.
+    await put(home, "agents/top-level.json", agent({ id: "top" }));
+    // `-name '*.json'`: anything else is not a record.
+    await putAgent(home, "w", "notes.txt", "not a record");
+    // `-maxdepth 2`: a record nested one level deeper is not scanned.
+    await put(home, "agents/w/deeper/nested.json", agent({ id: "nested" }));
+
+    const { agents, index } = await snapshotAgents(home);
+
+    expect(agents.map((a) => a.id)).toEqual(["kept"]);
+    expect(index.ok).toBe(true);
+  });
+
+  it("flags a symlinked record and never follows it", async () => {
+    // slp-gc.bash:641-643 — `find … -type l` reports the link itself.
+    const home = await makeHome();
+    await putAgent(home, "w", "a1.json", agent({ id: "a1" }));
+    const target = join(home, "elsewhere.json");
+    await writeFile(target, JSON.stringify(agent({ id: "linked" })));
+    await symlink(target, join(home, "agents/w/linked.json"));
+
+    const { agents, index } = await snapshotAgents(home);
+
+    expect(agents.map((a) => a.id)).toEqual(["a1"]);
     expect(index.ok).toBe(false);
-    expect(index.why.join()).toContain("provider");
+    expect(index.why.join("\n")).toContain("symlink (never followed)");
+  });
+
+  it("keeps one record per id when two files disagree", async () => {
+    const home = await makeHome();
+    await putAgent(home, "w", "a1-first.json", agent({ id: "a1", provider: "claude" }));
+    await putAgent(home, "w", "a1-second.json", agent({ id: "a1", provider: "codex" }));
+
+    const { agents, index } = await snapshotAgents(home);
+
+    expect(agents).toHaveLength(1);
+    expect(agents[0].provider).toBe("claude"); // sorted by file name, first wins
+    expect(index.ok).toBe(true);
+  });
+
+  it("fails the index when a workspace directory cannot be read", async () => {
+    // A directory read failure is the reference's `idx_err` (:628): the index is
+    // incomplete and apply is disabled. A root test runner ignores mode bits, so
+    // the case is skipped there.
+    if (process.getuid?.() === 0) return;
+    const home = await makeHome();
+    await putAgent(home, "readable", "a1.json", agent({ id: "a1" }));
+    await putAgent(home, "closed", "a2.json", agent({ id: "a2" }));
+    const closed = join(home, "agents/closed");
+    await chmod(closed, 0o000);
+
+    try {
+      const { agents, index } = await snapshotAgents(home);
+
+      expect(agents.map((a) => a.id)).toEqual(["a1"]);
+      expect(index.ok).toBe(false);
+      expect(index.why.join("\n")).toContain(closed);
+    } finally {
+      await chmod(closed, 0o755); // so the temp home can be removed
+    }
+  });
+
+  it("honours an explicit directory override", async () => {
+    const home = await makeHome();
+    const elsewhere = join(home, "somewhere-else");
+    await mkdir(join(elsewhere, "w"), { recursive: true });
+    await writeFile(join(elsewhere, "w", "a9.json"), JSON.stringify(agent({ id: "a9" })));
+
+    const { agents } = await snapshotAgents(home, { dir: elsewhere });
+
+    expect(agents.map((a) => a.id)).toEqual(["a9"]);
   });
 });
 
 describe("snapshotSchedules", () => {
-  const listOnly = (schedules: unknown[]) =>
-    schedulesPaseo({ scheduleList: vi.fn(async () => ({ schedules, error: null })) });
-
-  it("counts failures in the last 24h", async () => {
-    const paseo = listOnly([
+  it("counts failures in the last 24h from the record's runs", async () => {
+    const home = await makeHome();
+    await putSchedule(
+      home,
+      "cff78540.json",
       schedule({
         runs: [
           { startedAt: iso(NOW - 60), status: "failed", error: "boom" },
           { startedAt: iso(NOW - 7200), status: "succeeded", error: null },
         ],
       }),
-    ]);
+    );
 
-    const { schedules, index } = await snapshotSchedules(paseo, { now: NOW });
+    const { schedules, index } = await snapshotSchedules(home, { now: NOW });
 
-    expect(index.ok).toBe(true);
-    expect(schedules[0]).toMatchObject({ id: "s1", runs: 2, fail24h: 1, targetAgent: "a1" });
+    expect(index).toEqual({ ok: true, why: [] });
+    expect(schedules[0]).toMatchObject({ id: "cff78540", runs: 2, fail24h: 1, targetAgent: "a1" });
   });
 
   it("counts fires from run timestamps and ignores unusable ones", async () => {
-    const paseo = listOnly([
+    const home = await makeHome();
+    await putSchedule(
+      home,
+      "cff78540.json",
       schedule({
         runs: [
           { startedAt: iso(NOW - 60), status: "succeeded" },
@@ -316,24 +414,27 @@ describe("snapshotSchedules", () => {
           { startedAt: null, scheduledFor: null, status: "succeeded" },
         ],
       }),
-    ]);
+    );
 
-    const { schedules } = await snapshotSchedules(paseo, { now: NOW });
+    const { schedules } = await snapshotSchedules(home, { now: NOW });
 
     // fires24h: -60, -7200 and -3600 are inside 24 h; -90000 and the two
-    // unreadable timestamps are not.
+    // unusable stamps are not.
     expect(schedules[0]).toMatchObject({ runs: 6, fires1h: 2, fires24h: 3 });
   });
 
   it("counts an active-run failure separately from plain failures", async () => {
-    const paseo = listOnly([
+    const home = await makeHome();
+    await putSchedule(
+      home,
+      "cff78540.json",
       schedule({
         runs: [
           { startedAt: iso(NOW - 60), status: "failed", error: "boom" },
           {
             startedAt: iso(NOW - 120),
             status: "failed",
-            error: "Agent already has an active run",
+            error: "Agent a1 already has an active run",
           },
           { startedAt: iso(NOW - 180), status: "failed", error: "Already Has An Active Run!" },
           { startedAt: iso(NOW - 240), status: "running", error: null },
@@ -343,9 +444,9 @@ describe("snapshotSchedules", () => {
           { startedAt: iso(NOW - 90000), status: "failed", error: "long gone" },
         ],
       }),
-    ]);
+    );
 
-    const { schedules } = await snapshotSchedules(paseo, { now: NOW });
+    const { schedules } = await snapshotSchedules(home, { now: NOW });
 
     expect(schedules[0]).toMatchObject({
       runs: 6,
@@ -355,75 +456,51 @@ describe("snapshotSchedules", () => {
     });
   });
 
-  it("treats an error the runs do not carry as a failure", async () => {
-    const paseo = listOnly([
+  it("treats an error without a failed status as a failure (isfail, :230)", async () => {
+    const home = await makeHome();
+    await putSchedule(
+      home,
+      "cff78540.json",
       schedule({
         runs: [{ startedAt: iso(NOW - 60), status: "succeeded", error: "provider died" }],
       }),
-    ]);
+    );
 
-    const { schedules } = await snapshotSchedules(paseo, { now: NOW });
+    const { schedules } = await snapshotSchedules(home, { now: NOW });
 
     expect(schedules[0].fail24h).toBe(1);
   });
 
   it("detects room machinery by name and by heartbeat prompt", async () => {
-    const paseo = listOnly([
-      schedule({ id: "s1", name: "supervisor: nightly" }),
+    const home = await makeHome();
+    await putSchedule(home, "11111111.json", schedule({ id: "11111111", name: "supervisor: nightly" }));
+    await putSchedule(
+      home,
+      "22222222.json",
       schedule({
-        id: "s2",
+        id: "22222222",
         name: null,
         prompt: "[supervisor-heartbeat] tick",
         target: { type: "new-agent", config: { provider: "claude", cwd: "/tmp" } },
       }),
-      schedule({ id: "s3", name: "user job", prompt: "do work" }),
-    ]);
+    );
+    await putSchedule(
+      home,
+      "33333333.json",
+      schedule({ id: "33333333", name: "user job", prompt: "do work" }),
+    );
 
-    const { schedules } = await snapshotSchedules(paseo, { now: NOW });
+    const { schedules } = await snapshotSchedules(home, { now: NOW });
 
     expect(schedules.map((s) => s.room)).toEqual([true, true, false]);
     expect(schedules[1].targetType).toBe("new-agent");
     expect(schedules[1].targetAgent).toBeNull();
   });
 
-  it("reads runs from the schedule logs when the list summary has none", async () => {
-    // The daemon's list payload is a `ScheduleSummary`, which has no `runs`.
-    const withoutRuns = schedule();
-    delete withoutRuns.runs;
-    const logs = vi.fn(async () => ({
-      runs: [{ startedAt: iso(NOW - 30), status: "running" }],
-      error: null,
-    }));
-    const paseo = schedulesPaseo({
-      scheduleList: vi.fn(async () => ({ schedules: [withoutRuns], error: null })),
-      scheduleLogs: logs,
-    });
-
-    const { schedules, index } = await snapshotSchedules(paseo, { now: NOW });
-
-    expect(logs).toHaveBeenCalledWith({ id: "s1" });
-    expect(schedules[0]).toMatchObject({ runs: 1, runsRunning: 1, strict: true });
-    expect(index.ok).toBe(true);
-  });
-
-  it("fails the index when the runs of a schedule cannot be read", async () => {
-    const withoutRuns = schedule();
-    delete withoutRuns.runs;
-    const paseo = schedulesPaseo({
-      scheduleList: vi.fn(async () => ({ schedules: [withoutRuns], error: null })),
-      scheduleLogs: vi.fn(async () => {
-        throw new Error("logs unavailable");
-      }),
-    });
-
-    const { index } = await snapshotSchedules(paseo, { now: NOW });
-
-    expect(index.ok).toBe(false);
-    expect(index.why.join()).toContain("logs unavailable");
-  });
-
   // `strict` (SCHED_JQ:241-242): the runs array plus the two run stamps the
-  // reclamation recheck reads, and an updatedAt of the right type.
+  // reclamation recheck reads, and an updatedAt of the right type. Note that a
+  // missing `runs` is *not* a parse failure — the reference reads it as `[]`
+  // (:237) — it is only a `strict: false` record.
   const strictCases: Array<[string, Record<string, unknown>, boolean]> = [
     ["a full record", {}, true],
     ["no runs", { runs: undefined }, false],
@@ -434,28 +511,39 @@ describe("snapshotSchedules", () => {
     ["no updatedAt", { updatedAt: undefined }, false],
   ];
   it.each(strictCases)("strict is %s -> %s", async (_label, over, expected) => {
-    const record = schedule(over);
-    for (const [key, value] of Object.entries(over)) {
-      if (value === undefined) delete record[key];
-    }
-    const paseo = listOnly([record]);
+    const home = await makeHome();
+    await putSchedule(home, "cff78540.json", schedule(over));
 
-    const { schedules } = await snapshotSchedules(paseo, { now: NOW });
+    const { schedules } = await snapshotSchedules(home, { now: NOW });
 
+    expect(schedules).toHaveLength(1);
     expect(schedules[0].strict).toBe(expected);
   });
 
+  it("reads a record with no runs array as zero runs, not as a failure", async () => {
+    const home = await makeHome();
+    await putSchedule(home, "cff78540.json", schedule({ runs: undefined }));
+
+    const { schedules, index } = await snapshotSchedules(home, { now: NOW });
+
+    expect(index.ok).toBe(true);
+    expect(schedules[0]).toMatchObject({ runs: 0, runsRunning: 0, fires1h: 0, fires24h: 0 });
+  });
+
   it("carries the run stamps the reclamation rule compares", async () => {
-    const paseo = listOnly([
+    const home = await makeHome();
+    await putSchedule(
+      home,
+      "cff78540.json",
       schedule({
         status: "completed",
         updatedAt: iso(NOW - 7200),
         lastRunAt: iso(NOW - 600),
         nextRunAt: null,
       }),
-    ]);
+    );
 
-    const { schedules } = await snapshotSchedules(paseo, { now: NOW });
+    const { schedules } = await snapshotSchedules(home, { now: NOW });
 
     expect(schedules[0]).toMatchObject({
       name: null,
@@ -468,76 +556,128 @@ describe("snapshotSchedules", () => {
     });
   });
 
-  it("drops a schedule it cannot identify and fails the index", async () => {
-    const paseo = listOnly([
-      schedule({ id: "s1" }),
-      { status: "active", target: { type: "agent", agentId: "a1" } },
-      { id: "s3", target: { type: "agent", agentId: "a1" } },
-      { id: "s4", status: "active" },
-    ]);
+  it("a corrupt schedule fails the index but still returns the good ones", async () => {
+    const home = await makeHome();
+    await putSchedule(home, "cff78540.json", schedule({ id: "cff78540" }));
+    const bad = await putSchedule(home, "deadbeef.json", "{oops");
 
-    const { schedules, index } = await snapshotSchedules(paseo, { now: NOW });
-
-    expect(schedules.map((s) => s.id)).toEqual(["s1"]);
-    expect(index.ok).toBe(false);
-    expect(index.why.join()).toContain("s3");
-  });
-
-  it("a listed error fails the index and yields no schedules", async () => {
-    const paseo = schedulesPaseo({
-      scheduleList: vi.fn(async () => ({ schedules: [schedule()], error: "daemon busy" })),
-    });
-
-    const { schedules, index } = await snapshotSchedules(paseo, { now: NOW });
-
-    expect(schedules).toEqual([]);
-    expect(index.ok).toBe(false);
-    expect(index.why.join()).toContain("daemon busy");
-  });
-
-  it("a thrown read yields an incomplete index and no schedules", async () => {
     const log = { warn: vi.fn() };
-    const paseo = schedulesPaseo({
-      scheduleList: vi.fn(async () => {
-        throw new Error("boom");
-      }),
-    });
+    const { schedules, index } = await snapshotSchedules(home, { now: NOW, log });
 
-    const { schedules, index } = await snapshotSchedules(paseo, { now: NOW, log });
-
-    expect(schedules).toEqual([]);
+    expect(schedules.map((s) => s.id)).toEqual(["cff78540"]);
     expect(index.ok).toBe(false);
-    expect(index.why.join()).toContain("boom");
+    expect(index.why.join("\n")).toContain(bad);
+    expect(index.why.join("\n")).toContain("invalid JSON");
     expect(log.warn).toHaveBeenCalled();
   });
 
-  it("says why when the api exposes no schedule surface", async () => {
-    // Today's `PaseoApi` has no schedules at all, so the honest answer is an
-    // incomplete index — never an empty one that looks like "nothing to do".
-    const { schedules, index } = await snapshotSchedules(schedulesPaseo({}), { now: NOW });
+  it("drops a schedule it cannot identify, fails the index, and keeps the rest", async () => {
+    const home = await makeHome();
+    await putSchedule(home, "cff78540.json", schedule({ id: "cff78540" }));
+    await putSchedule(home, "no-id.json", schedule({ id: undefined }));
+    await putSchedule(home, "no-status.json", schedule({ id: "aaaa0001", status: undefined }));
+    await putSchedule(home, "no-target.json", schedule({ id: "aaaa0002", target: undefined }));
+    await putSchedule(
+      home,
+      "bad-target.json",
+      schedule({ id: "aaaa0003", target: { agentId: "a1" } }),
+    );
+    await putSchedule(home, "not-an-object.json", "null");
+
+    const { schedules, index } = await snapshotSchedules(home, { now: NOW });
+
+    expect(schedules.map((s) => s.id)).toEqual(["cff78540"]);
+    expect(index.ok).toBe(false);
+    const why = index.why.join("\n");
+    expect(why).toContain("missing id");
+    expect(why).toContain("missing status");
+    expect(why).toContain("missing target");
+    expect(why).toContain("not a JSON object");
+  });
+
+  it("an absent schedules directory is a healthy, empty index", async () => {
+    // slp-gc.bash:648 — `[ ! -d "$PHOME/schedules" ]` answers `[]` and no error.
+    const home = await makeHome();
+
+    const { schedules, index } = await snapshotSchedules(home, { now: NOW });
 
     expect(schedules).toEqual([]);
+    expect(index).toEqual({ ok: true, why: [] });
+  });
+
+  it("scans only `*.json` files directly in the schedules directory", async () => {
+    const home = await makeHome();
+    await putSchedule(home, "cff78540.json", schedule({ id: "cff78540" }));
+    await putSchedule(home, "cff78540.tmp", "{oops");
+    await putSchedule(home, "notes.txt", "not a record");
+    // `-mindepth 1 -maxdepth 1`: a subdirectory's records are not scanned.
+    await putSchedule(home, join("nested", "aaaa0001.json"), schedule({ id: "aaaa0001" }));
+
+    const { schedules, index } = await snapshotSchedules(home, { now: NOW });
+
+    expect(schedules.map((s) => s.id)).toEqual(["cff78540"]);
+    expect(index.ok).toBe(true);
+  });
+
+  it("flags a symlinked schedule record and never follows it", async () => {
+    const home = await makeHome();
+    await putSchedule(home, "cff78540.json", schedule({ id: "cff78540" }));
+    const target = join(home, "elsewhere.json");
+    await writeFile(target, JSON.stringify(schedule({ id: "aaaa0002" })));
+    await symlink(target, join(home, "schedules", "aaaa0002.json"));
+
+    const { schedules, index } = await snapshotSchedules(home, { now: NOW });
+
+    expect(schedules.map((s) => s.id)).toEqual(["cff78540"]);
     expect(index.ok).toBe(false);
-    expect(index.why.join()).toContain("scheduleList");
+    expect(index.why.join("\n")).toContain("symlink (never followed)");
+  });
+
+  it("uses the wall clock by default and its own window arithmetic", async () => {
+    // No `now` seam: a record updated/run a minute ago must land inside both
+    // 1 h and 24 h windows of the real clock.
+    const home = await makeHome();
+    const wall = Math.floor(Date.now() / 1000);
+    await putSchedule(
+      home,
+      "cff78540.json",
+      schedule({
+        updatedAt: iso(wall - 30),
+        lastRunAt: iso(wall - 30),
+        nextRunAt: iso(wall + 600),
+        runs: [{ startedAt: iso(wall - 30), status: "succeeded" }],
+      }),
+    );
+
+    const { schedules } = await snapshotSchedules(home);
+
+    expect(schedules[0]).toMatchObject({ fires1h: 1, fires24h: 1, fail24h: 0 });
+    expect(schedules[0].lastRunEpoch).toBeCloseTo(wall - 30, 0);
+  });
+
+  it("honours an explicit directory override", async () => {
+    const home = await makeHome();
+    const elsewhere = join(home, "somewhere-else");
+    await mkdir(elsewhere, { recursive: true });
+    await writeFile(
+      join(elsewhere, "aaaa0003.json"),
+      JSON.stringify(schedule({ id: "aaaa0003" })),
+    );
+
+    const { schedules } = await snapshotSchedules(home, { now: NOW, dir: elsewhere });
+
+    expect(schedules.map((s) => s.id)).toEqual(["aaaa0003"]);
   });
 });
 
-describe("the shapes the plugin context hands in", () => {
-  it("accepts PaseoApi for the agent read", () => {
-    // Compile-time assertion: if the SDK's agent surface moves, this file stops
-    // compiling rather than the snapshot discovering it at runtime.
-    const fitsAgents: PaseoApi extends AgentsApi ? true : false = true;
-    expect(fitsAgents).toBe(true);
-  });
-
-  it("cannot be handed to the schedule read, because it has no schedules", () => {
-    // `PaseoApi` (index.d.ts:398-408) has hosts, terminals, workspaces,
-    // projects, agents, providers and config — no schedule member at all, so
-    // this assignment is a type error today. Annotating it keeps the gap
-    // honest: a future SDK that grows a schedule surface makes the annotation
-    // unused and this file stops compiling, which is the moment to wire it up.
-    // @ts-expect-error PaseoApi exposes no schedules; only DaemonClient does.
-    const notSchedules: SchedulesApi = {} as PaseoApi;
-    expect(notSchedules).toBeDefined();
+describe("the index never consults the daemon", () => {
+  it("takes a home directory on both reads", () => {
+    // Compile-time assertion: both reads take a home directory, so an edit that
+    // reintroduces `PaseoApi` here stops compiling rather than silently reading
+    // the wrong source of truth.
+    const agentsRead: (home: string) => Promise<unknown> = (home) => snapshotAgents(home);
+    const schedulesRead: (home: string) => Promise<unknown> = (home) => snapshotSchedules(home);
+    expect(typeof agentsRead).toBe("function");
+    expect(typeof schedulesRead).toBe("function");
   });
 });
