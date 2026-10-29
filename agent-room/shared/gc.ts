@@ -150,6 +150,34 @@ export const gcAlertSchema = z.object({
 export type GcAlert = z.infer<typeof gcAlertSchema>;
 
 /**
+ * The Paseo tree's footprint as the last tick measured it (`$P.tree`, the
+ * report-only section the reference prints: slp-gc.bash:440-473).
+ *
+ * `warnMb` is the **resolved** tree threshold the tick compared against — the
+ * saved `treeWarnMb`, or half of physical RAM when that is `null` — so the screen
+ * never has to redo the `null` resolution (and cannot get it wrong). `over` is the
+ * tick's own verdict; the screen reports it rather than recomputing it.
+ *
+ * This is the tree Paseo's app main and its agents add up to, including the proven
+ * orphans. It is deliberately a separate block from the daemon's own row: the
+ * daemon is one process inside the tree, and the two footprints answer different
+ * questions.
+ */
+export const gcTreeSchema = z.object({
+  totalMb: z.number(),
+  /** The app-subtree half of the total. */
+  appMb: z.number(),
+  /** The proven-orphan half of the total. */
+  orphanMb: z.number(),
+  /** The resolved tree warn threshold (half of RAM when `treeWarnMb` is `null`). */
+  warnMb: z.number(),
+  /** The tick's own `totalMb >= warnMb` verdict. */
+  over: z.boolean(),
+});
+
+export type GcTree = z.infer<typeof gcTreeSchema>;
+
+/**
  * The GC screen's one read model: identification, when the last tick ran, when
  * the next report is due, the settings the tick acted on, the process rows it
  * judged and every record candidate it considered (refused ones included, so the
@@ -183,15 +211,26 @@ export const gcStatusSchema = z.object({
    * The tree warn threshold the last tick used (`SLP_GC_TREE_WARN_MB`), or `null`
    * when it is "half of physical RAM". It sits beside `settings` rather than in
    * it because no decision rule compares against it — it is the report's alert
-   * line — while `settings` is the acting block the rules read.
+   * line — while `settings` is the acting block the rules read. This is the *raw*
+   * setting; `tree.warnMb` is the value the tick resolved it to.
    */
   treeWarnMb: z.number().nullable(),
   /**
-   * The lineage ledger the last tick read and wrote back: its row count and the
-   * reader's own note (`null` when it had none). `rows: 0` before any tick, and
-   * after a tick whose process phase failed.
+   * The Paseo tree's footprint from the last tick's report, or `null` before any
+   * tick has run. Separate from the `procs` rows on purpose: it is the whole
+   * tree, not one process, and the screen labels it "Paseo tree" so the daemon's
+   * own footprint is never read as the tree's.
    */
-  ledger: z.object({ note: z.string().nullable(), rows: z.number() }),
+  tree: gcTreeSchema.nullable(),
+  /**
+   * The lineage ledger the last tick read and wrote back: its row count, the
+   * reader's own note (`null` when it had none), and whether it could be read at
+   * all. `readable: false` means "unknown", never "empty": the process phase can
+   * fail (no rows were read or written) and the reader refuses a file that is not
+   * a regular file, not ours, or too large. `rows: 0` with `readable: true` is the
+   * only state the screen may call empty.
+   */
+  ledger: z.object({ note: z.string().nullable(), rows: z.number(), readable: z.boolean() }),
   /**
    * The last tick's index verdict — both record scans complete — with the scans'
    * own reasons. This is the tick's `index`, not a conclusion drawn from the
@@ -202,6 +241,13 @@ export const gcStatusSchema = z.object({
   lastReportAt: z.string().nullable(),
   /** The newest `alerts.log` lines, newest first, at most `ALERTS_STATUS_LIMIT`. */
   alerts: z.array(gcAlertSchema),
+  /**
+   * Whether `alerts.log` could be read. `false` means the history is unknown, not
+   * empty — the file is there and the tick could not read it (a directory in its
+   * place, a permissions change). An absent file is `true` with `alerts: []`: a
+   * fresh install really has no alerts.
+   */
+  alertsReadable: z.boolean(),
   settings: z.object({
     apply: z.boolean(),
     killStale: z.boolean(),

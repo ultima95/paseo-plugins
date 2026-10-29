@@ -561,7 +561,16 @@ describe("runTick — the acting phases, with something to act on", () => {
     expect(status.daemonPid).toBe(200);
     expect(status.uptimeS).toBe(2 * 86400 + 3 * 3600 + 4 * 60 + 5);
     expect(status.treeWarnMb).toBe(DEFAULT_GC_SETTINGS.treeWarnMb);
-    expect(status.ledger).toEqual({ note: null, rows: expect.any(Number) as number });
+    // The report's own tree, with the warn value the tick resolved it to.
+    expect(status.tree).toEqual({
+      totalMb: result.report.procs.tree.totalMb,
+      appMb: result.report.procs.tree.appMb,
+      orphanMb: result.report.procs.tree.orphanMb,
+      warnMb: result.report.procs.tree.warnMb,
+      over: result.report.procs.tree.over,
+    });
+    expect(status.tree?.totalMb).toBeGreaterThan(0);
+    expect(status.ledger).toEqual({ note: null, rows: expect.any(Number) as number, readable: true });
     expect(status.index).toEqual({ ok: true, why: [] });
     expect(status.lastReportAt).toBe(result.at);
     // This tick's own memory alert is in the tail it publishes, stamped with the
@@ -569,6 +578,7 @@ describe("runTick — the acting phases, with something to act on", () => {
     expect(status.alerts).toHaveLength(1);
     expect(status.alerts[0]?.at).toBe(result.at);
     expect(status.alerts[0]?.text).toContain("ALERT");
+    expect(status.alertsReadable).toBe(true);
   });
 });
 
@@ -583,10 +593,14 @@ describe("the GC screen's status fields", () => {
     expect(status.daemonPid).toBeNull();
     expect(status.uptimeS).toBeNull();
     expect(status.treeWarnMb).toBeNull();
-    expect(status.ledger).toEqual({ note: null, rows: 0 });
+    // No footprint has been measured: `null`, not a zero-byte tree.
+    expect(status.tree).toBeNull();
+    // A ledger that has never been written is a readable, empty one.
+    expect(status.ledger).toEqual({ note: null, rows: 0, readable: true });
     expect(status.index).toEqual({ ok: false, why: ["no tick has run yet"] });
     expect(status.lastReportAt).toBeNull();
     expect(status.alerts).toEqual([]);
+    expect(status.alertsReadable).toBe(true);
     // The acting block is unchanged and complete.
     expect(status.settings).toEqual({
       apply: false,
@@ -605,7 +619,7 @@ describe("the GC screen's status fields", () => {
 
     expect(status.daemonPid).toBeNull();
     expect(status.uptimeS).toBeNull();
-    expect(status.ledger).toEqual({ note: null, rows: 0 });
+    expect(status.ledger).toEqual({ note: null, rows: 0, readable: true });
     expect(status.index).toEqual({ ok: true, why: [] });
     // The first tick writes a report (no `.last-report` yet), so the stamp moves.
     expect(status.lastReportAt).toBe(status.lastTickAt);
@@ -655,5 +669,80 @@ describe("the GC screen's status fields", () => {
     const status = buildStatus(await runTick(test.deps));
 
     expect(status.alerts).toEqual([]);
+    // Empty and unreadable are different answers: the screen must be able to say
+    // "could not be read" rather than "nothing recorded".
+    expect(status.alertsReadable).toBe(false);
+  });
+
+  it("leaves the alert tail readable when the file simply does not exist yet", async () => {
+    // Nothing on this machine trips an arm, so no `alerts.log` is written: a fresh
+    // install's history is empty and readable, not unreadable.
+    const test = await harness({}, { treeWarnMb: 999_999 });
+
+    const status = buildStatus(await runTick(test.deps));
+
+    expect(status.alerts).toEqual([]);
+    expect(status.alertsReadable).toBe(true);
+  });
+
+  it("publishes the tree footprint with the warn value the tick resolved, not the raw setting", async () => {
+    // `treeWarnMb: null` is "half of physical RAM": the tick resolves it against
+    // `hw.memsize`, and the status carries the resolved number beside the raw
+    // `null` (which the threshold field still needs).
+    const exec: GcExec = (argv) =>
+      argv[0] === "sysctl" && argv[1] === "-n" && argv[2] === "hw.memsize"
+        ? { code: 0, stdout: "17179869184\n", stderr: "", timedOut: false }
+        : { code: 0, stdout: "", stderr: "", timedOut: false };
+    const test = await harness({ exec }, { treeWarnMb: null });
+
+    const status = buildStatus(await runTick(test.deps));
+
+    // 16 GB of RAM → 8192 MB, resolved by the tick.
+    expect(status.tree).toEqual({ totalMb: 0, appMb: 0, orphanMb: 0, warnMb: 8192, over: false });
+    expect(status.treeWarnMb).toBeNull();
+  });
+
+  it("publishes the tree's own over verdict and split from the tick", async () => {
+    // A threshold the machine's tree clears, so `over` is the tick's real answer.
+    const test = await world({ treeWarnMb: 1 });
+
+    const status = buildStatus(await runTick(test.deps));
+
+    expect(status.tree?.warnMb).toBe(1);
+    expect(status.tree?.over).toBe(true);
+    expect(status.tree?.totalMb).toBeGreaterThan(0);
+    expect(status.tree?.appMb).toBeGreaterThan(0);
+    expect(status.tree?.orphanMb).toBe(0);
+  });
+
+  it("marks a ledger the reader refused as unreadable rather than empty", async () => {
+    const test = await harness();
+    const dir = join(workspace, "gc");
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    // A directory where the ledger belongs: `readLedger` refuses it with a note.
+    await mkdir(join(dir, "lineage.tsv"), { recursive: true, mode: 0o700 });
+
+    const status = buildStatus(await runTick(test.deps));
+
+    expect(status.ledger.readable).toBe(false);
+    expect(status.ledger.rows).toBe(0);
+    expect(status.ledger.note).toContain("not a regular file");
+  });
+
+  it("marks the ledger unreadable when the process phase failed outright", async () => {
+    // The phase itself throws (a `ps` read that could not even be attempted), which
+    // the tick turns into its empty process phase: no ledger was read or written.
+    const test = await harness({
+      seams: {
+        procs: async () => {
+          throw new Error("ps unavailable");
+        },
+      },
+    });
+
+    const status = buildStatus(await runTick(test.deps));
+
+    // No ledger was read and nothing explains it: unknown, not empty.
+    expect(status.ledger).toEqual({ note: null, rows: 0, readable: false });
   });
 });

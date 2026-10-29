@@ -66,11 +66,19 @@ export const getRoomRpc = defineRpc({
 });
 
 /**
- * The GC screen's read model: the last tick's identification verdict, when it
- * ran, when the next report is due, the settings it acted on, and the process and
- * record candidates it judged. Served from the last tick's captured result, so it
- * never runs a `ps` sample of its own; before the first tick it answers an empty
- * status carrying the settings the next tick would use.
+ * The GC screen's read model: the last tick's identification verdict and daemon
+ * (pid, `ps` uptime), the Paseo tree's footprint against the resolved tree warn
+ * threshold, when the tick ran, when the last report was written and when the
+ * next is due, the settings it acted on, the lineage ledger (row count, the
+ * reader's note, and whether it could be read at all), the index verdict, the
+ * newest `alerts.log` lines (with whether that file could be read), and the
+ * process and record candidates it judged.
+ *
+ * Served from the last tick's captured result, so it never runs a `ps` sample of
+ * its own; before the first tick it answers an empty status carrying the settings
+ * the next tick would use, with every unmeasured field (`daemonPid`, `uptimeS`,
+ * `tree`, `lastReportAt`) `null` rather than a plausible zero. Nothing in the GC's
+ * rules reads this payload: it is the screen's window on a tick that already ran.
  */
 export const gcStatusRpc = defineRpc({
   name: "gc.status",

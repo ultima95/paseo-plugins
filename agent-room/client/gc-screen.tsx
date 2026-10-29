@@ -11,6 +11,7 @@ import {
   actionRows,
   ruleConfirm,
   ruleValue,
+  settingsNotice,
   thresholdDraft,
   toGcRows,
   validateThresholds,
@@ -170,6 +171,9 @@ export function GcScreen(props: PluginScreenProps) {
 
   const data = query.data ?? null;
   const rows = data === null ? null : toGcRows(data);
+  // What the settings store itself has to say, before anything below can be
+  // edited: an unreadable store, or a saved document that does not parse.
+  const notice = settingsNotice(settings);
 
   // Before the first status answers, only the saved document can be known.
   const ruleOn = (key: RuleKey): boolean =>
@@ -281,9 +285,10 @@ export function GcScreen(props: PluginScreenProps) {
               </View>
             )}
             <Text style={muted}>
-              Daemon pid and uptime, the ledger, the index verdict, the last report and the alerts all come from the
-              last tick's own answer. A row that says "no data yet" is a fresh install: nothing has run, so nothing is
-              reported.
+              Daemon pid and uptime, the Paseo tree's footprint, the ledger, the index verdict, the last report and
+              the alerts all come from the last tick's own answer. "Paseo tree" is the app and its agents (with the
+              proven orphans), not the daemon's own processes — the daemon has its own row. A row that says "no data
+              yet" is a fresh install: nothing has run, so nothing is reported.
             </Text>
           </Section>
 
@@ -292,6 +297,9 @@ export function GcScreen(props: PluginScreenProps) {
             title="Rules"
             subtitle="Saved to the plugin's gc settings document, over the imported slp-gc.conf. A change takes effect on the next tick."
           >
+            {notice === null ? null : (
+              <Text style={notice.tone === "danger" ? danger : warning}>{notice.text}</Text>
+            )}
             {RULES.map((rule) => {
               const on = ruleOn(rule.key);
               const confirm =
@@ -568,10 +576,17 @@ export function GcScreen(props: PluginScreenProps) {
             subtitle="The newest alerts.log lines, as gc.status publishes them: newest first, at most 20."
           >
             {rows === null || rows.alerts.length === 0 ? (
-              <Text style={muted}>
-                No alerts recorded yet. alerts.log is empty on a fresh install; the first alert appears when a memory
-                or orphan threshold trips.
-              </Text>
+              rows !== null && !rows.alertsReadable ? (
+                <Text style={warning}>
+                  alerts.log could not be read, so the history is unknown — not empty. The file is there and the last
+                  tick could not read it; check its permissions.
+                </Text>
+              ) : (
+                <Text style={muted}>
+                  No alerts recorded yet. alerts.log is empty on a fresh install; the first alert appears when a
+                  memory or orphan threshold trips.
+                </Text>
+              )
             ) : null}
             {rows?.alerts.map((alert) => (
               <View

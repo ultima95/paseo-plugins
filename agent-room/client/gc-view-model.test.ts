@@ -6,6 +6,7 @@ import {
   mbText,
   ruleConfirm,
   ruleValue,
+  settingsNotice,
   thresholdDraft,
   toGcRows,
   uptimeText,
@@ -20,6 +21,15 @@ const SETTINGS: GcStatus["settings"] = {
   memKillMb: 4096,
 };
 
+/** A tree footprint, as the tick published it. */
+const TREE: NonNullable<GcStatus["tree"]> = {
+  totalMb: 2814.2,
+  appMb: 2600,
+  orphanMb: 214.2,
+  warnMb: 6144,
+  over: false,
+};
+
 /** A status the shape `gc.status` answers, with only the interesting parts varied. */
 function status(over: Partial<GcStatus> = {}): GcStatus {
   return {
@@ -29,10 +39,12 @@ function status(over: Partial<GcStatus> = {}): GcStatus {
     daemonPid: null,
     uptimeS: null,
     treeWarnMb: 6144,
-    ledger: { note: null, rows: 0 },
+    tree: { ...TREE },
+    ledger: { note: null, rows: 0, readable: true },
     index: { ok: true, why: [] },
     lastReportAt: null,
     alerts: [],
+    alertsReadable: true,
     settings: { ...SETTINGS },
     procs: [],
     candidates: [],
@@ -48,10 +60,13 @@ function freshStatus(over: Partial<GcStatus> = {}): GcStatus {
     nextReportAt: null,
     daemonPid: null,
     uptimeS: null,
-    ledger: { note: null, rows: 0 },
+    treeWarnMb: null,
+    tree: null,
+    ledger: { note: null, rows: 0, readable: true },
     index: { ok: false, why: ["no tick has run yet"] },
     lastReportAt: null,
     alerts: [],
+    alertsReadable: true,
     ...over,
   });
 }
@@ -69,10 +84,12 @@ describe("toGcRows", () => {
       daemonPid: null,
       uptimeS: null,
       treeWarnMb: null,
-      ledger: { note: null, rows: 0 },
+      tree: null,
+      ledger: { note: null, rows: 0, readable: true },
       index: { ok: true, why: [] },
       lastReportAt: null,
       alerts: [],
+      alertsReadable: true,
       settings: { apply: false, killStale: false, killMemory: false, memWarnMb: 3072, memKillMb: 4096 },
       procs: [],
       candidates: [{ kind: "agent", id: "a1", refusedBy: "archived 3d < 14d" }],
@@ -92,10 +109,12 @@ describe("toGcRows", () => {
       daemonPid: null,
       uptimeS: null,
       treeWarnMb: null,
-      ledger: { note: null, rows: 0 },
+      tree: null,
+      ledger: { note: null, rows: 0, readable: true },
       index: { ok: false, why: ["no tick has run yet"] },
       lastReportAt: null,
       alerts: [],
+      alertsReadable: true,
       settings: { apply: false, killStale: false, killMemory: false, memWarnMb: 3072, memKillMb: 4096 },
       procs: [],
       candidates: [],
@@ -258,14 +277,83 @@ describe("toGcRows", () => {
   });
 
   it("shows the ledger's row count and the reader's own note", () => {
-    const rows = toGcRows(status({ ledger: { note: null, rows: 12 } }));
+    const rows = toGcRows(status({ ledger: { note: null, rows: 12, readable: true } }));
     expect(row(rows, "ledger")).toMatchObject({ value: "12 rows", tone: "normal" });
 
-    const complained = toGcRows(status({ ledger: { note: "lineage.tsv unreadable (mode 0644)", rows: 4 } }));
+    const complained = toGcRows(
+      status({ ledger: { note: "lineage.tsv unreadable (mode 0644)", rows: 4, readable: true } }),
+    );
     expect(row(complained, "ledger")).toMatchObject({
       value: "4 rows · lineage.tsv unreadable (mode 0644)",
       tone: "warning",
     });
+  });
+
+  it("says an unreadable ledger could not be read instead of calling it empty", () => {
+    // The reader refused the file and said why.
+    const refused = toGcRows(
+      status({ ledger: { note: "lineage.tsv is not a regular file (symlink or directory): ignored", rows: 0, readable: false } }),
+    );
+    expect(row(refused, "ledger")?.value).toContain("could not be read");
+    expect(row(refused, "ledger")?.value).not.toContain("no ledger rows yet");
+    expect(row(refused, "ledger")?.value).toContain("not a regular file");
+    expect(row(refused, "ledger")?.tone).toBe("warning");
+
+    // Nothing was read at all (a failed process phase) and nothing explains it.
+    const failed = toGcRows(status({ ledger: { note: null, rows: 0, readable: false } }));
+    expect(row(failed, "ledger")?.value).toContain("could not be read");
+    expect(row(failed, "ledger")?.value).toContain("process phase failed");
+    expect(row(failed, "ledger")?.tone).toBe("danger");
+
+    // Only a readable ledger with no rows is allowed to read as empty.
+    const empty = toGcRows(status({ ledger: { note: null, rows: 0, readable: true } }));
+    expect(row(empty, "ledger")).toMatchObject({ value: "no ledger rows yet", tone: "muted" });
+  });
+
+  it("draws the Paseo tree as its own row, against the resolved warn threshold and the kill threshold", () => {
+    const below = toGcRows(status());
+    expect(row(below, "Paseo tree")).toMatchObject({
+      value: "2814.2 MB · app 2600 MB · orphan 214.2 MB · below warn 6144 MB · kill 4096 MB",
+      tone: "normal",
+    });
+    // The label, not the value, is what keeps this apart from the daemon's row.
+    expect(row(below, "Paseo tree")?.label).toBe("Paseo tree");
+    expect(row(below, "footprint vs warn/kill")?.label).not.toContain("tree");
+
+    // `over` is the tick's verdict, at the resolved warn value it published. The
+    // kill threshold is above the tree warn here, which is the state where "over
+    // warn, below kill" can exist at all.
+    const over = toGcRows(
+      status({
+        tree: { ...TREE, totalMb: 7000, over: true },
+        settings: { ...SETTINGS, memKillMb: 8192 },
+      }),
+    );
+    expect(row(over, "Paseo tree")).toMatchObject({
+      value: "7000 MB · app 2600 MB · orphan 214.2 MB · over warn 6144 MB · kill 8192 MB",
+      tone: "warning",
+    });
+
+    // Above the memory kill threshold the row is a danger, not a warning.
+    const kill = toGcRows(status({ tree: { ...TREE, totalMb: 5000, over: true }, settings: { ...SETTINGS, memKillMb: 4096 } }));
+    expect(row(kill, "Paseo tree")).toMatchObject({
+      value: "5000 MB · app 2600 MB · orphan 214.2 MB · over kill 4096 MB",
+      tone: "danger",
+    });
+  });
+
+  it("says no data yet for the tree before any tick has measured it", () => {
+    const rows = toGcRows(freshStatus());
+    expect(row(rows, "Paseo tree")).toMatchObject({
+      value: "no data yet — no tick has read the tree footprint",
+      tone: "muted",
+    });
+  });
+
+  it("carries whether the alert tail could be read, so empty and unreadable are not the same answer", () => {
+    expect(toGcRows(status()).alertsReadable).toBe(true);
+    expect(toGcRows(status({ alertsReadable: false })).alertsReadable).toBe(false);
+    expect(toGcRows(freshStatus()).alertsReadable).toBe(true);
   });
 
   it("reads the index verdict from the tick, not from the candidates' refusal strings", () => {
@@ -400,6 +488,31 @@ describe("thresholdDraft", () => {
 
   it("leaves the fields blank before a status has answered, rather than inventing defaults", () => {
     expect(thresholdDraft(null, null)).toEqual({ memWarnMb: "", memKillMb: "", treeWarnMb: "" });
+  });
+});
+
+describe("settingsNotice", () => {
+  it("shows the store's own error and says nothing can be edited until it loads", () => {
+    const notice = settingsNotice({ status: "error", error: "settings store unreachable" });
+    expect(notice?.tone).toBe("danger");
+    expect(notice?.text).toContain("settings store unreachable");
+    expect(notice?.text).toContain("cannot be edited");
+    expect(notice?.text).toContain("until the settings load");
+  });
+
+  it("says an invalid document is not what is shown, and that saving replaces it", () => {
+    const notice = settingsNotice({ status: "invalid", error: "memWarnMb: expected number" });
+    expect(notice?.tone).toBe("warning");
+    expect(notice?.text).toContain("do not match the schema");
+    // Where the shown values come from, and what a save does to the broken document.
+    expect(notice?.text).toContain("slp-gc.conf baseline");
+    expect(notice?.text).toContain("replaces the saved document");
+    expect(notice?.text).toContain("is lost");
+  });
+
+  it("says nothing while the document is ready or still loading", () => {
+    expect(settingsNotice({ status: "ready" })).toBeNull();
+    expect(settingsNotice({ status: "loading" })).toBeNull();
   });
 });
 

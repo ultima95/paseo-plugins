@@ -1240,6 +1240,8 @@ export interface TickResult {
   lastReportAt: string | null;
   /** The newest `alerts.log` lines, newest first (`ALERTS_STATUS_LIMIT`), for the status. */
   alerts: GcStatus["alerts"];
+  /** Whether `alerts.log` could be read; `false` is "unknown", not "empty". */
+  alertsReadable: boolean;
   /** The migration's answer on the tick that ran it, else `null`. */
   migrated: MigrateResult | null;
 }
@@ -1254,30 +1256,38 @@ export interface TickResult {
  * first token is not an ISO stamp is kept whole with `at: ""`, because a line this
  * port cannot parse is still an alert a person should see.
  *
- * An absent or unreadable file is `[]`: a fresh install has no alerts, and a
- * status read must never fail over one.
+ * An absent or unreadable file is no alerts: a fresh install has none, and a
+ * status read must never fail over one. The two cases are not the same answer to
+ * the screen, though, so `readable` says which one it was — an absent file is a
+ * history that has not started (`readable: true`), a failed read is a history that
+ * could not be read (`readable: false`).
  */
 export async function readAlertTail(
   stateDir: string,
   limit: number = ALERTS_STATUS_LIMIT,
-): Promise<GcStatus["alerts"]> {
-  if (limit <= 0) return [];
+): Promise<{ alerts: GcStatus["alerts"]; readable: boolean }> {
+  if (limit <= 0) return { alerts: [], readable: true };
   let text: string;
   try {
     text = await readFile(join(stateDir, ALERTS_FILE), "utf8");
-  } catch {
-    return [];
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    // No file yet is a fresh install, not a read failure.
+    return { alerts: [], readable: code === "ENOENT" || code === "ENOTDIR" };
   }
   const lines = text.split("\n").filter((line) => line.trim() !== "");
   const tail = lines.slice(Math.max(0, lines.length - limit)).reverse();
-  return tail.map((line) => {
-    const space = line.indexOf(" ");
-    const head = space < 0 ? line : line.slice(0, space);
-    const stamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(head.trim());
-    return stamp
-      ? { at: head.trim(), text: line.slice(space + 1).trim() }
-      : { at: "", text: line.trim() };
-  });
+  return {
+    alerts: tail.map((line) => {
+      const space = line.indexOf(" ");
+      const head = space < 0 ? line : line.slice(0, space);
+      const stamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(head.trim());
+      return stamp
+        ? { at: head.trim(), text: line.slice(space + 1).trim() }
+        : { at: "", text: line.trim() };
+    }),
+    readable: true,
+  };
 }
 
 /** Run one phase, logging and falling back instead of throwing (property 1). */
@@ -1834,7 +1844,13 @@ export async function runTick(
   // --- the status tail (`alerts.log`, :1229). Read last, so an alert this tick
   // just wrote is in it. Status only: no rule reads the file, and an unreadable
   // one is an empty tail rather than a failed tick.
-  const alerts = await phase(log, "alerts tail", () => readAlertTail(deps.stateDir), []);
+  const alertTail = await phase(
+    log,
+    "alerts tail",
+    () => readAlertTail(deps.stateDir),
+    // A failed read is not an empty history: the screen has to be able to say so.
+    { alerts: [] as GcStatus["alerts"], readable: false },
+  );
 
   return {
     at: isoUtc(epoch),
@@ -1846,7 +1862,8 @@ export async function runTick(
     settings,
     nextReportAt,
     lastReportAt: reportedAt > 0 ? isoUtc(reportedAt) : null,
-    alerts,
+    alerts: alertTail.alerts,
+    alertsReadable: alertTail.readable,
     migrated,
   };
 }
@@ -2158,10 +2175,16 @@ export function emptyStatus(settings: GcSettings): GcStatus {
     daemonPid: null,
     uptimeS: null,
     treeWarnMb: settings.treeWarnMb,
-    ledger: { note: null, rows: 0 },
+    // No footprint has been measured, and no tree threshold resolved against RAM:
+    // `null` is "no tick has read the tree", never a zero-byte tree.
+    tree: null,
+    // Nothing has been written yet, which is a readable, empty ledger — not an
+    // unreadable one.
+    ledger: { note: null, rows: 0, readable: true },
     index: { ok: false, why: ["no tick has run yet"] },
     lastReportAt: null,
     alerts: [],
+    alertsReadable: true,
     settings: {
       apply: settings.apply,
       killStale: settings.killStale,
@@ -2181,11 +2204,13 @@ export function emptyStatus(settings: GcSettings): GcStatus {
  * stripped); the candidates are the *unfiltered* list, so a refused row arrives
  * with its rule key and the screen can say why nothing happened to it.
  *
- * The daemon identity, the ledger and the index are read off that same captured
- * result — `ident.daemonPid`, the `daemon` row's `etime_s`, `ledgerNext` /
+ * The daemon identity, the tree, the ledger and the index are read off that same
+ * captured result — `ident.daemonPid`, the `daemon` row's `etime_s`, the report's
+ * `tree` (its resolved `warnMb` and its own `over` verdict), `ledgerNext` /
  * `ledgerNote`, and the tick's one `index` verdict. Nothing here re-judges: the
- * ledger row count is the ledger the tick wrote back, and `index` is the scans'
- * own answer, not a conclusion drawn from refusal strings.
+ * ledger row count is the ledger the tick wrote back, `ledger.readable` /
+ * `alertsReadable` distinguish "unreadable" from "empty", and `index` is the
+ * scans' own answer, not a conclusion drawn from refusal strings.
  */
 export function buildStatus(result: TickResult): GcStatus {
   const ident = result.report.procs.ident;
@@ -2195,6 +2220,7 @@ export function buildStatus(result: TickResult): GcStatus {
       : result.report.procs.procs.find((row) => row.pid === ident.daemonPid);
   const ledgerNext: unknown = result.report.procs.ledgerNext;
   const ledgerNote = result.report.procs.ledgerNote;
+  const tree = result.report.procs.tree;
 
   return {
     ident: { ok: result.report.procs.ident.ok, why: result.report.procs.ident.why },
@@ -2204,15 +2230,28 @@ export function buildStatus(result: TickResult): GcStatus {
     // `etime_s` is `-1` for a field `ps` did not give: unknown, not zero.
     uptimeS: daemonRow === undefined || daemonRow.etime_s < 0 ? null : daemonRow.etime_s,
     treeWarnMb: result.settings.treeWarnMb,
+    // The report's own tree: `warnMb` is already resolved against RAM there
+    // (`buildTree`), and `over` is the tick's verdict — neither is recomputed.
+    tree: {
+      totalMb: tree.totalMb,
+      appMb: tree.appMb,
+      orphanMb: tree.orphanMb,
+      warnMb: tree.warnMb,
+      over: tree.over,
+    },
     ledger: {
       note: ledgerNote === "" ? null : ledgerNote,
       // The tick always asks for the next ledger (`wantLedger: true`); `null` here
       // means the process phase failed, and a failed phase recorded no rows.
       rows: Array.isArray(ledgerNext) ? ledgerNext.length : 0,
+      // A ledger that was never read (failed process phase) or that the reader
+      // refused (a note) is not an empty ledger, and must not read as one.
+      readable: Array.isArray(ledgerNext) && ledgerNote === "",
     },
     index: { ok: result.report.index.ok, why: [...result.report.index.why] },
     lastReportAt: result.lastReportAt,
     alerts: result.alerts.map((alert) => ({ at: alert.at, text: alert.text })),
+    alertsReadable: result.alertsReadable,
     settings: {
       apply: result.settings.apply,
       killStale: result.settings.killStale,

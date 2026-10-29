@@ -79,6 +79,24 @@ export interface GcRows {
   candidates: CandidateRow[];
   /** `gc.status.alerts`, newest first: the history the design asks for. */
   alerts: AlertRow[];
+  /**
+   * Whether `gc.status` could read `alerts.log`. `false` is "the history could not
+   * be read", which the screen says in those words instead of "nothing recorded".
+   */
+  alertsReadable: boolean;
+}
+
+/** The settings store's state, as much of it as the disclosure depends on. */
+export type SettingsStateForNotice =
+  | { status: "loading" }
+  | { status: "error"; error: string }
+  | { status: "invalid"; error: string }
+  | { status: "ready" };
+
+/** The banner above the rules and thresholds: nothing to draw, or what to say. */
+export interface SettingsNotice {
+  tone: "warning" | "danger";
+  text: string;
 }
 
 /** One line of the screen's run log. */
@@ -207,20 +225,71 @@ function indexRow(status: GcStatus): StatusRow {
   };
 }
 
+/**
+ * The Paseo tree's footprint against the two thresholds the reference prints it
+ * against: the resolved tree warn threshold and the memory kill threshold.
+ *
+ * Labelled "Paseo tree" on purpose — this is the app main plus its agents (and the
+ * proven orphans), not the daemon, and the daemon has its own row. The footprint,
+ * the resolved `warnMb` and the `over` verdict are the tick's; only the kill
+ * comparison is drawn here, exactly as `thresholdRow` does for the daemon.
+ *
+ * `tree === null` is a fresh install: no tick has measured the tree, and that is
+ * said in words rather than drawn as a zero-byte tree.
+ */
+function treeRow(status: GcStatus): StatusRow {
+  const label = "Paseo tree";
+  if (status.tree === null) {
+    return { label, value: `${NO_DATA} — no tick has read the tree footprint`, tone: "muted" };
+  }
+  const tree = status.tree;
+  const total = mbText(tree.totalMb);
+  const split = `app ${mbText(tree.appMb)} · orphan ${mbText(tree.orphanMb)}`;
+  const kill = mbText(status.settings.memKillMb);
+  if (tree.totalMb >= status.settings.memKillMb) {
+    return { label, value: `${total} · ${split} · over kill ${kill}`, tone: "danger" };
+  }
+  if (tree.over) {
+    return {
+      label,
+      value: `${total} · ${split} · over warn ${mbText(tree.warnMb)} · kill ${kill}`,
+      tone: "warning",
+    };
+  }
+  return {
+    label,
+    value: `${total} · ${split} · below warn ${mbText(tree.warnMb)} · kill ${kill}`,
+    tone: "normal",
+  };
+}
+
 /** The lineage ledger the last tick read and wrote back. */
 function ledgerRow(status: GcStatus): StatusRow {
-  const { note, rows } = status.ledger;
-  if (rows === 0 && (note === null || note.trim().length === 0)) {
-    // No rows and no complaint: a fresh install, or a tick that recorded none.
+  const { note, readable, rows } = status.ledger;
+  const complaint = note === null || note.trim().length === 0 ? null : note;
+  if (!readable) {
+    // Not empty: the tick did not read a ledger at all (a failed process phase),
+    // or the reader refused the file and said why.
+    return {
+      label: "ledger",
+      value:
+        complaint === null
+          ? "could not be read — the last tick's process phase failed, so no ledger was read"
+          : `could not be read · ${complaint}`,
+      tone: complaint === null ? "danger" : "warning",
+    };
+  }
+  if (rows === 0) {
+    // No rows and a readable file: a fresh install, or a tick that recorded none.
     return { label: "ledger", value: "no ledger rows yet", tone: "muted" };
   }
   const count = `${String(rows)} row${rows === 1 ? "" : "s"}`;
-  if (note === null || note.trim().length === 0) {
+  if (complaint === null) {
     return { label: "ledger", value: count, tone: "normal" };
   }
-  // The reader's note is a warning about the file it read ("unreadable", "N rows
-  // dropped"), so it outranks the count in the row's tone.
-  return { label: "ledger", value: `${count} · ${note}`, tone: "warning" };
+  // The reader's note is a warning about the file it read ("N rows dropped"), so
+  // it outranks the count in the row's tone.
+  return { label: "ledger", value: `${count} · ${complaint}`, tone: "warning" };
 }
 
 /** The alert tail, newest first: the design's history, from `alerts.log`. */
@@ -305,6 +374,9 @@ export function toGcRows(status: GcStatus): GcRows {
       tone: status.uptimeS === null ? "muted" : "normal",
     },
     thresholdRow(status, daemon),
+    // The tree is its own row, right under the daemon's: the daemon's footprint is
+    // one process inside the tree, and the two readings are not interchangeable.
+    treeRow(status),
     {
       label: "processes over warn",
       value:
@@ -343,7 +415,48 @@ export function toGcRows(status: GcStatus): GcRows {
     warnText: proc.warn ? `over warn (${mbText(status.settings.memWarnMb)})` : "",
   }));
 
-  return { status: statusRows, procs, candidates, alerts: alertRows(status.alerts) };
+  return {
+    status: statusRows,
+    procs,
+    candidates,
+    alerts: alertRows(status.alerts),
+    alertsReadable: status.alertsReadable,
+  };
+}
+
+/**
+ * The banner above the rules and thresholds, mirroring the Room screen's settings
+ * disclosure.
+ *
+ * Three of the store's four states are silent — `ready` is the normal case and
+ * `loading` is momentary. The other two are the states a person must not have to
+ * discover by pressing a toggle:
+ *
+ * - `error`: the store could not be read at all, so nothing here can be edited or
+ *   saved until it loads; the store's own words are shown.
+ * - `invalid`: the saved document does not match the schema. The values on screen
+ *   therefore come from the last tick — the imported `slp-gc.conf` baseline
+ *   layered under nothing — and saving writes a fresh document from those values,
+ *   which replaces the broken one (an invalid document supplies a revision but no
+ *   overrides, so any other override it carried is not preserved).
+ */
+export function settingsNotice(state: SettingsStateForNotice): SettingsNotice | null {
+  if (state.status === "error") {
+    return {
+      tone: "danger",
+      text: `${state.error} — the rules and thresholds cannot be edited until the settings load.`,
+    };
+  }
+  if (state.status === "invalid") {
+    return {
+      tone: "warning",
+      text:
+        "The saved GC settings do not match the schema, so the values shown come from the last tick " +
+        "(the imported slp-gc.conf baseline). Saving them replaces the saved document, and any other " +
+        "override it carried is lost.",
+    };
+  }
+  return null;
 }
 
 /**
