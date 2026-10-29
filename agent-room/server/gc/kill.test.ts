@@ -7,12 +7,16 @@
 //
 // The gates, in the reference's order, and what pins each one here:
 //
-//   the same pid is considered once        :1108  "does not signal the same pid twice"
+//   the same pid is considered once        :1108  "does not signal the same pid twice",
+//                                                  "refuses two candidates that resolve to one
+//                                                  fresh pid" (the pid signalled is the fresh one)
 //   `maxKills`                             :1110  "stops at maxKills", "counts across kinds"
 //   the tick budget                        :1111  "stops when the budget is spent",
 //                                                  "refuses everything when the budget was
 //                                                  already spent at entry"
-//   the pid is a signalable process        :1112  "refuses a pid that is not signalable"
+//   the pid is a signalable process        :1112  "refuses a pid that is not signalable", and
+//                                                  "refuses a fresh pid that is not signalable"
+//                                                  (0 and -900: `kill(0)`/`kill(-1)` are groups)
 //   the class is killable                  :1113  "refuses a class the rules can never make
 //                                                  eligible", the three never-signalled classes
 //   the row is not protected               :1114  "never signals a protected candidate"
@@ -21,9 +25,16 @@
 //                                                  "skips one that no longer qualifies"
 //   the fresh row's pid is what is signalled :1112 "signals the pid the fresh re-evaluation
 //                                                  carries"
+//   the fresh row's process identity       :1126  "refuses a fresh row whose lstart differs
+//                                                  (pid reuse)"
 //   its own proof re-read (exe allowlist)  :1148  "refuses an executable outside the allowlist"
 //   the footprint re-read before a mem kill :1159 "re-reads the footprint before a memory kill"
 //   one `SIGTERM`                          :1165  every acted case asserts the second argument
+//
+// The three settings-shaped inputs are permissive when absent (file header, point 7 of
+// `kill.ts`), so each absence has its own test pinning that default *and* the `warn` that
+// announces it: "treats absent kinds as both rules on", "…an absent killComms as no
+// executable allowlist", "…an absent memKillMb as no footprint re-read".
 import { describe, expect, it, vi } from "vitest";
 
 import type { KillCandidate, KillDeps } from "./kill";
@@ -207,6 +218,53 @@ describe("signalCandidates", () => {
     expect(result[0]).toMatchObject({ kind: "kill", id: "901", acted: true });
   });
 
+  // --- the fresh pid is gated again (:1112), because *it* is the one signalled
+  it.each([
+    ["0", 0],
+    ["-900", -900],
+  ])("refuses a fresh pid that is not signalable: %s", async (_label, freshPid) => {
+    // `process.kill(0, "SIGTERM")` signals the caller's own process group and a negative
+    // pid signals a group too: the candidate's pid being signalable is not enough.
+    const signal = vi.fn();
+    const result = await signalCandidates(
+      { candidates: [{ ...candidate, pid: 900 }], maxKills: 10, budgetS: 45 },
+      makeDeps({ signal, reevaluate: () => ({ ...candidate, pid: freshPid }) }),
+    );
+    expect(signal).not.toHaveBeenCalled();
+    expect(result[0]).toMatchObject({ acted: false });
+    expect(result[0].refusedBy).toBe("bad-pid");
+    expect(result[0].reason).toContain(String(freshPid));
+  });
+
+  // --- the fresh row's process identity (:1120-1128)
+  it("refuses a fresh row whose lstart differs, or cannot be re-read (pid reuse)", async () => {
+    const judged = { ...candidate, lstart: "Mon Oct  1 10:00:00 2026" };
+    for (const freshLstart of ["Tue Oct  2 10:00:00 2026", undefined]) {
+      const signal = vi.fn();
+      const result = await signalCandidates(
+        { candidates: [judged], maxKills: 10, budgetS: 45 },
+        makeDeps({ signal, reevaluate: () => ({ ...judged, lstart: freshLstart }) }),
+      );
+      expect(signal).not.toHaveBeenCalled();
+      expect(result[0]).toMatchObject({ acted: false, refusedBy: "identity" });
+      expect(result[0].reason).toContain("pid reuse");
+    }
+  });
+
+  it("signals a candidate whose lstart the fresh row confirms, and one that carries none", async () => {
+    const withLstart = { ...candidate, pid: 900, lstart: "Mon Oct  1 10:00:00 2026" };
+    const withoutLstart = { ...candidate, pid: 901, lstart: undefined };
+    const signal = vi.fn();
+    await signalCandidates(
+      { candidates: [withLstart, withoutLstart], maxKills: 10, budgetS: 45 },
+      makeDeps({ signal }),
+    );
+    // `lstart` is not newly required: only a candidate that carries one is compared.
+    expect(signal).toHaveBeenCalledTimes(2);
+    expect(signal).toHaveBeenNthCalledWith(1, 900, "SIGTERM");
+    expect(signal).toHaveBeenNthCalledWith(2, 901, "SIGTERM");
+  });
+
   it("stops after a fresh re-evaluation fails and refuses the rest", async () => {
     const signal = vi.fn();
     const result = await signalCandidates(
@@ -281,6 +339,76 @@ describe("signalCandidates", () => {
     expect(result[0].acted).toBe(true);
     expect(result[1]).toMatchObject({ acted: false });
     expect(result[1].refusedBy).toBe("duplicate-pid");
+  });
+
+  it("refuses two candidates that resolve to one fresh pid, after signalling it once", async () => {
+    // Two *different* candidate pids that the re-read says are the same process. The pid
+    // that gets signalled is the fresh one, so `seen` has to be consulted for it again
+    // once it is known — otherwise both candidates signal 950.
+    const signal = vi.fn();
+    const result = await signalCandidates(
+      { candidates: [{ ...candidate, pid: 900 }, { ...candidate, pid: 901 }], maxKills: 10, budgetS: 45 },
+      makeDeps({ signal, reevaluate: (row) => ({ ...row, pid: 950 }) }),
+    );
+    expect(signal).toHaveBeenCalledTimes(1);
+    expect(signal).toHaveBeenCalledWith(950, "SIGTERM");
+    expect(result).toHaveLength(2);
+    expect(result[0]).toMatchObject({ kind: "kill", id: "950", acted: true });
+    expect(result[1]).toMatchObject({ kind: "kill", id: "901", acted: false, refusedBy: "duplicate-pid" });
+    expect(result[1].reason).toContain("950");
+  });
+
+  // --- the three fail-open defaults (kill.ts, file header point 7)
+  it("treats absent kinds as both rules on, and warns", async () => {
+    const signal = vi.fn();
+    const log = vi.fn();
+    const memOnly = { ...candidate, pid: 700, stale: { eligible: false, why: "no" } };
+    const result = await signalCandidates(
+      { candidates: [memOnly], maxKills: 10, budgetS: 45 },
+      makeDeps({ signal, log }),
+    );
+    expect(signal).toHaveBeenCalledWith(700, "SIGTERM");
+    expect(result[0].acted).toBe(true);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("kinds"), expect.anything());
+  });
+
+  it("treats an absent killComms as no executable allowlist, and warns", async () => {
+    const signal = vi.fn();
+    const log = vi.fn();
+    // `/bin/bash` is refused by name when a `killComms` allowlist is supplied; with none,
+    // the executable arm does not run at all.
+    const orphan = { ...candidate, pid: 820, class: "orphan", exePath: "/bin/bash" };
+    const result = await signalCandidates(
+      { candidates: [orphan], maxKills: 10, budgetS: 45 },
+      makeDeps({ signal, log }),
+    );
+    expect(signal).toHaveBeenCalledWith(820, "SIGTERM");
+    expect(result[0].acted).toBe(true);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("killComms"), expect.anything());
+  });
+
+  it("treats an absent memKillMb as no footprint re-read, and warns", async () => {
+    const signal = vi.fn();
+    const log = vi.fn();
+    // A memory kill whose footprint cannot be read is refused when a threshold is
+    // supplied; with none, nothing re-reads it.
+    const memOnly = { ...candidate, pid: 830, footprint_mb: undefined };
+    const result = await signalCandidates(
+      { candidates: [memOnly], maxKills: 10, budgetS: 45, kinds: ["mem"] },
+      makeDeps({ signal, log }),
+    );
+    expect(signal).toHaveBeenCalledWith(830, "SIGTERM");
+    expect(result[0].acted).toBe(true);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("memKillMb"), expect.anything());
+  });
+
+  it("warns nothing about settings it was given", async () => {
+    const log = vi.fn();
+    await signalCandidates(
+      { candidates: [candidate], maxKills: 10, budgetS: 45, kinds: ["mem"], killComms: ["node"], memKillMb: 4096 },
+      makeDeps({ signal: vi.fn(), log }),
+    );
+    expect(log).not.toHaveBeenCalled();
   });
 
   // --- the rule toggles (:1105)

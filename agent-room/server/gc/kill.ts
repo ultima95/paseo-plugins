@@ -12,12 +12,15 @@
 //   the row is not protected           :1114
 //   a fresh full re-evaluation         :1116       (`recheck`, :1028 — before *every* signal)
 //   the fresh row is still eligible    :1117-1119
+//   the fresh pid is considered once   :1108-1109  (the `seen` list, re-checked *after* the re-read,
+//                                                   because the pid that gets signalled is the fresh one)
+//   the fresh row's process identity   :1120-1128  (`lstart`: a reused pid is not the process judged)
 //   the executable's own proof re-read :1148-1157  (`exe_of`, the `.app`/`/System`/`/Library`
 //                                                   refusal, the `SLP_GC_KILL_COMMS` allowlist)
 //   the footprint re-read              :1158-1163  (memory kills only)
 //   one `SIGTERM`                      :1165       (`"$KILL" -TERM "$pid"`)
 //
-// Six properties matter more than tidiness:
+// Seven properties matter more than tidiness:
 //
 // 1. **Nothing is signalled without a fresh evaluation of that very candidate.**
 //    `recheck` runs before *every* signal (`:1116`), and the reference then selects
@@ -54,6 +57,14 @@
 // 6. **`SIGTERM` and nothing else.** The signal name is passed to the injected
 //    `signal` so the contract is visible at every call site and assertable in a
 //    test; the reference sends `-TERM` once and never escalates (`:1165`).
+//
+// 7. **The three settings-shaped inputs fail open, out loud.** Absent `kinds`,
+//    `killComms` and `memKillMb` mean *no restriction* — both rules on, no
+//    executable allowlist, no footprint re-read — because the reference's own
+//    parameters work that way (`do_apply 1 1`, `KILL_COMMS` and `KILL_MB` only
+//    consulted when set) and because the brief's tests supply none of them. That
+//    is permissive, so every absence is logged as a `warn` and each default is
+//    pinned by its own test; the tick must always pass the settings it read.
 
 import { type ActionResult, createBudget } from "./apply";
 import type { Decision } from "./evaluate";
@@ -118,9 +129,19 @@ export interface KillCandidate {
   protected?: string | null;
   /** The reference's `why` for the decision that made the row eligible (`:1167`). */
   why?: string;
-  /** `ps`'s `lstart` — the identity the reference re-reads before a signal (`:1124-1127`). */
+  /**
+   * `ps`'s `lstart` — the identity the reference re-reads before a signal
+   * (`:1124-1127`). Optional: a candidate without one keeps the pre-fix behaviour
+   * (no identity comparison), so nothing newly *requires* it. A candidate that
+   * carries one is refused when the fresh row's `lstart` differs or cannot be
+   * re-read — that is a reused pid, not the process the report judged.
+   */
   lstart?: string;
-  /** The parent pid the reference re-checks (`:1123`). */
+  /**
+   * The parent pid the reference re-checks (`:1123`). Informational here: `ppid`
+   * and `comm` are carried for a refusal's text, and comparing them is
+   * `reevaluate`'s job (`:1126` is one combined `lstart`/`ppid`/`command` arm).
+   */
   ppid?: number;
   /** `comm` / argv basename, for a refusal's text. */
   comm?: string;
@@ -143,16 +164,31 @@ export interface KillInput {
   startedAt?: number;
   /**
    * Which rules are enabled (`SLP_GC_KILL_STALE` / `SLP_GC_KILL_MEMORY`, `:1105`).
-   * Absent means both — `do_apply 1 1`, which is what the caller asks for by
-   * calling this function with no toggle information. An empty list means neither.
+   *
+   * **Absent is permissive**: both rules are treated as enabled — `do_apply 1 1`,
+   * which is what the caller asks for by calling this function with no toggle
+   * information — and a `warn` is logged to say so. An empty list means neither.
+   * The tick must always pass the settings it read here, or a toggle the operator
+   * turned off does nothing.
    */
   kinds?: readonly KillKind[];
-  /** `SLP_GC_MEM_KILL_MB`: when supplied, a memory kill re-checks the fresh footprint (`:1159`). */
+  /**
+   * `SLP_GC_MEM_KILL_MB`: when supplied, a memory kill re-checks the fresh footprint
+   * (`:1159`).
+   *
+   * **Absent is permissive**: no footprint re-read at all, so a memory kill rests on
+   * the report's own footprint; a `warn` is logged to say so. The tick must always
+   * pass the setting.
+   */
   memKillMb?: number;
   /**
    * `SLP_GC_KILL_COMMS`: when supplied, an `orphan`/`agent-descendant` signal also
    * requires the fresh row's real executable to be readable and in this allowlist
    * (`:1148-1157`).
+   *
+   * **Absent is permissive**: the executable arm is skipped entirely for every
+   * class, so a signal rests on the class and the rule alone; a `warn` is logged to
+   * say so. The tick must always pass the setting.
    */
   killComms?: readonly string[];
 }
@@ -284,7 +320,9 @@ function exeRefusal(row: KillCandidate, killComms: readonly string[]): Refusal |
  * The order per candidate is the reference's: de-duplicate the pid (`:1108`),
  * `maxKills` (`:1110`), the budget (`:1111`), the pid (`:1112`), the class
  * (`:1113`), protection (`:1114`), the fresh re-evaluation (`:1116`), the fresh
- * row's own eligibility/protection/class/pid (`:1117-1119`), the executable
+ * row's own pid (`:1112` again, and de-duplicated again because *this* is the pid
+ * that gets signalled, `:1108`), protection/class (`:1117`), eligibility
+ * (`:1117-1119`), the process identity (`:1120-1128`), the executable
  * (`:1148-1157`), the memory footprint (`:1158-1163`), then exactly one
  * `SIGTERM` (`:1165`).
  *
@@ -315,6 +353,24 @@ export async function signalCandidates(
     typeof input.memKillMb === "number" && Number.isFinite(input.memKillMb)
       ? input.memKillMb
       : undefined;
+
+  // The three settings-shaped inputs fail open when absent (file header, point 7).
+  // Say so, every phase: a tick that forgot to pass settings must not be silent.
+  if (input.kinds === undefined) {
+    warn("gc kill: no rule toggles supplied (kinds absent): both the stale and the memory rule are treated as enabled", {
+      default: "both",
+    });
+  }
+  if (killComms === undefined) {
+    warn("gc kill: no executable allowlist supplied (killComms absent): SLP_GC_KILL_COMMS is not enforced", {
+      gatedClasses: [...EXE_GATED_CLASSES],
+    });
+  }
+  if (memKillMb === undefined) {
+    warn("gc kill: no memory threshold supplied (memKillMb absent): the footprint re-read is skipped", {
+      default: "no footprint re-read",
+    });
+  }
 
   /** Pids already considered this phase (`seen`, `:1103`, `:1108-1109`). */
   const seen = new Set<number>();
@@ -397,6 +453,10 @@ export async function signalCandidates(
       continue;
     }
     const freshPid = fresh.pid;
+    // `process.kill(0, …)` signals the caller's whole process group and
+    // `process.kill(-1, …)` every process it may signal, so the non-positive pids the
+    // candidate-level gate refuses have to be refused again here: the pid that gets
+    // signalled is the *fresh* one, never the candidate's.
     if (!signalablePid(freshPid)) {
       considered(refuseWith("bad-pid", `bad pid on the fresh re-evaluation: ${String(freshPid)}`));
       continue;
@@ -405,6 +465,17 @@ export async function signalCandidates(
     // proves itself against the row that was just re-read (:1117-1119).
     if (freshPid !== candidatePid) {
       warn("gc kill: the fresh row carries a different pid", { candidate: candidatePid, fresh: freshPid });
+    }
+    // --- the fresh pid has to be one this phase has not already considered
+    // (:1108-1109). `seen` is consulted for the candidate pid above, before the
+    // re-read; two candidates can converge on one fresh pid, and signalling it twice
+    // is one SIGTERM too many. A pid equal to the candidate's own was added above and
+    // is not a second consideration.
+    if (freshPid !== candidatePid && seen.has(freshPid)) {
+      considered(
+        refuseWith("duplicate-pid", `pid ${freshPid} was already considered this phase (fresh re-evaluation pid)`),
+      );
+      continue;
     }
 
     // --- its own proof on the fresh row (:1117): still protected, still killable
@@ -438,6 +509,35 @@ export async function signalCandidates(
       continue;
     }
     const why = decisionFor(fresh, authorising)?.why ?? "";
+
+    // --- the process identity (`:1120-1128`): a pid is reused, an `lstart` is not.
+    // The reference re-reads `ps -p <pid>` and refuses when `lstart`, `ppid` or the
+    // command moved between the evaluation and the signal. The one identity this port
+    // can compare is the fresh row's `lstart` against the candidate's: a candidate
+    // that carries none keeps the pre-fix behaviour (nothing is newly *required*), and
+    // one that carries it is refused when the fresh row differs — or cannot answer,
+    // because an unreadable identity proves nothing.
+    if (typeof candidate.lstart === "string" && candidate.lstart !== "") {
+      const freshLstart = fresh.lstart;
+      if (typeof freshLstart !== "string" || freshLstart === "") {
+        considered(
+          refuseWith(
+            "identity",
+            "lstart/ppid/command changed since evaluation (pid reuse?): the fresh row carries no lstart to compare",
+          ),
+        );
+        continue;
+      }
+      if (freshLstart !== candidate.lstart) {
+        considered(
+          refuseWith(
+            "identity",
+            `lstart/ppid/command changed since evaluation (pid reuse?): ${freshLstart} != ${candidate.lstart}`,
+          ),
+        );
+        continue;
+      }
+    }
 
     // --- the executable's own proof (:1148-1157)
     if (killComms !== undefined && EXE_GATED_CLASSES.has(fresh.class)) {

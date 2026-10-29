@@ -11,7 +11,8 @@
 //   the candidate is garbage            :1079  "refuses a candidate its own rule refused"
 //   the rule's toggle                   :1061  "refuses a candidate whose rule is off"
 //   the tick budget                     :1072  "stops when the budget is spent"
-//   `maxActions`                        :1073  "stops at maxActions"
+//   `maxActions`                        :1073  "stops at maxActions", "counts a failed delete"
+//   the record file is still a file     :1076  "refuses a record file that is gone or a symlink"
 //   a signature to compare against      :1080  "refuses a candidate with no signature"
 //   a fresh full re-evaluation          :1077  "refuses when the fresh re-evaluation fails"
 //   the signature/timestamps still match :1081 "skips a candidate whose signature changed"
@@ -423,6 +424,87 @@ describe("reclaim", () => {
     expect(result[2].refusedBy).toBe("bad-kind");
   });
 
+  // --- the record file's own shape (:1076): `[ -L "$path" ] || [ ! -f "$path" ]`
+  it("refuses a record file that is gone or a symlink, before re-reading it", async () => {
+    const shapes = [
+      ["gone", null],
+      ["a symlink", { isSymbolicLink: true, isFile: true }],
+      ["a directory", { isSymbolicLink: false, isFile: false }],
+    ] as const;
+    for (const [label, shape] of shapes) {
+      const deleteAgent = vi.fn();
+      const verify = vi.fn(() => true);
+      const result = await reclaim(
+        { candidates: [agentCandidate], indexOk: true },
+        makeDeps({ deleteAgent, verify, lstat: () => shape }),
+      );
+      expect(deleteAgent, label).not.toHaveBeenCalled();
+      expect(verify, label).not.toHaveBeenCalled();
+      expect(result[0].refusedBy).toBe("file-gone");
+      expect(result[0].reason).toContain("file gone or symlink");
+    }
+  });
+
+  it("refuses when the record file itself cannot be statted", async () => {
+    const deleteAgent = vi.fn();
+    const result = await reclaim(
+      { candidates: [agentCandidate], indexOk: true },
+      makeDeps({
+        deleteAgent,
+        lstat: () => {
+          throw new Error("EACCES");
+        },
+      }),
+    );
+    expect(deleteAgent).not.toHaveBeenCalled();
+    expect(result[0].refusedBy).toBe("file-gone");
+    expect(result[0].reason).toContain("EACCES");
+  });
+
+  it("deletes when the record file is still a regular file", async () => {
+    const deleteAgent = vi.fn(async () => undefined);
+    const lstat = vi.fn(() => ({ isFile: true, isSymbolicLink: false }));
+    const result = await reclaim(
+      { candidates: [agentCandidate], indexOk: true },
+      makeDeps({ deleteAgent, lstat }),
+    );
+    expect(lstat).toHaveBeenCalledWith(agentCandidate.path);
+    expect(deleteAgent).toHaveBeenCalledWith("a1");
+    expect(result[0].acted).toBe(true);
+  });
+
+  it("leaves the record file's existence to verify when no path is supplied", async () => {
+    const deleteAgent = vi.fn(async () => undefined);
+    const lstat = vi.fn(() => null);
+    const verify = vi.fn(() => ({
+      sig: "1:2:3",
+      updatedAt: agentCandidate.updatedAt,
+      archivedAt: agentCandidate.archivedAt,
+    }));
+    const result = await reclaim(
+      { candidates: [{ ...agentCandidate, path: undefined }], indexOk: true },
+      makeDeps({ deleteAgent, lstat, verify }),
+    );
+    expect(lstat).not.toHaveBeenCalled();
+    expect(verify).toHaveBeenCalledTimes(1);
+    expect(result[0].acted).toBe(true);
+  });
+
+  it("says so when the record file cannot be checked and leans on verify instead", async () => {
+    // No `lstat` injected: the arm is skipped (this module does no I/O of its own), so
+    // the file's existence is `verify`'s to answer — and a `verify` that answers nothing
+    // refuses the row.
+    const deleteAgent = vi.fn();
+    const log = vi.fn();
+    const result = await reclaim(
+      { candidates: [agentCandidate], indexOk: true },
+      makeDeps({ deleteAgent, log, verify: () => null }),
+    );
+    expect(deleteAgent).not.toHaveBeenCalled();
+    expect(result[0].refusedBy).toBe("fresh-evaluation");
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("lstat"), expect.anything());
+  });
+
   // --- the limits (:1072-1073)
   it("stops at maxActions", async () => {
     const deleteAgent = vi.fn(async () => undefined);
@@ -445,6 +527,23 @@ describe("reclaim", () => {
     expect(result).toHaveLength(3);
     expect(result[2]).toMatchObject({ acted: false, refusedBy: "limit" });
     expect(result[2].reason).toContain("SLP_GC_MAX_ACTIONS=2");
+  });
+
+  it("counts a failed delete against maxActions", async () => {
+    // `MAX_ACTIONS` counts attempts, as the reference does: `n=$((n + 1))` is at :1092,
+    // before the CLI call at :1093. A delete that fails still spends its slot.
+    const deleteAgent = vi.fn(async () => {
+      throw new Error("daemon hung");
+    });
+    const result = await reclaim(
+      { candidates: [agentCandidate, { ...agentCandidate, id: "a2" }], indexOk: true, maxActions: 1 },
+      makeDeps({ deleteAgent }),
+    );
+    expect(deleteAgent).toHaveBeenCalledTimes(1);
+    expect(deleteAgent).toHaveBeenCalledWith("a1");
+    expect(result[0]).toMatchObject({ acted: false, refusedBy: "delete-failed" });
+    expect(result[1]).toMatchObject({ acted: false, refusedBy: "limit" });
+    expect(result[1].reason).toContain("SLP_GC_MAX_ACTIONS=1");
   });
 
   it("stops when the budget is spent", async () => {

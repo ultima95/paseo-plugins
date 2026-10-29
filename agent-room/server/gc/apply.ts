@@ -5,7 +5,9 @@
 //   the two refuse-everything arms     :1050-1057  (`procs.ident.ok`, then `index.ok`)
 //   the per-candidate loop             :1068-1096  (schedules first, then agents)
 //   the tick budget, per candidate     :1072       (`budget_expired`, :1008)
-//   `MAX_ACTIONS`, per action          :1073
+//   `MAX_ACTIONS`, per attempt         :1073
+//   the id/kind shapes                 :1074-1075
+//   the record file is still a file    :1076       (gone, or a symlink)
 //   a fresh full re-evaluation         :1077       (`recheck`, :1028)
 //   the row must still be garbage      :1078-1079
 //   the signature/timestamp re-check   :1080-1084  (file `sig` *and* the fresh row's)
@@ -35,18 +37,21 @@
 //
 // 3. **The gates are ordered the way the reference orders them**, and each one is
 //    a refusal that returns an `ActionResult` rather than an exception: the row's
-//    own verdict, its rule's toggle, the budget, `MAX_ACTIONS`, the signature, the
-//    re-read. A failure of the *delete* is also a result (`acted: false`), and the
-//    loop continues — `fail=1` in the reference (`:1094`) does not stop the run.
+//    own verdict, its rule's toggle, the budget, `MAX_ACTIONS`, the id/kind shapes,
+//    the record file's own shape (`:1076`), the signature, the re-read. A failure of
+//    the *delete* is also a result (`acted: false`), and the loop continues —
+//    `fail=1` in the reference (`:1094`) does not stop the run. `MAX_ACTIONS` counts
+//    *attempts*, not successes (`:1092` increments `n` before the CLI call at
+//    `:1093`), so a delete that fails still consumes its slot.
 //
-// 4. **Nothing throws.** `deleteAgent`, `deleteSchedule`, `verify`, `now` and the
-//    log are foreign code: a throw, a `null`, or a wrongly shaped answer is a
-//    refusal. The one exception is deliberately *not* caught into a "verified"
+// 4. **Nothing throws.** `deleteAgent`, `deleteSchedule`, `verify`, `lstat`, `now`
+//    and the log are foreign code: a throw, a `null`, or a wrongly shaped answer is
+//    a refusal. The one exception is deliberately *not* caught into a "verified"
 //    answer — a `verify` that throws refuses the candidate.
 //
 // 5. **Pure of I/O.** No `paseo` client, no `fs`, no clock of its own: the
-//    deletes, the re-read and the clock arrive as `deps`. A test never touches a
-//    record file, an agent or a schedule.
+//    deletes, the re-read, the optional `lstat` and the clock arrive as `deps`. A
+//    test never touches a record file, an agent or a schedule.
 //
 // 6. **The budget is the tick's.** `budgetS` is `SLP_GC_TICK_BUDGET_S`; when the
 //    caller passes the tick's own `startedAt` the comparison is the reference's
@@ -166,7 +171,13 @@ export interface ReclaimCandidate {
   kind: "agent" | "schedule";
   /** The record's id — `paseo agent delete -- <uuid>` / `paseo schedule delete -- <hex8>`. */
   id: string;
-  /** The record file the decision was made on (`$path`, `:1076`). */
+  /**
+   * The record file the decision was made on (`$path`, `:1076`). When supplied
+   * *and* `deps.lstat` is supplied, the file must still be a regular file that is not
+   * a symlink, or the candidate is refused (`file-gone`) before anything is re-read;
+   * when absent — or when no `lstat` was injected — the file's existence is left to
+   * `verify`, whose "no answer" refuses the candidate.
+   */
   path?: string;
   /** `inode:size:mtime` of that file (`$sig`, `:1080`); `""`/absent = unverified, refused. */
   sig?: string;
@@ -260,6 +271,17 @@ export interface ReclaimDeps {
    * from disk and answer with what it now is.
    */
   verify: (candidate: ReclaimCandidate) => VerifyAnswer | Promise<VerifyAnswer>;
+  /**
+   * The record file's own shape, for `[ -L "$path" ] || [ ! -f "$path" ]` (`:1076`):
+   * a production caller passes `fs.lstat`'s two answers. Optional — this module does
+   * no I/O of its own, and the brief's candidates carry no `path` at all. When it is
+   * absent and a candidate *does* carry a `path`, a `warn` says the arm was skipped
+   * and `verify` owns the record's existence (a `verify` that answers nothing refuses
+   * the candidate).
+   */
+  lstat?: (
+    path: string,
+  ) => { isFile?: boolean; isSymbolicLink?: boolean } | null | undefined;
   /** `date +%s`; defaults to the wall clock. */
   now?: () => number;
   log?: GcLog;
@@ -452,9 +474,10 @@ function refusal(
  * hold. Never throws: every failure of a dependency is a refusal row.
  *
  * Order per candidate is the reference's: the row's own verdict, its rule's
- * toggle, the budget (`:1072`), `MAX_ACTIONS` (`:1073`), the id/kind sanity the
- * reference applies at `:1074-1075`, the signature (`:1080`), the fresh re-read
- * (`:1077-1084`), then the delete (`:1093`).
+ * toggle, the budget (`:1072`), `MAX_ACTIONS` (`:1073`, attempts), the id/kind
+ * sanity the reference applies at `:1074-1075`, the record file's own shape
+ * (`:1076`, through the optional `deps.lstat`), the signature (`:1080`), the fresh
+ * re-read (`:1077-1084`), then the delete (`:1093`).
  */
 export async function reclaim(input: ReclaimInput, deps: ReclaimDeps): Promise<ActionResult[]> {
   const warn = warnLog(deps?.log);
@@ -491,7 +514,10 @@ export async function reclaim(input: ReclaimInput, deps: ReclaimDeps): Promise<A
 
   /** Set once a phase-wide limit is hit: every remaining candidate is refused with it. */
   let stopped: Refusal | null = null;
-  let acted = 0;
+  /** Deletes *attempted* this phase — the reference's `n`, incremented before the call. */
+  let attempted = 0;
+  /** Whether the "no lstat, so `verify` owns the file" warn was already emitted. */
+  let warnedNoLstat = false;
 
   for (const candidate of candidates) {
     const kind: ActionResultKind =
@@ -537,13 +563,14 @@ export async function reclaim(input: ReclaimInput, deps: ReclaimDeps): Promise<A
         "budget",
         `tick budget (SLP_GC_TICK_BUDGET_S=${String(input.budgetS)}) expired: remaining apply work skipped`,
       );
-      warn("gc apply stopped: tick budget expired", { budgetS: input.budgetS, acted });
+      warn("gc apply stopped: tick budget expired", { budgetS: input.budgetS, attempted });
       considered(stopped);
       continue;
     }
 
-    // --- MAX_ACTIONS (:1073)
-    if (acted >= maxActions) {
+    // --- MAX_ACTIONS (:1073), counted in *attempts*: `n` is incremented before the
+    // CLI call (`:1092`), so a delete that fails still consumes its slot.
+    if (attempted >= maxActions) {
       stopped = refuseWith("limit", `SLP_GC_MAX_ACTIONS=${maxActions} reached`);
       considered(stopped);
       continue;
@@ -557,6 +584,43 @@ export async function reclaim(input: ReclaimInput, deps: ReclaimDeps): Promise<A
     if (id === "") {
       considered(refuseWith("bad-id", "the candidate carries no id"));
       continue;
+    }
+
+    // --- the record file itself (:1076): `[ -L "$path" ] || [ ! -f "$path" ]` is
+    // "file gone or symlink", refused *before* the re-read. Only when the caller
+    // carries a `path` and injected `lstat`: this module does no I/O of its own, and
+    // with no `path` — or no `lstat` to answer for it — the file's existence is
+    // `verify`'s to answer one gate later (a `verify` that answers nothing refuses the
+    // candidate). No `path`, nothing to check; no `lstat`, the caller is told so.
+    if (typeof candidate.path === "string" && candidate.path !== "") {
+      if (deps.lstat === undefined) {
+        if (!warnedNoLstat) {
+          warnedNoLstat = true;
+          warn("gc apply: no lstat supplied, leaving each record file's existence to verify", {
+            firstPath: candidate.path,
+          });
+        }
+      } else {
+        let shape: { isFile?: boolean; isSymbolicLink?: boolean } | null | undefined;
+        try {
+          shape = deps.lstat(candidate.path);
+        } catch (error) {
+          considered(refuseWith("file-gone", `file gone or symlink: lstat failed: ${reasonOf(error)}`));
+          continue;
+        }
+        if (shape === null || shape === undefined) {
+          considered(refuseWith("file-gone", "file gone or symlink: the record file no longer exists"));
+          continue;
+        }
+        if (shape.isSymbolicLink === true) {
+          considered(refuseWith("file-gone", "file gone or symlink: the record file is a symlink"));
+          continue;
+        }
+        if (shape.isFile !== true) {
+          considered(refuseWith("file-gone", "file gone or symlink: the record file is not a regular file"));
+          continue;
+        }
+      }
     }
 
     // --- the signature the decision was made on (:1080). "" is "unverified".
@@ -579,7 +643,9 @@ export async function reclaim(input: ReclaimInput, deps: ReclaimDeps): Promise<A
       continue;
     }
 
-    // --- the delete (:1093)
+    // --- the delete (:1093). The attempt is counted *before* the call, as the
+    // reference does (`:1092` then `:1093`), so a failed delete still spends a slot.
+    attempted += 1;
     try {
       if (kind === "schedule") await deps.deleteSchedule(id);
       else await deps.deleteAgent(id);
@@ -588,7 +654,6 @@ export async function reclaim(input: ReclaimInput, deps: ReclaimDeps): Promise<A
       warn("gc apply delete failed", { kind, id, error: reasonOf(error) });
       continue;
     }
-    acted += 1;
     results.push({
       kind,
       id,
