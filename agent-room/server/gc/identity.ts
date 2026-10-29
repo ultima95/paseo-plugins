@@ -112,7 +112,12 @@ export interface IdentityInput {
   pidFile: unknown;
   /** Pids listening on the pid file's port — the reference's `listen.json` (slp-gc.bash:615-619). */
   listen: readonly number[];
-  /** Pid rows that appeared more than once in the `ps` output (`ParsedPs.dupes`, slp-gc.bash:286). */
+  /**
+   * Pid rows that appeared more than once in the `ps` output (`ParsedPs.dupes`,
+   * slp-gc.bash:286). Only exactly `0` proves the sample was a process table;
+   * any other value — including a `NaN` or a caller that lost the count — is
+   * duplicates present and refuses (`:334-335`).
+   */
   dupes: number;
   /** `$HOME_IS_DEFAULT`: the GC's own `PASEO_HOME` is the default one (slp-gc.bash:784). */
   homeDefault: boolean;
@@ -147,7 +152,9 @@ function readPidFile(raw: unknown): PidFile | null {
  *
  * 1. **duplicates** — two rows for one pid mean the `ps` sample is not a
  *    process table, so every pid-keyed lookup below is unreliable; nothing else
- *    can be trusted first (`:334-335`).
+ *    can be trusted first (`:334-335`). A count that is not exactly `0` counts,
+ *    including one the caller could not read: `ok` and `why` share the same
+ *    predicate so a refusal here always names the duplicate sample.
  * 2. **pid file** — without it there is no claim to check (`:336`).
  * 3. **supervisor** — the pid the file names must be a live Supervisor *and* a
  *    child of an app main, which is what makes it the GUI's Supervisor rather
@@ -182,11 +189,17 @@ export function resolveIdentity(input: IdentityInput): Identity {
   const supHome: HomeState = sup === undefined ? "unreadable" : (sup.home ?? "unreadable");
   const homeBound = supHome === "match" || (supHome === "none" && input.homeDefault);
 
-  const ok =
-    input.dupes === 0 && pidFile && supervisor && daemon && listener && homeBound;
+  // One predicate behind both `ok` and `why` (slp-gc.bash:334-335): only exactly
+  // zero proves the `ps` sample was a table, so every refusal from this arm also
+  // gets the duplicate-rows `why`. With two spellings (`dupes === 0` in `ok`,
+  // `dupes > 0` in `why`) a `NaN` or a lost count produced `ok: false` with
+  // `why: "ok"` — a refusal the operator cannot act on.
+  const duplicated = !(input.dupes === 0);
+
+  const ok = !duplicated && pidFile && supervisor && daemon && listener && homeBound;
 
   const why = ((): string => {
-    if (input.dupes > 0) return "duplicate pid rows in the ps output";
+    if (duplicated) return "duplicate pid rows in the ps output";
     if (!pidFile) return "paseo.pid missing/unparseable";
     if (!supervisor) return 'pid in paseo.pid is not a live "Paseo Supervisor" child of an app main';
     if (!daemon) return 'no single "Paseo Daemon" child of the Supervisor';

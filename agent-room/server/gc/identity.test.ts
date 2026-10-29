@@ -337,3 +337,36 @@ describe("resolveIdentity — refusal order and duplicates (slp-gc.bash:334-341)
     }
   });
 });
+
+describe("resolveIdentity — the duplicate count is one predicate for `ok` and `why` (slp-gc.bash:334-335)", () => {
+  // Before this, `ok` tested `dupes === 0` while `why` tested `dupes > 0`, so a
+  // count that was neither (`undefined`, `NaN`, a negative) produced the
+  // contradictory answer `ok: false, why: "ok"`. Every other flag holds in these
+  // cases, which is what makes the count the only possible reason.
+  const withDupes = (dupes: unknown) => resolveIdentity(input({ dupes: dupes as number }));
+
+  it("accepts exactly zero, and nothing else", () => {
+    const zero = withDupes(0);
+    expect(zero.ok).toBe(true);
+    expect(zero.why).toBe("ok");
+
+    for (const dupes of [1, 2, 0.5, -1, Number.NaN, Number.POSITIVE_INFINITY, undefined, null]) {
+      const identity = withDupes(dupes);
+      expect(identity.ok).toBe(false);
+      expect(identity.why).toBe("duplicate pid rows in the ps output");
+      // The whole chain was fine: the refusal is the count and names the count.
+      expect(identity.pidFile).toBe(true);
+      expect(identity.supervisor).toBe(true);
+      expect(identity.daemon).toBe(true);
+      expect(identity.listener).toBe(true);
+      expect(identity.homeBound).toBe(true);
+    }
+  });
+
+  it("never reports why: ok while ok is false, and never refuses while ok is true", () => {
+    for (const dupes of [0, 1, 2, 0.5, -1, Number.NaN, Number.POSITIVE_INFINITY, undefined]) {
+      const identity = withDupes(dupes);
+      expect(identity.why === "ok").toBe(identity.ok);
+    }
+  });
+});

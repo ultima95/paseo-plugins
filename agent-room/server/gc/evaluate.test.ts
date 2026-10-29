@@ -434,7 +434,11 @@ describe("buildProcTable — ownership (slp-gc.bash:304-312)", () => {
   });
 
   it("answers missing, unknown and unknown-on-a-broken-index (slp-gc.bash:312)", () => {
-    const missing = buildProcTable(tableInput({ agents: [agent("other", null)] }));
+    // `missing` is the one state that needs the caller to vouch for the index:
+    // it proves the agent is gone, so it is opt-in (`agentIndexOk: true`).
+    const missing = buildProcTable(
+      tableInput({ agents: [agent("other", null)], agentIndexOk: true }),
+    );
     expect(missing.procs.find((entry) => entry.pid === 500)?.ownerState).toBe("missing");
 
     const noIndex = buildProcTable(tableInput({ agents: [] }));
@@ -444,6 +448,56 @@ describe("buildProcTable — ownership (slp-gc.bash:304-312)", () => {
       tableInput({ agents: [agent("other", null)], agentIndexOk: false }),
     );
     expect(broken.procs.find((entry) => entry.pid === 500)?.ownerState).toBe("unknown");
+  });
+});
+
+describe("buildProcTable — the index completeness must be opted into (slp-gc.bash:312)", () => {
+  // `agentIndexOk` defaults to false. An index nobody vouched for must not turn
+  // a missing record into `missing`, because `missing` is the only owner state
+  // that proves the agent is gone and the stale rule signals on it (arm 8).
+  it("reads an owner with no record as unknown when the flag is absent", () => {
+    const table = buildProcTable(tableInput({ agents: [agent("other", null)] }));
+    expect(table.procs.find((entry) => entry.pid === 500)?.ownerState).toBe("unknown");
+    expect(table.procs.find((entry) => entry.pid === 400)?.ownerState).toBe("unknown");
+    // Even an explicit `undefined` is an unstated index, not a complete one.
+    const explicit = buildProcTable(
+      tableInput({ agents: [agent("other", null)], agentIndexOk: undefined }),
+    );
+    expect(explicit.procs.find((entry) => entry.pid === 500)?.ownerState).toBe("unknown");
+  });
+
+  it("leaves a record-backed owner state alone, whatever the flag says", () => {
+    for (const agentIndexOk of [undefined, true, false]) {
+      for (const [record, expected] of [
+        [agent("agent-1", "2026-10-01T00:00:00Z"), "archived"],
+        [agent("agent-1", null), "live"],
+      ] as const) {
+        const table = buildProcTable(tableInput({ agents: [record], agentIndexOk }));
+        expect(table.procs.find((entry) => entry.pid === 500)?.ownerState).toBe(expected);
+      }
+    }
+  });
+
+  it("refuses the stale rule for the owner a defaulted index could not resolve", () => {
+    // The fail-closed consequence: an aged agent child whose parent is gone from
+    // the table and whose owner has no record is refused until the caller proves
+    // the index was complete. (ppid must not be 1: all three owner arms of
+    // slp-gc.bash:354-357 are guarded by `ppid != 1`.)
+    const rows = [...MACHINE, psRow({ pid: 800, ppid: 900, cmd: CLAUDE, etime_s: 3600 })];
+    const env = envOf({ 400: { agent: "agent-1" }, 800: { agent: "agent-gone", home: "match" } });
+    const agents = [agent("agent-1", "2026-10-01T00:00:00Z")];
+
+    const defaulted = buildProcTable(tableInput({ rows, env, agents }));
+    const orphan = defaulted.procs.find((entry) => entry.pid === 800)!;
+    expect(orphan.ownerState).toBe("unknown");
+    const refused = staleDecision(orphan, { ...ctx, famPids: defaulted.famPids });
+    expect(refused.eligible).toBe(false);
+    expect(refused.why).toContain("owner agent-gone is unknown");
+
+    // The same machine with the index vouched for: the owner really is gone.
+    const complete = buildProcTable(tableInput({ rows, env, agents, agentIndexOk: true }));
+    const proven = complete.procs.find((entry) => entry.pid === 800)!;
+    expect(proven.ownerState).toBe("missing");
   });
 });
 
@@ -587,7 +641,10 @@ describe("buildProcTable — underDaemon (slp-gc.bash:346)", () => {
     expect(table.procs.find((entry) => entry.pid === 800)?.underDaemon).toBe(false);
   });
 
-  it("is false for every row when no daemon was identified", () => {
+  it("is false for every row when identification found no daemon (explicit null)", () => {
+    // `daemonPid: null` is a *finding* — identification ran and there is no single
+    // daemon — not the absent state below. It is safe because identity is not
+    // `ok` in that case, so the stale rule refuses at its identification arm.
     const table = buildProcTable(tableInput({ daemonPid: null }));
     expect(table.procs.every((entry) => entry.underDaemon === false)).toBe(true);
   });
@@ -600,6 +657,84 @@ describe("buildProcTable — underDaemon (slp-gc.bash:346)", () => {
     ];
     const table = buildProcTable(tableInput({ rows, daemonPid: 200 }));
     expect(table.procs.find((entry) => entry.pid === 400)?.underDaemon).toBe(false);
+  });
+});
+
+describe("buildProcTable — the three daemonPid states (slp-gc.bash:346, 353)", () => {
+  /** The single-pass build: no `daemonPid` key at all, as a caller that has not identified the daemon yet. */
+  function singlePass(over: Partial<ProcTableInput> = {}) {
+    const { daemonPid: _omitted, ...rest } = tableInput(over);
+    return buildProcTable(rest);
+  }
+
+  it("treats an absent daemonPid as unknown ownership: every row is daemon-owned", () => {
+    const absent = singlePass();
+    expect(absent.procs.map((entry) => entry.pid)).toEqual([100, 150, 200, 400, 500]);
+    expect(absent.procs.every((entry) => entry.underDaemon === true)).toBe(true);
+    // Deliberately not a claim about a real daemon: even a row that cannot descend
+    // from one — the app main, whose own parent is launchd — is marked.
+    expect(absent.procs.find((entry) => entry.pid === 100)?.underDaemon).toBe(true);
+  });
+
+  it("refuses a single-pass table's stale-eligible row at the daemon-owned arm", () => {
+    // The fail-closed consequence: a reparented, aged agent child with an archived
+    // owner would be stale-eligible — but a table built before the daemon is known
+    // cannot prove it is not daemon-owned, so it is refused.
+    const rows = [...MACHINE, psRow({ pid: 800, ppid: 1, cmd: CLAUDE, etime_s: 3600 })];
+    const env = envOf({ 400: { agent: "agent-1" }, 800: { agent: "agent-1", home: "match" } });
+    const agents = [agent("agent-1", "2026-10-01T00:00:00Z")];
+
+    const absent = singlePass({ rows, env, agents });
+    const orphan = absent.procs.find((entry) => entry.pid === 800)!;
+    expect(orphan.class).toBe("claude-child");
+    expect(orphan.protected).toBeNull();
+    expect(orphan.home).toBe("match");
+    expect(orphan.ownerState).toBe("archived");
+    const refused = staleDecision(orphan, { ...ctx, famPids: absent.famPids });
+    expect(refused.eligible).toBe(false);
+    expect(refused.why).toContain("daemon-owned (runs under the daemon)");
+
+    // The second build, handed the identified daemon pid, judges the same row on
+    // its own merits — which is what makes the refusal above meaningful.
+    const identified = buildProcTable(tableInput({ rows, env, agents }));
+    const sameRow = identified.procs.find((entry) => entry.pid === 800)!;
+    expect(sameRow.underDaemon).toBe(false);
+    expect(staleDecision(sameRow, { ...ctx, famPids: identified.famPids }).eligible).toBe(true);
+  });
+
+  it("keeps absent and explicit-null distinct, and differs only in underDaemon", () => {
+    const absent = singlePass();
+    const none = buildProcTable(tableInput({ daemonPid: null }));
+    expect(absent.procs.every((entry) => entry.underDaemon)).toBe(true);
+    expect(none.procs.every((entry) => !entry.underDaemon)).toBe(true);
+    expect(none.famPids).toEqual(absent.famPids);
+    expect(none.procs.map((entry) => entry.pid)).toEqual(absent.procs.map((entry) => entry.pid));
+  });
+
+  it("refuses explicit-null rows at the identification arm, never at daemon-owned", () => {
+    const none = buildProcTable(tableInput({ daemonPid: null }));
+    const row = none.procs.find((entry) => entry.pid === 400)!;
+    expect(row.underDaemon).toBe(false);
+    const decision = staleDecision(row, {
+      ...ctx,
+      identity: {
+        ok: false,
+        why: 'no single "Paseo Daemon" child of the Supervisor',
+        supervisorPid: 150,
+        daemonPid: null,
+        appPid: 100,
+      },
+      famPids: none.famPids,
+    });
+    expect(decision.eligible).toBe(false);
+    expect(decision.why).toContain("identification failed");
+    expect(decision.why).not.toContain("daemon-owned");
+  });
+
+  it("keeps a real pid precise: the daemon itself and its descendants only", () => {
+    const table = buildProcTable(tableInput({ daemonPid: 200 }));
+    const under = table.procs.filter((entry) => entry.underDaemon).map((entry) => entry.pid);
+    expect(under).toEqual([200, 400, 500]);
   });
 });
 

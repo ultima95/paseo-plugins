@@ -39,6 +39,14 @@
 // The second call is the same pure function over the same inputs, so the two
 // tables cannot disagree about anything except `underDaemon`. Both builds are
 // O(rows) and the table is a few hundred rows.
+//
+// **The first table is for identification only.** Without a `daemonPid` the
+// builder cannot say which rows the daemon owns, so it marks every one of them
+// daemon-owned (fail closed) rather than clearing them: the stale rule refuses
+// on that flag, and a single-pass caller must never get a stale-eligible row for
+// a process the daemon may own. Only the second build — the one handed the
+// identified pid, or an explicit `null` after identification failed — may be
+// judged by the two rules.
 
 import { classify, type ProcClass, type ProcRow, type TopRow } from "./procs";
 import type {
@@ -129,9 +137,15 @@ export interface ProcTableInput {
   /** The agent index (`snapshotAgents().agents`). */
   agents: readonly AgentOwner[];
   /**
-   * Whether the agent index is complete (`snapshotAgents().index.ok`). False
-   * makes an owner with no record `unknown` rather than `missing`, which the
-   * stale rule refuses — the reference's `$nbad > 0` arm (slp-gc.bash:312).
+   * Whether the agent index is complete (`snapshotAgents().index.ok`) — the
+   * reference's `$nbad > 0` arm (slp-gc.bash:312).
+   *
+   * **Defaults to `false`.** An owner with no record then reads `unknown` rather
+   * than `missing`, and `missing` is the *only* owner state that proves an agent
+   * is gone: it is what the stale rule signals on (arm 8). So it has to be opted
+   * into, by a caller that has established the index was complete. A caller that
+   * simply forgot the flag, or whose index lost a record, can therefore never
+   * turn an unreadable index into kill eligibility.
    */
   agentIndexOk?: boolean;
   /** The GC's own pid (`$$`, the reference's `$selfPid`): its tree is protected. */
@@ -140,7 +154,25 @@ export interface ProcTableInput {
   invoker?: string | null;
   /** `SLP_GC_MEM_WARN_MB` (`$warnMb`). */
   warnMb: number;
-  /** The identified daemon pid (`identity.daemonPid`); omit on the first build. */
+  /**
+   * The identified daemon pid (`identity.daemonPid`). **Omit it on the first
+   * build**; the three states are deliberately distinct, and only one of them is
+   * "nothing is daemon-owned":
+   *
+   * - **absent** (`undefined`, the key not supplied) — identification has not run
+   *   yet. Every row's `underDaemon` is `true`, so the stale rule refuses each
+   *   one at its `daemon-owned` arm (:353). Fail closed: a table built before the
+   *   daemon is known cannot prove that a row is *not* under it, and a
+   *   single-pass caller must never get a stale-eligible daemon-owned process.
+   * - **explicit `null`** — identification ran and found no single daemon, so no
+   *   row is daemon-owned (`$idt.daemonPid != null and …`, :346) and
+   *   `underDaemon` is `false` for every row. That is safe without the first
+   *   rule's help: identification is not `ok`, so the stale rule's
+   *   identification arm (:351) refuses first, before the daemon-owned arm could
+   *   have said anything.
+   * - **a pid** — `underDaemon` is true for that pid and its descendants, exactly
+   *   as `chainc(.) | map(.pid) | index($idt.daemonPid)` (:346).
+   */
   daemonPid?: number | null;
 }
 
@@ -225,10 +257,16 @@ function buildWalk(rows: readonly ClassifiedRow[]): Walk {
  *    configured threshold.
  */
 export function buildProcTable(input: ProcTableInput): ProcTable {
-  const agentIndexOk = input.agentIndexOk ?? true;
+  // Both defaults are fail-closed. An unstated index is an unproven index
+  // (`unknown`, never `missing`), and an unstated daemon is an *unknown* daemon
+  // owner (`underDaemon: true`, never `false`) — see the two options' docs.
+  const agentIndexOk = input.agentIndexOk ?? false;
   const invoker = input.invoker === null || input.invoker === undefined || input.invoker === ""
     ? null
     : input.invoker;
+  // Three states, not two: "identification has not run" is not "no daemon was
+  // found". An absent key means the former and has to fail closed.
+  const daemonPidSupplied = input.daemonPid !== undefined;
   const daemonPid = input.daemonPid ?? null;
 
   const classed: ClassifiedRow[] = input.rows.map((row) => ({
@@ -280,7 +318,9 @@ export function buildProcTable(input: ProcTableInput): ProcTable {
         ? null
         : input.agents.length === 0
           ? "unknown"
-          : (ownerBy.get(owner) ?? (agentIndexOk ? "missing" : "unknown"));
+          : // `missing` proves the agent is gone, so it needs a complete index
+            // the caller vouched for; an unstated index leaves `unknown` (:312).
+            (ownerBy.get(owner) ?? (agentIndexOk ? "missing" : "unknown"));
     const top = input.top.get(row.pid);
     const footprint = top === undefined ? row.rss_mb : top.mem;
 
@@ -312,8 +352,11 @@ export function buildProcTable(input: ProcTableInput): ProcTable {
       footprintSource: top === undefined ? "rss" : "top",
       cmd: row.cmd,
       protected: protectedBy,
-      underDaemon:
-        daemonPid !== null && ancestors.some((anc) => anc.pid === daemonPid),
+      // Absent daemon pid ⇒ ownership unknown ⇒ `true` (fail closed); explicit
+      // `null` ⇒ identification found no daemon ⇒ `false` (:346).
+      underDaemon: daemonPidSupplied
+        ? daemonPid !== null && ancestors.some((anc) => anc.pid === daemonPid)
+        : true,
       warn: footprint >= input.warnMb,
     });
   }
@@ -389,7 +432,14 @@ export interface DecisionEntry {
   exe: string;
   /** Why this process must never be signalled, or null. */
   protected: string | null;
-  /** `$ud`: descends from the identified daemon (slp-gc.bash:346). */
+  /**
+   * `$ud`: descends from the identified daemon (slp-gc.bash:346).
+   *
+   * `true` also covers "daemon ownership has not been established":
+   * `buildProcTable` sets it on every row when it was not told which daemon to
+   * trust, so this flag is a *refusal* signal as well as a fact. `false` is only
+   * ever claimed by a caller that identified the absence of a daemon.
+   */
   underDaemon: boolean;
   /** The command line with its argv, verbatim. */
   cmd: string;
@@ -409,7 +459,13 @@ export interface DecisionEntry {
  *    claim about what is "Paseo's" is trustworthy.
  * 4. `PASEO_HOME` is `match` (`:352`) — an `unreadable` env refuses here.
  * 5. not daemon-owned (`:353`): a process under the daemon is stopped through the
- *    daemon, never signalled.
+ *    daemon, never signalled. This arm is also the fail-closed answer for
+ *    *unknown* ownership: a table built before the identified daemon pid was
+ *    known carries `underDaemon: true` on every row (see `ProcTableInput`'s
+ *    `daemonPid`), so a single-pass caller's rows are refused here rather than
+ *    slipping through to eligibility. An explicit `daemonPid: null` means the
+ *    opposite — identification found no daemon, so no row is owned, and the
+ *    `identification failed` arm above has already refused every row.
  * 6. `ppid == 1`, or the parent is not a live Paseo process (`:354`).
  * 7. `ppid == 1`, or there is an owner (`:355`) — an orphan with no provenance
  *    cannot be traced back to an agent.
