@@ -28,6 +28,26 @@ describe("classify", () => {
   });
 });
 
+// The two classes no fixture row covers, and the flag-count constraints the
+// fixtures cannot exercise: `slp-wait` and `codex-child` were not running at
+// capture time, and every captured `claude` row carries all three flags. These
+// are the binding cases — each one is what a `&&` -> `||` or a dropped anchor
+// in `procs.ts` turns green into red.
+describe("classify — binding rules the fixtures cannot cover", () => {
+  const cases: Array<[string, string | null]> = [
+    // slp-gc.bash:273 — anchored `sh (.*/)?slp-wait <uuid> <digits>`.
+    ["/bin/bash /usr/local/bin/slp-wait 3f1c2f0a-1111-4bbb-8ccc-1234567890ab 42", "slp-wait"],
+    ["/bin/bash /usr/local/bin/slp-wait 3f1c2f0a-1111-4bbb-8ccc-1234567890ab", null],
+    // slp-gc.bash:274 — an agent child needs all three flags, not two.
+    ["claude --output-format stream-json --input-format stream-json", null],
+    // slp-gc.bash:275 — a bare `codex` is not a codex child.
+    ["codex exec hi", null],
+  ];
+  it.each(cases)("%s", (cmd, expected) => {
+    expect(classify(cmd)).toBe(expected);
+  });
+});
+
 describe("parseEtime", () => {
   it("handles the three shapes ps emits", () => {
     expect(parseEtime("05:12")).toBe(312);
@@ -71,7 +91,8 @@ describe("classify — against the captured ps table", () => {
   it("classifies the capture exactly as PROVENANCE.md documents it", () => {
     // One row per class the reference `classify` (slp-gc.bash:262-276) emits for
     // this machine. `codex-child` and `slp-wait` were not running at capture
-    // time, so those classes have no captured row and are covered inline above.
+    // time, so those classes have no captured row here; they are covered by the
+    // inline `classify — binding rules the fixtures cannot cover` block.
     const tally = new Map<string, number>();
     for (const row of parsed.rows) {
       const key = classify(row.cmd) ?? "null";
