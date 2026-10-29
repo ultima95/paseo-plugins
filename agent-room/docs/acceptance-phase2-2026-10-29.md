@@ -185,8 +185,9 @@ exited **0**; body 113 lines / 10059 bytes, fully readable, ending
 `(a)` processes, `(a2)` orphaned descendants, `(a3)` tree memory, `(a4)` test-runner concurrency
 (0 agents), `(b)` recurring machinery (0), `(c)` `274 records live 4 archived 256
 closed-unarchived 14 unreadable 0`, `(d)` 0 garbage candidates, `(e)` retention data
-(`$COMMANDCODE_SCRATCHPAD/phase2-gc-report.txt`). No error line, and in particular no `claude-`
-error: the collector's `for d in "$HOME"/.config/slp-room/claude-*` loop
+(`$COMMANDCODE_SCRATCHPAD/phase2-gc-report.txt`). No error line affecting the exit code or the
+`claude-` scan; the pre-existing `identification: FAILED` header is recorded in Deviations 6. The
+collector's `for d in "$HOME"/.config/slp-room/claude-*` loop
 (`bin/slp-gc:799`) guards with `[ -d "$d" ]`, so the deleted directories are "nothing to scan"
 rather than a failure.
 
@@ -278,9 +279,9 @@ write, then `WROTE SMOKE.md`. The Supervisor's log ends by inspecting and report
 ```
 
 The guard fired once, correctly: the Supervisor's first attempt created an unmarked child
-(`ca9963de-5bcc-4e68-a83b-07d8dbc581a5`, provider `claude-worker/claude-haiku-4-5` — the caller's
-own provider, because an unmarked title gets no seat override); `server/guard.ts` archived it and
-told the Supervisor the rule, and the Supervisor then created the proper Lead and finished.
+(`ca9963de-5bcc-4e68-a83b-07d8dbc581a5` — an unmarked child, so no seat override applied,
+`inject.ts:32-33`); its provider was `claude-worker/claude-haiku-4-5`. `server/guard.ts` archived
+it and told the Supervisor the rule, and the Supervisor then created the proper Lead and finished.
 
 **Cleanup.** All three smoke agents archived (plus the attempt-1 supervisor and the guard's
 `ca9963de`), `/tmp/phase2-smoke` removed, 0 live smoke rows in `paseo ls` afterwards. The live
@@ -353,11 +354,12 @@ the Peer call `Activate skill` before working, competing with the room protocol 
 
 | Constraint (plan §Global Constraints) | Result |
 |---|---|
-| No archive created | Met. No backup/tarball/copy anywhere. The only copy of the deleted provider blocks is the session-scoped scratchpad `phase2-providers-removed.json` (mode 600), which is not an archive. The two `~/.paseo/config.json.bak-*` files are pre-existing (mtimes `2026-09-21 22:18` and `2026-09-30 15:33`). |
+| No archive created | Met. No archive of any deleted file or credential. The single retained artifact is `phase2-providers-removed.json` (mode 600, session scratchpad) — the four provider blocks only, as sanctioned by the brief's §Rollback notes; it is not an archive of the deleted paths or credentials. The two `~/.paseo/config.json.bak-*` files are pre-existing (mtimes `2026-09-21 22:18` and `2026-09-30 15:33`). |
 | Daemon never restarted | Met. `pid 1317`, `startedAt 2026-10-29T04:43:22.838Z` unchanged at every checkpoint; `paseo reload` only, exit 0. |
 | Live `minimal-browser` room untouched | Met. 10 ids identical across the reload; 25 rows before/after the smoke run; supervisor `cf391bb` still listed, never stopped, unarchived. Only agents whose cwd was `/tmp/phase2-smoke` were archived. |
 | `slp-room` reduced to exactly two entries | Met. `bin/slp-gc` + `slp-gc.conf`, both unchanged (SHA-256 and Sep 30 mtimes). |
 | `claude-worker` and all five `agentProfiles` present | Met. `claude-worker` is a surviving provider with its `paseo status` row; `daemon.agentProfiles` still has 5 entries (Researcher, Executor, UI/UX Designer, Command Code Default, Claude Default), none naming a removed provider. |
+| Both plugins untouched | Met. `paseo plugin ls` still lists agent-room `running` and command-code `running`; neither was stopped or reloaded. Re-checked for this record: `agent-room                      running     yes       /Users/ultima/Workspace/paseo-plugins/agent-room` and `command-code                    running     yes       /Users/ultima/Workspace/paseo-plugins/command-code-provider`. |
 | No `agent-room/` source file modified | Met. The only file added by this migration is this record; `git status` shows nothing else. |
 | Work on `feat/agent-room`, never `main` | Met. Record committed on `feat/agent-room`. |
 
@@ -367,8 +369,9 @@ the Peer call `Activate skill` before working, competing with the room protocol 
   launchd `60 s` interval, with the pre-existing `identification` failure above. Porting it is
   Phase 3.
 - **`claude-worker` removal (out of scope).** The provider is untouched by design: it was never in
-  the removal set, and it is what an unmarked child inherits from its caller (the guard's archived
-  `SMOKE peer` child ran on `claude-worker/claude-haiku-4-5`). It is not named by any saved seat —
-  the `cheap` peer tier is `claude/claude-haiku-5-5`.
+  the removal set. The guard's archived `SMOKE peer` child ran on `claude-worker/claude-haiku-4-5`,
+  but the record does not explain where that provider came from — an unmarked title is only left
+  unmodified (`inject.ts:32-33`), so no inheritance rule is claimed. It is not named by any saved
+  seat — the `cheap` peer tier is `claude/claude-haiku-5-5`.
 - **Stale `/tmp/phase2-smoke` workspace records** (`wks_ff67ba715422c373`,
   `wks_b550834eb395286d`) — see Deviations 5.
