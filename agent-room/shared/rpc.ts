@@ -83,6 +83,12 @@ export const gcStatusRpc = defineRpc({
  * acting, `act` runs the full tick with the rules the settings enable. Neither
  * mode overrides a toggle — `act` cannot delete or signal anything a scheduled
  * tick would have refused, it only moves the tick forward.
+ *
+ * A run that arrives while a tick is still running (the scheduler's, or another
+ * `gc.run`) is refused, not queued: the answer is one `refuse` row with
+ * `refusedBy` starting `tick-in-progress`, and no tick is started. Both paths
+ * share one exclusion primitive (`createTickGate`), so two ticks can never act
+ * on the same records at once.
  */
 export const gcRunRpc = defineRpc({
   name: "gc.run",

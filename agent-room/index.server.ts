@@ -12,8 +12,9 @@ import { gcSettingsDefinition, type GcSettings } from "./shared/gc";
 import { adoptRoomRpc, gcRunRpc, gcStatusRpc, getRoomRpc, launchRoomRpc, listRoomsRpc } from "./shared/rpc";
 import { parseSeatMarker, roomSettings } from "./shared/seats";
 import { createRoomEvents, lookupTitle } from "./server/events";
+import type { ActionResult } from "./server/gc/apply";
 import { createGcSettingsReader } from "./server/gc/settings";
-import { startScheduler, GC_INTERVAL_MS } from "./server/gc/scheduler";
+import { createTickGate, startScheduler, GC_INTERVAL_MS } from "./server/gc/scheduler";
 import {
   buildStatus,
   emptyStatus,
@@ -94,6 +95,33 @@ export interface GcOverrides {
   deleteSchedule?: TickDeps["deleteSchedule"];
   notify?: TickDeps["notify"];
   log?: TickDeps["log"];
+  /** Replace one tick phase (`TickDeps["seams"]`); a test holds a tick open with it. */
+  seams?: TickDeps["seams"];
+  /** The scheduler's interval. `GC_INTERVAL_MS` in production; short in a test. */
+  intervalMs?: number;
+}
+
+/**
+ * The answer `gc.run` gives when the scheduler's tick is still running: a
+ * refusal row, not an error and not a queue.
+ *
+ * The RPC's output is `ActionResult[]`, so a refusal fits the contract and the
+ * screen shows it the way it shows any other refusal. Queuing was the
+ * alternative and it is worse: the caller would wait for a tick it cannot see,
+ * and a second acting phase would start on records the running tick is already
+ * judging (the reference's `take_lock` answers "another tick is running;
+ * skipped" for the same reason).
+ */
+function tickBusyRefusal(): ActionResult[] {
+  return [
+    {
+      kind: "refuse",
+      id: "-",
+      acted: false,
+      reason: "refused: another gc tick is still running (this run was not queued)",
+      refusedBy: "tick-in-progress: the scheduled tick is still sampling",
+    },
+  ];
 }
 
 /**
@@ -290,18 +318,34 @@ export default function contribute(
     return emptyStatus(settingsNow);
   });
 
+  // The one exclusion every tick path shares. The interval and `gc.run` both go
+  // through this object, so an RPC run can never overlap a scheduled tick —
+  // two overlapping ticks would record two samples, write the ledger twice and,
+  // with `apply` on, run two acting phases over the same records.
+  const tickGate = createTickGate();
+
   server.handle(gcRunRpc, async (input) => {
-    const result = await runGc({ reportOnly: input.mode === "report" });
-    return result.acted;
+    const outcome = await tickGate.runExclusive(() =>
+      runGc({ reportOnly: input.mode === "report" }),
+    );
+    // Refused, not queued: the caller asked for a tick *now*, and the answer is
+    // that one is already running. `lastTick` is untouched, so `gc.status` keeps
+    // describing the tick that actually ran.
+    if (!outcome.ran) {
+      log.warn("gc run refused: a tick is still running");
+      return tickBusyRefusal();
+    }
+    return outcome.value.acted;
   });
 
   // The scheduler is started last, after every handler is registered, and its
   // first tick is one interval away — a room hook that fires during the load
   // never races it.
   const stopGc = startScheduler({
-    intervalMs: GC_INTERVAL_MS,
+    intervalMs: gcOverrides.intervalMs ?? GC_INTERVAL_MS,
     runTick: () => runGc(),
     onSkip: () => log.warn("gc tick skipped: the previous tick is still running"),
+    gate: tickGate,
   });
 
   return async () => {

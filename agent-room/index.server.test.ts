@@ -522,6 +522,102 @@ describe("agent-room server contribution", () => {
     expect(signal).not.toHaveBeenCalled();
   });
 
+  it("serves gc.status after a tick whose process phase failed outright", async () => {
+    const brokenExec = () => {
+      throw new Error("spawn ENOENT");
+    };
+    const { invoke } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+      readyGc(),
+      {
+        exec: brokenExec,
+        now: () => 1_790_000_000,
+        legacyStateDir: join(home, "no-legacy-state"),
+        notify: () => undefined,
+      },
+    );
+
+    // The tick still answers — a failed sample is a report, not an exception.
+    await expect(invoke("gc.run")({ mode: "report" }, {})).resolves.toEqual([]);
+
+    const status = (await invoke("gc.status")({}, {})) as {
+      ident: { ok: boolean; why: string };
+      lastTickAt: string | null;
+      settings: Record<string, unknown>;
+      procs: unknown[];
+      candidates: unknown[];
+    };
+
+    // A failed tick is still the last tick: the screen must say why nothing is
+    // known, not fall back to "no tick has run yet".
+    expect(status.ident.ok).toBe(false);
+    expect(status.ident.why).not.toBe("");
+    expect(status.ident.why).not.toBe("no tick has run yet");
+    expect(status.procs).toEqual([]);
+    expect(status.candidates).toEqual([]);
+    expect(status.lastTickAt).toBe("2026-09-21T14:13:20Z");
+    expect(status.settings).toMatchObject({ apply: false, memWarnMb: 3072, memKillMb: 4096 });
+  });
+
+  it("refuses a gc.run that arrives while a scheduled tick is still running", async () => {
+    // I-2: an RPC run must not overlap a scheduled tick. Both paths go through
+    // the one `createTickGate`, so the RPC is *refused* (not queued) and starts
+    // no tick of its own.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let tickStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      tickStarted = resolve;
+    });
+    let releaseTick!: () => void;
+    const released = new Promise<void>((resolve) => {
+      releaseTick = resolve;
+    });
+    const record = vi.fn(async () => {
+      tickStarted();
+      await released;
+      return { line: null, alert: null };
+    });
+    const deleteAgent = vi.fn(async () => undefined);
+    const emptyExec = () => ({ code: 0, stdout: "", stderr: "", timedOut: false });
+
+    const { invoke, cleanup } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+      readyGc({ apply: true }),
+      {
+        exec: emptyExec,
+        now: () => 1_790_000_000,
+        legacyStateDir: join(home, "no-legacy-state"),
+        notify: () => undefined,
+        deleteAgent,
+        // Short interval: the first scheduled tick fires while the test waits.
+        intervalMs: 25,
+        seams: { record },
+      },
+    );
+
+    // The scheduled tick is now mid-tick, holding the gate inside the record phase.
+    await started;
+    expect(record).toHaveBeenCalledTimes(1);
+
+    const rows = (await invoke("gc.run")({ mode: "act" }, {})) as Array<Record<string, unknown>>;
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ kind: "refuse", id: "-", acted: false });
+    expect(String(rows[0]?.refusedBy)).toContain("tick-in-progress");
+    // The strongest evidence: the RPC started no tick at all, so there is no
+    // second acting phase — the seam still has exactly the scheduled tick's call.
+    expect(record).toHaveBeenCalledTimes(1);
+    expect(deleteAgent).not.toHaveBeenCalled();
+    expect(
+      warn.mock.calls.some(
+        (call) => call[0] === "[agent-room]" && call[1] === "gc run refused: a tick is still running",
+      ),
+    ).toBe(true);
+
+    releaseTick();
+    await cleanup();
+  });
+
   it("warns about an unknown peer tier", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const { create } = contributeWith(readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }));

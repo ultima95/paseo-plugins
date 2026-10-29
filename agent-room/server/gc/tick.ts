@@ -151,6 +151,33 @@ export const EXE_LOOKUP_CAP = 40;
 /** `ls -1 "$STATE/reports" | sort -r | tail -n +49` (slp-gc.bash:1327): 48 reports kept. */
 export const REPORTS_KEPT = 48;
 
+/**
+ * The `selfPid` the tick passes when the caller supplies none: a sentinel that
+ * matches no `ps` row, **not** `process.pid`.
+ *
+ * The reference runs as a shell script, so `$$` is a real, short-lived pid whose
+ * ancestry is the invoking shell's and whose subtree is nothing but itself: the
+ * `$selfTree` protection (slp-gc.bash:295-298) protects "the GC's own process
+ * tree" and there is one. Inside the plugin there is no such tree — the tick runs
+ * *in* the daemon's process, so `process.pid` is the daemon's pid and
+ * `buildProcTable`'s self-tree would be the daemon plus **every descendant**,
+ * i.e. every agent, every agent child and every agent descendant. That would make
+ * the memory rule unable to fire on `agent-descendant` rows at all (the one class
+ * it targets, `:365-370`) and would mislabel every agent process in the report and
+ * in `gc.status` as "in the GC's own process tree".
+ *
+ * `0` is safe as a sentinel because `ps` never reports pid 0 (the kernel's
+ * scheduler is not a user process) and `parsePs` refuses a non-positive pid
+ * through `UINT`; so `selfRow` is `undefined`, the self subtree is empty and no
+ * row is ever claimed by that arm. Nothing else weakens: the daemon is refused by
+ * class (`:363`), the app main and the Supervisor by class (`:362`), an agent
+ * child by class (`:364`), and the invoking agent by its `PASEO_AGENT_ID`
+ * (`invoker`) and by `invOwnerPid` in the orphan proof (`:411-417`). A caller that
+ * really does have a process tree of its own — a test, or a future out-of-process
+ * runner — passes `deps.selfPid`.
+ */
+export const NO_SELF_PID = 0;
+
 /** `-size +512k` and `head -n 15` are `report.ts`'s defaults; the tick passes the settings it has. */
 
 /** `is_uint` (slp-gc.bash:40): digits only, at most twelve of them. */
@@ -256,7 +283,11 @@ export interface GcRuntime {
   stateDir: string;
   /** `$NOW`, epoch seconds — one clock read per phase. */
   now: number;
-  /** `$$`. */
+  /**
+   * `$$` in the reference, `NO_SELF_PID` (a sentinel matching no row) here: the
+   * plugin runs *inside* the daemon, so it has no process tree of its own. See
+   * `NO_SELF_PID` for the ruling and for the protections that stay in force.
+   */
   selfPid: number;
   /** `$PASEO_AGENT_ID` of the process running the tick, or null. */
   invoker: string | null;
@@ -691,6 +722,19 @@ export async function collectProcsPhase(input: ProcsPhaseInput): Promise<ProcsPh
 
   // `$orph` (:399): an unclassified row reparented to launchd. The proof itself
   // refuses anything else, so the selection is the reference's `select`.
+  //
+  // The three tree inputs are passed **explicitly empty**, not omitted: the
+  // reference protects the GC's own tree (`$selfTree`), the invoking agent's
+  // subtree (`$invSub`) and the invoking agent's `pid:<n>@<lstart>` owner
+  // (`$invOwnerPid`) because it runs as a shell script *inside* an agent's
+  // ancestry. The plugin has no process tree of its own (see `NO_SELF_PID`) and
+  // is not itself an agent, so `selfTree`/`invTree` are `[]` and `invOwnerPid` is
+  // `null`. That is also the only possible answer for this module's subject: a
+  // `ppid == 1` orphan has no ancestors left, so it can be in neither the GC's
+  // tree nor any agent's subtree — reparenting to launchd is exactly what removes
+  // it from both. Everything else in `$prot` stays in force and is passed below:
+  // `invoker` (`belongs to the invoking agent`), and the `exe`/`exePath` arms
+  // (`.app`, `/System`, `/Library`) are computed from the row and the ledger.
   const orphanCtx: OrphanContext = {
     now: runtime.now,
     identity: ident,
@@ -703,6 +747,9 @@ export async function collectProcsPhase(input: ProcsPhaseInput): Promise<ProcsPh
     top,
     procs: table.procs,
     invoker: runtime.invoker,
+    invOwnerPid: null,
+    invTree: [],
+    selfTree: [],
   };
   const orphans: OrphanDecision[] = [];
   for (const row of ps.rows) {
@@ -1118,9 +1165,14 @@ export interface TickDeps {
   paseoHomeRaw?: string;
   /** The reference's state dir, migrated from once per process. */
   legacyStateDir?: string;
-  /** Set once `migrateState` has run for this process; the tick flips it. */
+  /** Set once `migrateState` has **succeeded**; the tick flips it, never clears it. */
   migrated?: boolean;
   now?: () => number;
+  /**
+   * Override the GC's own pid. Production omits it and gets `NO_SELF_PID`, which
+   * matches no `ps` row (the plugin has no process tree of its own); a test that
+   * wants to prove the self-tree arm still protects a real tree passes one.
+   */
   selfPid?: number;
   env?: Record<string, string | undefined>;
   log?: GcLog;
@@ -1141,6 +1193,11 @@ export interface TickDeps {
 export interface TickSeams {
   /** Replace the process phase (`collectProcsPhase`). */
   procs?: (input: ProcsPhaseInput) => Promise<ProcsPhase>;
+  /**
+   * Replace the one-time state copy (`migrateState`). A seam, because that call
+   * owns the `deps.migrated` flag and a test has to be able to make it fail.
+   */
+  migrate?: (input: { from: string; to: string }) => Promise<MigrateResult>;
   /** Replace the memory-sample writer (`recordSample`). */
   record?: (input: {
     stateDir: string;
@@ -1358,7 +1415,10 @@ export async function runTick(
     paseoHomeRaw,
     stateDir: deps.stateDir,
     now: startedAt,
-    selfPid: deps.selfPid ?? process.pid,
+    // **Not** `process.pid`: inside the plugin that is the daemon, and a self-tree
+    // rooted at the daemon would protect every agent process (see `NO_SELF_PID`).
+    // The reference's `$$` has a real, tiny tree; this process has none.
+    selfPid: deps.selfPid ?? NO_SELF_PID,
     invoker: env.PASEO_AGENT_ID !== undefined && env.PASEO_AGENT_ID !== "" ? env.PASEO_AGENT_ID : null,
     exec: deps.exec ?? defaultExec,
     homeDefault: paseoHomeRaw === "" || paseoHomeRaw === join(home, ".paseo"),
@@ -1380,15 +1440,21 @@ export async function runTick(
   let migrated: MigrateResult | null = null;
   if (deps.migrated !== true) {
     const legacy = deps.legacyStateDir ?? join(home, "Library/Logs/slp-gc");
-    migrated = await phase(
-      log,
-      "migrate",
-      () => migrateState({ from: legacy, to: deps.stateDir }),
-      { copied: [], skipped: [], present: false },
-    );
-    // Only a resolved migration counts as done: a rejection is retried next tick,
-    // which is the only case where retrying can help.
-    deps.migrated = true;
+    const runMigrate: NonNullable<TickSeams["migrate"]> =
+      deps.seams?.migrate ?? ((input) => migrateState(input));
+    try {
+      migrated = await runMigrate({ from: legacy, to: deps.stateDir });
+      // Only *this* tick, which actually ran the copy, may claim it is done. Set
+      // it here and not before the call: a migration that rejects has not run,
+      // and a later tick has to retry it — the flag is what makes the retry
+      // reachable, so setting it on failure would silently skip the copy forever.
+      deps.migrated = true;
+    } catch (error) {
+      warnLog(log)("gc tick: migrate failed", { error: reasonOf(error) });
+      // `migrated: null` (nothing was copied) and `deps.migrated` still unset, so
+      // the next tick tries again.
+      migrated = null;
+    }
   }
 
   // `mkdir -p "$STATE"` (:1301): everything below writes into it, and the ledger

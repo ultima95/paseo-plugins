@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { GC_INTERVAL_MS, startScheduler } from "./scheduler";
+import { GC_INTERVAL_MS, createTickGate, startScheduler } from "./scheduler";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -104,5 +104,85 @@ describe("startScheduler", () => {
 
   it("defaults to the reference's 60 s interval", () => {
     expect(GC_INTERVAL_MS).toBe(60_000);
+  });
+});
+
+describe("createTickGate — the one mutex both tick paths share", () => {
+  it("refuses a second caller while the first is in flight", async () => {
+    const gate = createTickGate();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = 0;
+
+    const first = gate.runExclusive(async () => {
+      entered += 1;
+      await blocked;
+      return "the scheduled tick";
+    });
+    // The flag is set in the synchronous prefix, before `runExclusive` awaits.
+    expect(gate.running).toBe(true);
+
+    const second = await gate.runExclusive(async () => {
+      entered += 1;
+      return "the rpc";
+    });
+
+    // Refused, not queued: the second task never ran.
+    expect(second).toEqual({ ran: false });
+    expect(entered).toBe(1);
+    expect(gate.running).toBe(true);
+
+    release();
+    await expect(first).resolves.toEqual({ ran: true, value: "the scheduled tick" });
+    expect(gate.running).toBe(false);
+    expect(entered).toBe(1);
+  });
+
+  it("releases the gate when the task rejects, so one failure cannot block every later tick", async () => {
+    const gate = createTickGate();
+
+    await expect(
+      gate.runExclusive(async () => {
+        throw new Error("the process phase exploded");
+      }),
+    ).rejects.toThrow("the process phase exploded");
+
+    expect(gate.running).toBe(false);
+    await expect(gate.runExclusive(async () => "second")).resolves.toEqual({
+      ran: true,
+      value: "second",
+    });
+  });
+
+  it("makes an outside caller (the gc.run RPC) unable to overlap a scheduled tick", async () => {
+    vi.useFakeTimers();
+    const gate = createTickGate();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const onSkip = vi.fn();
+    const run = vi.fn(async () => {
+      await blocked;
+    });
+
+    const stop = startScheduler({ intervalMs: 1000, runTick: run, gate, onSkip });
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(run).toHaveBeenCalledTimes(1);
+
+    // What index.server.ts's handler does: the RPC runs through the same gate.
+    const rpc = await gate.runExclusive(async () => "a second acting phase");
+    expect(rpc).toEqual({ ran: false });
+
+    // …and the interval's own tick is dropped, not queued, for the same reason.
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(onSkip).toHaveBeenCalledTimes(1);
+
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    stop();
   });
 });
