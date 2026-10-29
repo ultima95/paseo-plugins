@@ -23,9 +23,10 @@
 // The two reports are captured by different processes at different instants, so
 // every field whose value is live — a pid, a sample of `top`, an age, a size, a
 // timestamp — is dropped before the comparison (`IGNORE`), with the reason recorded
-// in `docs/acceptance-phase3-2026-10-30.md`. Two whole-row *populations* are live for the
-// same reason, and one list's *order* is not a decision. Nothing here is semantic: every
-// refusal, class, owner, rule, reason, count, threshold and verdict is compared as it is.
+// in `docs/acceptance-phase3-2026-10-30.md`. Three whole-row *populations* are live for the
+// same reason (the processes, the garbage candidates and the agent records), and one list's
+// *order* is not a decision. Nothing here is semantic: every refusal, class, owner, rule,
+// reason, count, threshold and verdict is compared as it is.
 //
 // 1. **The process and orphan sections are compared as sets, keyed by `pid` +
 //    `lstart`** (`ROW_SECTIONS`). A process that exits between the two captures is a
@@ -43,17 +44,37 @@
 //    same instant one level up. What they decide stays compared — `tree.over`,
 //    `overall.n`, `totals[].n`, every threshold — and the sums' per-row inputs were
 //    already dropped, so comparing a sum of dropped samples alone would only ever fail.
-// 4. **`agents.rows` is compared sorted by `id`** (`ORDER_INSENSITIVE`): the reference
-//    walks the record directory with `find` (`slp-gc.bash:628`, filesystem order) and the
-//    port sorts each directory's filenames (`server/gc/agents.ts:255`), so the same 300
-//    rows arrive in a different order. Sorting both sides keeps every row, every field
-//    and the row count compared — the rows are identical by `id`, and the summary counts
-//    are compared separately. No row is dropped.
-// 5. **`procs.ledgerNext` is the one field the two artifacts do not share**
+// 4. **`agents` is compared row by row, keyed by `id`** (`ROW_SECTIONS`, `agentKey`): the
+//    reference walks the record directory with `find` (`slp-gc.bash:628`, filesystem
+//    order) and the port sorts each directory's filenames (`server/gc/agents.ts:255`), so
+//    the same rows arrive in a different order — and the *population* moves between two
+//    captures, because the daemon closes and archives agents continuously. Rows are
+//    therefore paired by `id` and compared field by field; an id that exists on one side
+//    only is churn and is skipped, exactly like a process row, and counted in the skip
+//    log. The rows are still compared as rows: every field of every shared row is compared
+//    as it is, and the section's shape is asserted before any of it
+//    (`normalizeAgentPopulation`) — a missing `agents` object, a missing `rows`, a
+//    non-array `rows` or a row without a string `id` fails by path.
+// 5. **The five aggregate population counts are dropped** (`AGGREGATE_COUNTS`):
+//    `agents.total`, `.live`, `.archived`, `.closedUnarchived` and `.unreadable` are counts
+//    of a population that is *moving* while the report is being compared — `live` read 6 in
+//    both stored reports, then 5, then 4, and `closed-unarchived` 15, 16, 17, in readings
+//    minutes apart, because the daemon archived and closed agents between them. Those
+//    counts are derived from the same rows the row comparison compares one by one, so
+//    keeping them would only re-fail on the churn. The two fields that are *not* a count
+//    are kept compared: `agents.trusted` and the report's `index` section (`{ok, why}`).
+//    The counts' presence and type are asserted before they are dropped (each must be a
+//    number), so a restructured section fails by path instead of passing quietly.
+// 6. **A one-sided `agents` population is bounded, not hidden** (`ONE_SIDED_MAX`): if
+//    more than 10 % of either side's agent ids are one-sided, the run prints `DIFFERS`
+//    with both counts. Churn is a handful of rows; a tenth of the record index on one
+//    side is a different population (a bad scan, a moved home, a filter) and is refused
+//    the way a section with no row in common is.
+// 7. **`procs.ledgerNext` is the one field the two artifacts do not share**
 //    (`REPORT_MODE_ONLY`): the reference's `report` verb does not compute a ledger, and
 //    the port's report is a *tick's* report, which does. The exemption is asserted, not
 //    assumed, and covers no rule.
-// 6. **`daemonMetrics[].timelineStats` is replaced on both sides, its entry shape asserted
+// 8. **`daemonMetrics[].timelineStats` is replaced on both sides, its entry shape asserted
 //    first** (`normalizeDaemonCounters`): the section is the daemon's own last three
 //    `ws_runtime_metrics` records, so its counters are live samples too — `totalItems` grows
 //    with every agent turn (a re-run five minutes after the tick read `3748` against the
@@ -62,7 +83,7 @@
 //    comparison must keep: the section is asserted to be an array of objects, each with a
 //    `time` key and a `timelineStats` key, and a missing, non-array or restructured section
 //    fails by path rather than passing quietly.
-// 7. **The `dirty=<n>` and `unpushed=<n>` tokens inside `retention[*].note` are collapsed,
+// 9. **The `dirty=<n>` and `unpushed=<n>` tokens inside `retention[*].note` are collapsed,
 //    the entry shape asserted first** (`normalizeRetentionNotes`): that note is the reference's
 //    `git_state` (`slp-gc.bash:829-833`) — `dirty=<n> unpushed=<n>` for a working tree it
 //    samples — and the tree it samples is the repository this harness itself runs in, so a
@@ -75,13 +96,14 @@
 //
 // Nothing else about a row is normalised: an empty section on one side against a
 // non-empty one on the other, a different class or owner, a different `why` sentence
-// with the same numbers — all still fail. One value is not dropped but mapped to a
-// sentinel (`EQUIVALENT`): `protected` reads `in slp-gc's own process tree` on the
-// reference side and `null` on the port's, which is the documented deviation and not
-// drift — see the `EQUIVALENT` comment for the reason and the ruling it implements.
+// with the same numbers, a field of an agent row that both captures carry — all still
+// fail. One value is not dropped but mapped to a sentinel (`EQUIVALENT`): `protected` reads
+// `in slp-gc's own process tree` on the reference side and `null` on the port's, which is
+// the documented deviation and not drift — see the `EQUIVALENT` comment for the reason and
+// the ruling it implements.
 // No other `protected` value is normalised. What remains is the report's structure
 // and its decisions: sections, classes, owners, states, rules, reasons, actions,
-// thresholds, counts and verdicts. A difference there is drift in the port, and the
+// thresholds, per-row counts and verdicts. A difference there is drift in the port, and the
 // harness names the first one by path so the fix lands in the modules.
 
 import { execFileSync } from "node:child_process";
@@ -202,6 +224,11 @@ interface RowSection {
    * `null` when the row carries no identity, and the whole row is then its own key.
    */
   readonly key: (row: Record<string, unknown>) => string | null;
+  /**
+   * The largest share of a side's rows that may be one-sided before the section is
+   * refused, or `undefined` for a section where any amount of churn is churn.
+   */
+  readonly oneSidedMax?: number;
 }
 
 /**
@@ -230,15 +257,45 @@ function garbageKey(row: Record<string, unknown>): string | null {
 }
 
 /**
+ * The record's own `id`, the identity of an agent row across two captures
+ * (`ReportAgentRow.id`, `server/gc/report.ts:870`): both sides read the same record files,
+ * one by path and one by index, and the file's name is the id.
+ */
+function agentKey(row: Record<string, unknown>): string | null {
+  const { id } = row;
+  if (typeof id !== "string" || id === "") return null;
+  return id;
+}
+
+/**
+ * The largest share of a side's agent ids that may exist on one side only — one tenth.
+ *
+ * The `agents` section is the record index, and the daemon closes and archives agents
+ * while the two captures are taken, so a few ids are on one side only on every run. They
+ * are churn and are skipped like a process that exited. A *tenth* of the index, though, is
+ * not churn: it is a different population — a scan that stopped early, a home that moved,
+ * a filter that narrowed — and skipping it would let a systematic difference hide behind
+ * the skip log. Above this share the section is refused with both one-sided counts, the
+ * way a section with no row in common is refused.
+ */
+const ONE_SIDED_MAX = 0.1;
+
+/**
  * The sections compared as row sets. These are the populations a live machine changes
  * between two captures: a process exits, a record file is written or reclaimed. Every
- * other array in the report (an agent's `rows`, a schedule's, the retention walk) is
- * compared in order, as a sequence.
+ * other array in the report (a schedule's, the retention walk) is compared in order, as a
+ * sequence.
  */
 const ROW_SECTIONS: readonly RowSection[] = [
   { name: "procs", path: ["procs", "procs"], key: processKey },
   { name: "orphans", path: ["procs", "orphans"], key: processKey },
   { name: "garbage", path: ["garbage"], key: garbageKey },
+  {
+    name: "agents",
+    path: ["agents", "rows"],
+    key: agentKey,
+    oneSidedMax: ONE_SIDED_MAX,
+  },
 ];
 
 /** The value at `path` under `root`, or `undefined` when the path or root does not exist. */
@@ -301,8 +358,11 @@ function keyRows(
  * live churn and is skipped, but a section whose two sides share *no* row is refused —
  * an empty section against a populated one is the case the brief names, and a pair of
  * disjoint non-empty ones (a completely different population, e.g. the pid-recycling bug
- * that once listed 418 system daemons as orphans) is not churn either. Both arrays are
- * replaced in place on the parsed reports; the caller owns them.
+ * that once listed 418 system daemons as orphans) is not churn either. A section that
+ * declares `oneSidedMax` (the agent index: `ONE_SIDED_MAX`) is refused a step earlier,
+ * while it still has rows in common, if the rows it cannot pair are more than that share
+ * of a side — churn is a handful of rows, and a tenth of the index is a population.
+ * Both arrays are replaced in place on the parsed reports; the caller owns them.
  */
 function alignRowSections(
   left: Record<string, unknown>,
@@ -321,15 +381,25 @@ function alignRowSections(
     const leftKeyed = keyRows(leftRows, section.key);
     const rightKeyed = keyRows(rightRows, section.key);
     const shared = [...leftKeyed.keys()].filter((key) => rightKeyed.has(key)).sort();
+    const oneSidedLeft = leftRows.length - shared.length;
+    const oneSidedRight = rightRows.length - shared.length;
     ignored.push({
       name: section.name,
-      left: leftRows.length - shared.length,
-      right: rightRows.length - shared.length,
+      left: oneSidedLeft,
+      right: oneSidedRight,
       leftTotal: leftRows.length,
       rightTotal: rightRows.length,
     });
+    const path = section.path.join(".");
+    const max = section.oneSidedMax;
+    if (
+      max !== undefined &&
+      (oneSidedLeft > leftRows.length * max || oneSidedRight > rightRows.length * max)
+    ) {
+      refusal ??= `${path} (${String(oneSidedLeft)}/${String(leftRows.length)} and ${String(oneSidedRight)}/${String(rightRows.length)} ids on one side only, over ${String(max * 100)}%)`;
+      continue;
+    }
     if (shared.length === 0 && (leftRows.length > 0 || rightRows.length > 0)) {
-      const path = section.path.join(".");
       refusal ??= `${path} (no row in common: ${String(leftRows.length)} rows vs ${String(rightRows.length)} rows)`;
       continue;
     }
@@ -339,40 +409,115 @@ function alignRowSections(
   return { ignored, refusal };
 }
 
+/** The agent index's section name and the row array inside it. */
+const AGENTS = "agents";
+const AGENT_ROWS = "rows";
+
 /**
- * Lists whose *order* is not a decision, compared sorted by the given field on both sides.
- *
- * `agents.rows` is the record index: the reference walks the directory with `find`
- * (`slp-gc.bash:628`) and takes the filesystem's order, while the port sorts each
- * directory's filenames (`server/gc/agents.ts:255`). The same rows therefore arrive in a
- * different order on a host with more than one workspace. Sorting both sides by `id`
- * compares every row, every field of it and the row count: nothing is dropped and no row
- * is matched against another. A row that exists on one side only still fails on length.
+ * The population counts the section carries beside its rows, in the report's own order
+ * (`ReportAgents`, `server/gc/report.ts:860`). Each is derivable from `rows` — `total` is
+ * `$agents | length` and the rest are counts of one `state` (`slp-gc.bash:550-556`,
+ * `normalizeAgents`) — and each is a count of a population the daemon shifts while the two
+ * captures are taken, so the comparison drops them and compares the rows instead.
  */
-const ORDER_INSENSITIVE: readonly { readonly path: readonly string[]; readonly by: string }[] = [
-  { path: ["agents", "rows"], by: "id" },
+const AGGREGATE_COUNTS: readonly string[] = [
+  "total",
+  "live",
+  "archived",
+  "closedUnarchived",
+  "unreadable",
 ];
 
 /**
- * Sort the `ORDER_INSENSITIVE` lists on both sides by their key field. A side that is not
- * an array of objects with the key is left alone for `firstDifference` to report.
+ * Assert the `agents` section's shape on both sides, then drop its aggregate counts.
+ *
+ * What is asserted — and therefore what a restructure breaks instead of passing quietly:
+ *
+ *  - `agents` exists on both sides and is a non-null **object** (not an array, not a
+ *    scalar, not absent);
+ *  - it carries a **`rows`** key and that value is an **array** (the row comparison needs
+ *    one; a missing `rows` is not "no agents", it is a report that lost its index);
+ *  - every row is a non-null **object** (not an array, not a scalar);
+ *  - every row carries a **string, non-empty `id`** — the key the row comparison pairs on,
+ *    so a row without one is not churn, it is an unkeyable row;
+ *  - every entry of `AGGREGATE_COUNTS` that is present is a **number**. Presence is not
+ *    required (a writer may omit a count it did not derive) but a count that became a
+ *    string or an object is a restructure, and it fails by path rather than being dropped
+ *    as if it were a count.
+ *
+ * Then the counts are deleted from both sides. The fields that are *not* a count are left
+ * alone and compared as they are: **`agents.trusted`** (at least one record parsed,
+ * `$trusted`) and the report's own `index` section (`{ok, why}`, `$ev[0].index`). The rows
+ * stay — the set comparison pairs them by `id` and compares every field of every shared
+ * row.
+ *
+ * The line returned alongside the refusal reports both sides' counts, so the drift the
+ * comparison no longer fails on is still visible in the run's log.
  */
-function sortRowLists(left: Record<string, unknown>, right: Record<string, unknown>): void {
-  for (const list of ORDER_INSENSITIVE) {
-    const leftSide = atPath(left, list.path);
-    const rightSide = atPath(right, list.path);
-    if (!Array.isArray(leftSide) || !Array.isArray(rightSide)) continue;
-    const sort = (rows: unknown): unknown =>
-      (rows as readonly unknown[])
-        .map((row) => row)
-        .sort((one, other) => {
-          const a = (one as Record<string, unknown>)[list.by];
-          const b = (other as Record<string, unknown>)[list.by];
-          return String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0;
-        });
-    setPath(left, list.path, sort(leftSide));
-    setPath(right, list.path, sort(rightSide));
+function normalizeAgentPopulation(
+  reference: Record<string, unknown>,
+  plugin: Record<string, unknown>,
+): { refusal: string | null; line: string } {
+  const sides: readonly (readonly [string, Record<string, unknown>])[] = [
+    ["reference", reference],
+    ["plugin", plugin],
+  ];
+  for (const [label, side] of sides) {
+    const agents = side[AGENTS];
+    if (agents === undefined || agents === null) {
+      return {
+        refusal: `${AGENTS} (${label} side is ${agents === null ? "null" : "absent"})`,
+        line: "",
+      };
+    }
+    if (typeof agents !== "object" || Array.isArray(agents)) {
+      return { refusal: `${AGENTS} (${label} side is not an object)`, line: "" };
+    }
+    const section = agents as Record<string, unknown>;
+    if (!Object.hasOwn(section, AGENT_ROWS)) {
+      return { refusal: `${AGENTS}.${AGENT_ROWS} (${label} side has no ${AGENT_ROWS} key)`, line: "" };
+    }
+    const rows = section[AGENT_ROWS];
+    if (!Array.isArray(rows)) {
+      return {
+        refusal: `${AGENTS}.${AGENT_ROWS} (${label} side is not an array: ${JSON.stringify(rows) ?? "<absent>"})`,
+        line: "",
+      };
+    }
+    for (let index = 0; index < rows.length; index += 1) {
+      const entry = rows[index] as unknown;
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        return {
+          refusal: `${AGENTS}.${AGENT_ROWS}[${String(index)}] (${label} side is not an object)`,
+          line: "",
+        };
+      }
+      const id = (entry as Record<string, unknown>).id;
+      if (typeof id !== "string" || id === "") {
+        return {
+          refusal: `${AGENTS}.${AGENT_ROWS}[${String(index)}].id (${label} side is not a non-empty string)`,
+          line: "",
+        };
+      }
+    }
+    for (const count of AGGREGATE_COUNTS) {
+      if (!Object.hasOwn(section, count)) continue;
+      if (typeof section[count] !== "number") {
+        return {
+          refusal: `${AGENTS}.${count} (${label} side is not a number: ${JSON.stringify(section[count]) ?? "<absent>"})`,
+          line: "",
+        };
+      }
+    }
   }
+  const line = `agent counts (not compared, population drift): ${AGGREGATE_COUNTS.map(
+    (count) => `${count} ${String((reference[AGENTS] as Record<string, unknown>)[count])} vs ${String((plugin[AGENTS] as Record<string, unknown>)[count])}`,
+  ).join("; ")}`;
+  for (const [, side] of sides) {
+    const section = side[AGENTS] as Record<string, unknown>;
+    for (const count of AGGREGATE_COUNTS) delete section[count];
+  }
+  return { refusal: null, line };
 }
 
 /**
@@ -677,12 +822,15 @@ function main(): void {
   }
 
   const reference = bashReport() as Record<string, unknown>;
-  // The set comparison first: it decides which rows are comparable at all, and logs what
-  // it skipped. Its refusal is a difference in its own right ("no row in common"), not a
-  // value drift `firstDifference` could name.
+  // The agent index first: its shape is asserted there before the row pairing can read it
+  // and before the aggregate counts are dropped, and the counts it drops are logged.
+  const agents = normalizeAgentPopulation(reference, plugin);
+  if (agents.line !== "") console.log(agents.line);
+  // The set comparison next: it decides which rows are comparable at all, and logs what
+  // it skipped. Its refusal is a difference in its own right ("no row in common", "over a
+  // tenth of the ids on one side only"), not a value drift `firstDifference` could name.
   const aligned = alignRowSections(reference, plugin);
   console.log(ignoredLine(aligned.ignored));
-  sortRowLists(reference, plugin);
   reconcileReportMode(reference, plugin);
   // The daemon's live counters, replaced only once both sides' shapes are asserted to hold.
   const counters = normalizeDaemonCounters(reference, plugin);
@@ -690,6 +838,7 @@ function main(): void {
   const notes = normalizeRetentionNotes(reference, plugin);
 
   const difference =
+    agents.refusal ??
     aligned.refusal ??
     counters ??
     notes ??

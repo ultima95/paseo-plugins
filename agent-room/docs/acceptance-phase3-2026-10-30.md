@@ -95,6 +95,8 @@ rather than a decision. Everything not listed here is compared as it is.
 | `tree.totalMb`, `tree.appMb`, `tree.orphanMb`, `retention[].kb`, `retention[].count`, `transcripts[].bytes`, `daemonMetrics[].time`, `daemonMetrics[].rss`, `daemonMetrics[].heapUsed` | dropped (`IGNORE`, second block) | sums and sizes *of* the dropped samples: the same instant one level up, and a sum of dropped inputs could only ever fail. What they decide stays compared — `tree.over`, `overall.*`, `totals[].n`, and the thresholds `warnMb`, `killMb`, `treeWarnMb` |
 | `daemonMetrics[].timelineStats` | replaced by `<live counter>` on both sides (`normalizeDaemonCounters`), **after asserting the section's shape**: `daemonMetrics` must be an array of objects, each carrying a `time` key and a `timelineStats` key, and each `timelineStats` an object or `null` | the daemon's own timeline counters, which grow with every agent turn: the 17:59Z re-run read `totalItems` 3748 against the 17:54:32Z report's 3745. Dropping the key by name would drop the section's shape with it, so the object is *replaced* and its shape asserted first — a missing, non-array or restructured `daemonMetrics` fails by path. Verified on three scratched copies of the 17:54:32Z report: an entry with no `timelineStats`, `daemonMetrics` set to a string, and an entry set to a string each printed `DIFFERS at daemonMetrics…`, exit 1 |
 | `retention[*].note`'s `dirty=<n>` / `unpushed=<n>` counts | each numeric value replaced by `<n>` (`dirty=1` → `dirty=<n>`, `unpushed=0` → `unpushed=<n>`; `normalizeRetentionNotes`), **after asserting the section's shape**: `retention` must be an array of objects, each carrying a `note` key, and each `note` a string. Only those two numbers are replaced; the rest of the note, `unpushed=no-upstream` and every other field of the row are compared as they are | the reference's `git_state` (`slp-gc.bash:829-833`) records `dirty=<n> unpushed=<n>` for the working tree it samples, and that tree is the repository **this harness itself runs in**, so the reading changes between captures — the 17:49:31Z tick recorded `dirty=0`, the 17:54:32Z tick `dirty=1`, and a re-read later reads a third value. The counts are used only for the report's `other-worktree` annotation; no rule, gate, action or verdict reads `retention`, so they are a live host reading and not port drift. A missing, non-array or restructured `retention` entry fails by path rather than being normalised away (four scratch-copy controls below) |
+| `agents.rows` | compared as a **set keyed by `id`** (`ROW_SECTIONS`, `agentKey`); every field of every row present on both sides is compared as it is, and ids on one side only are skipped and counted in the `rows on one side only (skipped)` line, like a process row. **Refused** when more than 10 % of either side's ids are one-sided (`ONE_SIDED_MAX`) | the record index is a population the daemon moves while the two captures run: the reference walks the record directory with `find` (`slp-gc.bash:628`, filesystem order), the port sorts each directory's filenames (`server/gc/agents.ts:255`), and agents are closed and archived continuously. Two records changed state *after* the stored reports were written (see *The agent section, compared by `id`* below), which is a row-level difference and not a decision of the port's; a row both captures carry is compared field by field, so a changed `state`, `reason` or `garbage` still fails |
+| `agents.total`, `agents.live`, `agents.archived`, `agents.closedUnarchived`, `agents.unreadable` | dropped on both sides (`normalizeAgentPopulation`, `AGGREGATE_COUNTS`), **after asserting the shape**: `agents` an object, `rows` an array of objects each with a non-empty string `id`, every aggregate count present a number. Both sides' values are printed in every run (`agent counts (not compared, population drift): …`) | five counts of a population that is moving between the tick that wrote the report and the harness's own capture: both stored reports recorded `live 6`, `closedUnarchived 15`, while re-reads minutes later read `live 5` (`16`), then `live 4` (`17`), because the daemon closed and archived agents in between. Each count is derived from `rows` (`slp-gc.bash:550-556`; `normalizeAgents`, `server/gc/report.ts:1105-1117`) and the same rows are compared one by one, so the count adds no decision the row comparison does not already make. `agents.trusted` and the report's `index` section (`{ok, why}`) are **not** counts and stay compared as values |
 | `procs.ledgerNext` | the port's side is dropped **only when the reference's side is exactly `null`** — asserted on every run (`REPORT_MODE_ONLY`, `reconcileReportMode`) | the reference's `report` verb never computes a ledger: `WANT_LEDGER=1` is set in exactly one place, `do_record` (`slp-gc.bash:1188`), reachable only from `tick` (`:1344`), so its `ledgerNext` is `null` on every host — while the port's file is a *tick's* report and carries the 6 rows that tick wrote (`server/gc/tick.ts:1752`). `null` here is the artifact's zero value, not "no rows" against "rows". This is the one section where the two artifacts are not the same artifact, the exemption is **asserted rather than ignored**, and it covers no rule: a reference that ever produced ledger rows keeps them and is compared normally. The ledger's own rules are pinned by `server/gc/ledger.test.ts` against the same jq, since no reference CLI emits a ledger |
 
 There is no `pct` field in either report (`grep -n "pct" server/gc/report.ts shared/gc.ts`
@@ -233,6 +235,123 @@ numbers move, and only `dirty`/`unpushed` tokens that carry digits.
 The daemon counters are settled — no run has named `daemonMetrics` since — and the retention
 note is now normalised; the field that still moves the verdict on a stored report is
 `agents.live`, a live population count, which this record leaves compared as a decision.
+
+> **Superseded.** `agents.live` is no longer compared. The agent section is now compared row
+> by row, keyed by `id`, and its five aggregate counts are dropped. See *The agent section,
+> compared by `id`* immediately below for the rule, the controls and the two final verdicts.
+
+### The agent section, compared by `id`
+
+`agents` is the record index: 300 rows on both sides, the reference walking the record
+directory with `find` (`slp-gc.bash:628`, filesystem order) and the port sorting each
+directory's filenames (`server/gc/agents.ts:255`). The previous pass compared those rows
+sorted by `id` but kept the section's summary counts as values, so a run stopped at
+`agents.live (4 vs 6)` — a *count* of rows the row comparison had already paired. The daemon
+closes and archives agents continuously, so rows change between the tick that wrote a stored
+report and the harness's own capture, and a count of those rows can never agree across the
+gap. The harness now:
+
+1. **asserts the section's shape first** (`normalizeAgentPopulation`): `agents` exists on both
+   sides and is a non-null object; it carries a `rows` key whose value is an array; every row
+   is a non-null object carrying a non-empty string `id`; every aggregate count that is
+   present is a number. A missing `agents`, a missing `rows`, a non-array `rows`, a row
+   without an `id` or a non-numeric count fails by path.
+2. **drops the five aggregate counts** (`AGGREGATE_COUNTS`: `total`, `live`, `archived`,
+   `closedUnarchived`, `unreadable`) on both sides, printing both sides' values in the run log
+   (`agent counts (not compared, population drift): …`), and
+3. **compares the rows as a set keyed by `id`** (`ROW_SECTIONS`, `agentKey`): every field of
+   every row present on both sides is compared as it is — `category`, `path`, `id`, `state`,
+   `garbage`, `reason`, `action` — and ids present on one side only are skipped and counted in
+   the `rows on one side only (skipped)` line, like a process row.
+
+`agents.trusted` and the report's `index` section (`{ok, why}`) are not counts of that
+population and stay compared as values.
+
+**The one-sided rule.** The skip log must not be able to hide a systematic difference, so the
+agent section declares `ONE_SIDED_MAX = 0.1`: if more than a tenth of *either* side's ids are
+one-sided, the run prints `DIFFERS at agents.rows (n/total and m/total ids on one side only,
+over 10%)` and exits 1, rather than skipping the difference as churn. A handful of ids is the
+daemon's churn; a tenth of the record index is a different population — a scan that stopped
+early, a moved home, a filter that narrowed. The other set sections keep the stricter
+no-row-in-common refusal only, because a host's process table and garbage candidates are
+supposed to turn over completely.
+
+All controls below were run against scratch copies of
+`20261029T175431Z.json` (the stored file untouched, `.last-report` untouched, no plugin
+reload); each printed `DIFFERS` and exited 1:
+
+| control | what the harness printed |
+| --- | --- |
+| one **shared** agent row's `reason` (sorted row 10, an `archived` record that agrees on both sides): `… (< 14 d); Paseo identification failed: …` → `… (< 14 d); CONTROL` | `DIFFERS at agents.rows[10].reason ("not garbage: archived 2 d ago (< 14 d); Paseo identification failed: … accepted only for the… vs "not garbage: archived 2 d ago (< 14 d); CONTROL")` |
+| one **shared** agent row's `state` (same row: `archived` → `live`) | `DIFFERS at agents.rows[10].state ("archived" vs "live")` |
+| `agents` removed | `DIFFERS at agents (plugin side is absent)` |
+| `agents.rows` removed | `DIFFERS at agents.rows (plugin side has no rows key)` |
+| `agents.rows` set to `"none"` | `DIFFERS at agents.rows (plugin side is not an array: "none")` |
+| `agents.live` set to `"6"` | `DIFFERS at agents.live (plugin side is not a number: "6")` |
+| 5 ids removed from the plugin side (1.7 % of 295) | threshold does **not** fire — the log reads `agents 5/300 vs 0/295` and the run goes on to the row residual |
+| 40 ids removed from the plugin side (13.3 % of 300) | `DIFFERS at agents.rows (40/300 and 0/260 ids on one side only, over 10%)` |
+
+So a shared row is compared as a row: its `reason` and its `state` each still fail on their
+own, and the only thing the set comparison tolerates is a row that exists on one side only —
+within a tenth.
+
+### Final verdicts: the counts are gone, a record change is not
+
+Both stored reports were re-run with the committed harness (one bash reference capture per
+run, throwaway `SLP_GC_STATE_DIR`, `.last-report` untouched, no plugin reload):
+
+```
+$ cd agent-room && node --experimental-strip-types scripts/gc-equivalence.mts \
+    /Users/ultima/.paseo/plugin-data/agent-room/gc/reports/20261029T174931Z.json
+agent counts (not compared, population drift): total 300 vs 300; live 4 vs 6; archived 279 vs 279; closedUnarchived 17 vs 15; unreadable 0 vs 0
+rows on one side only (skipped): procs 0/21 vs 0/21; orphans 0/0 vs 0/0; garbage 0/0 vs 0/0; agents 0/300 vs 0/300
+DIFFERS at agents.rows[32].state ("closed-unarchived" vs "live")                            exit=1
+
+$ cd agent-room && node --experimental-strip-types scripts/gc-equivalence.mts \
+    /Users/ultima/.paseo/plugin-data/agent-room/gc/reports/20261029T175431Z.json
+agent counts (not compared, population drift): total 300 vs 300; live 4 vs 6; archived 279 vs 279; closedUnarchived 17 vs 15; unreadable 0 vs 0
+rows on one side only (skipped): procs 0/21 vs 0/21; orphans 0/0 vs 0/0; garbage 0/0 vs 0/0; agents 0/300 vs 0/300
+DIFFERS at agents.rows[32].state ("closed-unarchived" vs "live")                            exit=1
+```
+
+The aggregate counts no longer stop a run: they are printed on both lines (`live 4 vs 6`,
+`closedUnarchived 17 vs 15`) and the comparison goes on past them. What stops both runs is a
+**shared agent row that differs in a field**, which the brief rules semantic and not
+normalisable. The rows are fully paired — 300 ids on both sides, `0/300` one-sided on each —
+and exactly two of them differ, both in `state` and in the `reason` that follows from it:
+
+| id | workspace | shared row | stored report (both ticks) | live re-read |
+| --- | --- | --- | --- | --- |
+| `1e355202-9498-4c85-a018-3383effd6922` | `Workspace/portfolio/thinh-dinh` | 32 (sorted) | `live`, `not garbage: unarchived agent (lastStatus idle)` | `closed-unarchived`, `not garbage: closed but not archived (report-only; the user may still see it)` |
+| `ff54fa47-4aa0-4f24-b46d-74e702745915` | `Workspace/workspace-minimal-browser` | 299 (sorted) | `live`, same | `closed-unarchived`, same |
+
+Both record files were written *after* both ticks — mtimes 2026-10-30 01:10:44 and 01:14:44
+local (UTC+7), i.e. 2026-10-29T18:10:44Z and 18:14:44Z, against ticks at 17:49:31Z and
+17:54:31Z — and they are exactly the two records behind `live 6 → 4` and
+`closedUnarchived 15 → 17`. So the counts moved by the rows that moved, and the row comparison
+now names the rows where a count used to name only a number. This is the honest residue of
+comparing a **snapshot** against a **live document**: it grows with the report's age, not with
+anything the port decides. The harness does not paper over it — `state` and `reason` are
+compared as they are, per the brief's rule that a shared agent row differing in any field is
+semantic and is not normalised.
+
+**Neither stored report is `EQUIVALENT`.** What changed is *why*: the residual is no longer a
+population count (dropped, with both sides' values logged) but two named records whose status
+the daemon changed after the reports were written.
+
+Two further observations, recorded and **not** normalised (out of this task's remit):
+
+- Copying just those two rows' live `state`/`reason` into a scratch copy of
+  `20261029T175431Z.json` (a control, not a harness rule) takes the run past the whole agent
+  section — `agents 0/300 vs 0/300` — and it then stops at
+  `DIFFERS at retention[9].path ("/Users/ultima/.paseo/agents" vs "/Users/ultima/.paseo/20261027-0955-01-daemon.log")`.
+  The stored report lists `~/.paseo/20261027-0955-01-daemon.log`, which the daemon's own log
+  rotation removed at 18:18Z (the 10 MB rotation that produced `20261030-0118-01-daemon.log`);
+  the live walk sees `agents` at that position instead. `retention` is report-only — no rule,
+  gate, action or verdict reads it — and its rows are compared in order, so this is a live home
+  listing and the next residual in line.
+- The daemon counters are still settled: no run since has named `daemonMetrics`, and the
+  retention *notes* (as opposed to the row listing) no longer appear either.
 
 ## 4. Protected classes — the tests that pin them
 
