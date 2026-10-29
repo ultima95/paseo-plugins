@@ -23,7 +23,40 @@
 // The two reports are captured by different processes at different instants, so
 // every field whose value is live — a pid, a sample of `top`, an age, a size, a
 // timestamp — is dropped before the comparison (`IGNORE`), with the reason recorded
-// in `docs/acceptance-phase3-2026-10-30.md`. One value is not dropped but mapped to a
+// in `docs/acceptance-phase3-2026-10-30.md`. Two whole-row *populations* are live for the
+// same reason, and one list's *order* is not a decision. Nothing here is semantic: every
+// refusal, class, owner, rule, reason, count, threshold and verdict is compared as it is.
+//
+// 1. **The process and orphan sections are compared as sets, keyed by `pid` +
+//    `lstart`** (`ROW_SECTIONS`). A process that exits between the two captures is a
+//    row on one side only; it is not a decision and is skipped, with the count logged
+//    per section. The key is the pair, not the pid: a recycled pid is a different
+//    process and stays a difference. A section with no row in common is *not* churn,
+//    it is a different population, and it fails (`alignRowSections`).
+// 2. **`why` sentences have their `top` sample collapsed** (`WHY_MB`): both sides
+//    quote a measured footprint ("footprint 115.0 MB <= 4096 MB"), sampled seconds
+//    apart. Only the numbers are replaced; the sentence, its comparison and its
+//    verdict are compared as they are, and the thresholds remain compared as the
+//    `warnMb`/`killMb` numbers the report carries separately.
+// 3. **Sums and sizes of those samples are dropped too** (`IGNORE`'s second block):
+//    `tree.totalMb`, `retention[].kb`, `daemonMetrics[].rss` and their like are the
+//    same instant one level up. What they decide stays compared — `tree.over`,
+//    `overall.n`, `totals[].n`, every threshold — and the sums' per-row inputs were
+//    already dropped, so comparing a sum of dropped samples alone would only ever fail.
+// 4. **`agents.rows` is compared sorted by `id`** (`ORDER_INSENSITIVE`): the reference
+//    walks the record directory with `find` (`slp-gc.bash:628`, filesystem order) and the
+//    port sorts each directory's filenames (`server/gc/agents.ts:255`), so the same 300
+//    rows arrive in a different order. Sorting both sides keeps every row, every field
+//    and the row count compared — the rows are identical by `id`, and the summary counts
+//    are compared separately. No row is dropped.
+// 5. **`procs.ledgerNext` is the one field the two artifacts do not share**
+//    (`REPORT_MODE_ONLY`): the reference's `report` verb does not compute a ledger, and
+//    the port's report is a *tick's* report, which does. The exemption is asserted, not
+//    assumed, and covers no rule.
+//
+// Nothing else about a row is normalised: an empty section on one side against a
+// non-empty one on the other, a different class or owner, a different `why` sentence
+// with the same numbers — all still fail. One value is not dropped but mapped to a
 // sentinel (`EQUIVALENT`): `protected` reads `in slp-gc's own process tree` on the
 // reference side and `null` on the port's, which is the documented deviation and not
 // drift — see the `EQUIVALENT` comment for the reason and the ruling it implements.
@@ -55,7 +88,39 @@ const IGNORE = new Set([
   "mem_mb", // a `top` MEM sample
   "cmprs_mb", // a `top` CMPRS sample
   "footprint_mb", // a `top` MEM sample (the row's measured footprint)
+
+  // --- sums and sizes *of* those samples: the same instant, one level up. Dropping the
+  // per-row value while comparing the sum would fail on every live host and tell nobody
+  // anything; what the sums decide stays compared — `tree.over` and `totals[].n` are still
+  // compared as values, and the thresholds (`warnMb`, `killMb`, `treeWarnMb`) are still
+  // compared as numbers.
+  "totalMb", // the app subtree's footprint sum (registry: `tree`)
+  "appMb",
+  "orphanMb",
+  "kb", // a `du -sk` reading (retention rows: report-only, no decision reads them)
+  "count", // a `find | wc -l` reading
+  "bytes", // a transcript file's size
+  // --- the daemon's own samples: the report carries the last three `ws_runtime_metrics`
+  // lines of `daemon.log`, and two captures read them seconds apart, so the three newest
+  // lines are three *different* samples. The row shape, the pid and the timeline counts
+  // are still compared.
+  "time",
+  "rss",
+  "heapUsed",
 ]);
+
+/**
+ * The `top` sample a `why` sentence quotes — `footprint 114 MB <= 4096 MB`, `footprint
+ * 3892.7 MB` — collapsed to `<MB>` before the comparison.
+ *
+ * Both sides measure the same process's footprint at different instants, so the number
+ * in the sentence is an instant and not a decision: the same row, sampled 2 s later,
+ * reads `115.0 MB` on one side and `114.0 MB` on the other. The sentence around it, the
+ * `<=`/`>` it asserts and the eligibility it states are untouched, and the two
+ * thresholds are still compared as numbers (`procs.warnMb`, `procs.killMb`), so nothing
+ * a rule decides is masked by this. Nothing but a `<number> MB` is replaced.
+ */
+const WHY_MB = /\d+(?:\.\d+)? MB/g;
 
 /**
  * The reference's own-tree reason for a row, verbatim (`slp-gc.bash:317`, `:411`).
@@ -100,7 +165,240 @@ const NO_SELF_TREE = "<own process tree or none>";
  */
 const EQUIVALENT: Record<string, (value: unknown) => unknown> = {
   protected: (value) => (value === null || value === REFERENCE_OWN_TREE ? NO_SELF_TREE : value),
+  // The `top` sample inside a `why` sentence: the number is an instant, the sentence is
+  // the decision. See `WHY_MB` for what this does and does not hide.
+  why: (value) => (typeof value === "string" ? value.replace(WHY_MB, "<MB>") : value),
 };
+
+/** A report section compared as a *set* of rows rather than a sequence, and its identity. */
+interface RowSection {
+  /** The section's name in the ignored-row log. */
+  readonly name: string;
+  /** The path to the array, from the report root. */
+  readonly path: readonly string[];
+  /**
+   * The row's identity: what makes one capture's row "the same row" as another's.
+   * `null` when the row carries no identity, and the whole row is then its own key.
+   */
+  readonly key: (row: Record<string, unknown>) => string | null;
+}
+
+/**
+ * `pid@lstart`, the identity of a live process across two captures.
+ *
+ * Both halves are needed: a pid alone is recycled by the kernel, so two different
+ * processes can share one, and `lstart` alone can repeat (a fork of a process describing
+ * itself with the same second). Together they name one process for its whole life, which
+ * is exactly the span a comparison of two captures may assume.
+ */
+function processKey(row: Record<string, unknown>): string | null {
+  const { pid, lstart } = row;
+  if (typeof pid !== "number" || typeof lstart !== "string") return null;
+  return `${String(pid)}@${lstart}`;
+}
+
+/**
+ * `category:id`, the identity of a garbage candidate: the record file's own name
+ * (`ReportGarbageRow`, `server/gc/report.ts:880`) — a path is home-prefixed and would
+ * make the key depend on an ignored field.
+ */
+function garbageKey(row: Record<string, unknown>): string | null {
+  const { category, id } = row;
+  if (typeof category !== "string" || typeof id !== "string") return null;
+  return `${category}:${id}`;
+}
+
+/**
+ * The sections compared as row sets. These are the populations a live machine changes
+ * between two captures: a process exits, a record file is written or reclaimed. Every
+ * other array in the report (an agent's `rows`, a schedule's, the retention walk) is
+ * compared in order, as a sequence.
+ */
+const ROW_SECTIONS: readonly RowSection[] = [
+  { name: "procs", path: ["procs", "procs"], key: processKey },
+  { name: "orphans", path: ["procs", "orphans"], key: processKey },
+  { name: "garbage", path: ["garbage"], key: garbageKey },
+];
+
+/** The value at `path` under `root`, or `undefined` when the path or root does not exist. */
+function atPath(root: Record<string, unknown>, path: readonly string[]): unknown {
+  let node: unknown = root;
+  for (const step of path) {
+    if (node === null || typeof node !== "object" || Array.isArray(node)) return undefined;
+    node = (node as Record<string, unknown>)[step];
+  }
+  return node;
+}
+
+/** Replace the value at `path` under `root`. `path` is never empty. */
+function setPath(root: Record<string, unknown>, path: readonly string[], value: unknown): void {
+  const parents = path.slice(0, -1);
+  const last = path[path.length - 1] as string;
+  let node = root;
+  for (const step of parents) {
+    const next = node[step];
+    if (next === null || typeof next !== "object" || Array.isArray(next)) return;
+    node = next as Record<string, unknown>;
+  }
+  node[last] = value;
+}
+
+/** One section's skipped rows, for the log: one-sided rows on each side, and the totals. */
+interface RowCount {
+  readonly name: string;
+  readonly left: number;
+  readonly right: number;
+  readonly leftTotal: number;
+  readonly rightTotal: number;
+}
+
+/**
+ * Rows of `rows` keyed by identity, with the occurrence number appended so that two rows
+ * with the same identity stay two rows instead of one overwriting the other. A row with
+ * no identity is keyed by its own JSON, which can only ever match an identical row.
+ */
+function keyRows(
+  rows: readonly Record<string, unknown>[],
+  key: RowSection["key"],
+): Map<string, Record<string, unknown>> {
+  const seen = new Map<string, number>();
+  const keyed = new Map<string, Record<string, unknown>>();
+  for (const row of rows) {
+    const base = key(row) ?? JSON.stringify(row);
+    const occurrence = (seen.get(base) ?? 0) + 1;
+    seen.set(base, occurrence);
+    keyed.set(`${base}#${String(occurrence)}`, row);
+  }
+  return keyed;
+}
+
+/**
+ * Compare the row sections as sets: keep only the rows both captures saw, in key order,
+ * and report what was skipped.
+ *
+ * The rule is deliberately asymmetric only in what it *drops*: a row on one side only is
+ * live churn and is skipped, but a section whose two sides share *no* row is refused —
+ * an empty section against a populated one is the case the brief names, and a pair of
+ * disjoint non-empty ones (a completely different population, e.g. the pid-recycling bug
+ * that once listed 418 system daemons as orphans) is not churn either. Both arrays are
+ * replaced in place on the parsed reports; the caller owns them.
+ */
+function alignRowSections(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+): { ignored: RowCount[]; refusal: string | null } {
+  const ignored: RowCount[] = [];
+  let refusal: string | null = null;
+  for (const section of ROW_SECTIONS) {
+    const leftSide = atPath(left, section.path);
+    const rightSide = atPath(right, section.path);
+    // Absent or not an array: no rows to align. `firstDifference` reports the shape
+    // difference as the drift it is.
+    if (!Array.isArray(leftSide) || !Array.isArray(rightSide)) continue;
+    const leftRows = leftSide as readonly Record<string, unknown>[];
+    const rightRows = rightSide as readonly Record<string, unknown>[];
+    const leftKeyed = keyRows(leftRows, section.key);
+    const rightKeyed = keyRows(rightRows, section.key);
+    const shared = [...leftKeyed.keys()].filter((key) => rightKeyed.has(key)).sort();
+    ignored.push({
+      name: section.name,
+      left: leftRows.length - shared.length,
+      right: rightRows.length - shared.length,
+      leftTotal: leftRows.length,
+      rightTotal: rightRows.length,
+    });
+    if (shared.length === 0 && (leftRows.length > 0 || rightRows.length > 0)) {
+      const path = section.path.join(".");
+      refusal ??= `${path} (no row in common: ${String(leftRows.length)} rows vs ${String(rightRows.length)} rows)`;
+      continue;
+    }
+    setPath(left, section.path, shared.map((key) => leftKeyed.get(key)));
+    setPath(right, section.path, shared.map((key) => rightKeyed.get(key)));
+  }
+  return { ignored, refusal };
+}
+
+/**
+ * Lists whose *order* is not a decision, compared sorted by the given field on both sides.
+ *
+ * `agents.rows` is the record index: the reference walks the directory with `find`
+ * (`slp-gc.bash:628`) and takes the filesystem's order, while the port sorts each
+ * directory's filenames (`server/gc/agents.ts:255`). The same rows therefore arrive in a
+ * different order on a host with more than one workspace. Sorting both sides by `id`
+ * compares every row, every field of it and the row count: nothing is dropped and no row
+ * is matched against another. A row that exists on one side only still fails on length.
+ */
+const ORDER_INSENSITIVE: readonly { readonly path: readonly string[]; readonly by: string }[] = [
+  { path: ["agents", "rows"], by: "id" },
+];
+
+/**
+ * Sort the `ORDER_INSENSITIVE` lists on both sides by their key field. A side that is not
+ * an array of objects with the key is left alone for `firstDifference` to report.
+ */
+function sortRowLists(left: Record<string, unknown>, right: Record<string, unknown>): void {
+  for (const list of ORDER_INSENSITIVE) {
+    const leftSide = atPath(left, list.path);
+    const rightSide = atPath(right, list.path);
+    if (!Array.isArray(leftSide) || !Array.isArray(rightSide)) continue;
+    const sort = (rows: unknown): unknown =>
+      (rows as readonly unknown[])
+        .map((row) => row)
+        .sort((one, other) => {
+          const a = (one as Record<string, unknown>)[list.by];
+          const b = (other as Record<string, unknown>)[list.by];
+          return String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0;
+        });
+    setPath(left, list.path, sort(leftSide));
+    setPath(right, list.path, sort(rightSide));
+  }
+}
+
+/**
+ * Sections the reference's `report` verb leaves at its zero value for *every* host,
+ * because it does not compute them at all.
+ *
+ * `procs.ledgerNext` is `null` unless `$wantLedger` (`slp-gc.bash:452`, `:467`), and
+ * `WANT_LEDGER=1` is set in exactly one place — `do_record` (`:1188`) — which is reachable
+ * only from `tick` (`:1344`). `report --json`, the verb this harness can print, therefore
+ * answers `null` on every machine, while the port's report file is *a tick's* report and
+ * carries the ledger that tick computed and wrote back (`server/gc/tick.ts:1752`). The two
+ * values are not "no rows" against "rows": `null` here is the artifact's zero value.
+ *
+ * So the comparison drops the port's side **only when the reference side is exactly
+ * `null`**, which is asserted on every run: a reference that ever produced rows keeps them
+ * and is compared normally, so a rule that started computing the ledger in `report` would
+ * surface here rather than be hidden. This is the one section where the two artifacts are
+ * not the same artifact; every other section is compared as it is.
+ *
+ * What it does not do is check the port's ledger rows against the reference's. No
+ * reference CLI emits a ledger (its `tick` writes rendered text only, and its JSON lives
+ * in a temp dir it removes), so the ledger's rules are pinned by
+ * `server/gc/ledger.test.ts` against the same jq instead.
+ */
+const REPORT_MODE_ONLY: readonly (readonly string[])[] = [["procs", "ledgerNext"]];
+
+/**
+ * Drop the port's side of a `REPORT_MODE_ONLY` section when — and only when — the
+ * reference's side is `null`. Any other reference value is left alone to be compared.
+ */
+function reconcileReportMode(
+  reference: Record<string, unknown>,
+  plugin: Record<string, unknown>,
+): void {
+  for (const path of REPORT_MODE_ONLY) {
+    if (atPath(reference, path) === null) setPath(plugin, path, null);
+  }
+}
+
+/** The one-line log of what the set comparison skipped, e.g. `procs 1/21 vs 2/21`. */
+function ignoredLine(ignored: readonly RowCount[]): string {
+  const parts = ignored.map(
+    (count) =>
+      `${count.name} ${String(count.left)}/${String(count.leftTotal)} vs ${String(count.right)}/${String(count.rightTotal)}`,
+  );
+  return `rows on one side only (skipped): ${parts.join("; ")}`;
+}
 
 /** The path of the first differing value, as `a.b[3].c`, or `null` when the two agree. */
 function firstDifference(left: unknown, right: unknown, path = ""): string | null {
@@ -196,14 +494,25 @@ function bashReport(): unknown {
 function main(): void {
   const explicit = process.argv[2];
   const pluginPath = explicit ?? newestPluginReport(pluginStateDir());
-  let plugin: unknown;
+  let plugin: Record<string, unknown>;
   try {
-    plugin = JSON.parse(readFileSync(pluginPath, "utf8")) as unknown;
+    plugin = JSON.parse(readFileSync(pluginPath, "utf8")) as Record<string, unknown>;
   } catch (error) {
     throw new Error(`cannot read the plugin report at ${pluginPath}: ${String(error)}`);
   }
 
-  const difference = firstDifference(normalize(bashReport()), normalize(plugin));
+  const reference = bashReport() as Record<string, unknown>;
+  // The set comparison first: it decides which rows are comparable at all, and logs what
+  // it skipped. Its refusal is a difference in its own right ("no row in common"), not a
+  // value drift `firstDifference` could name.
+  const aligned = alignRowSections(reference, plugin);
+  console.log(ignoredLine(aligned.ignored));
+  sortRowLists(reference, plugin);
+  reconcileReportMode(reference, plugin);
+
+  const difference =
+    aligned.refusal ??
+    firstDifference(normalize(reference), normalize(plugin));
   if (difference !== null) {
     console.log(`DIFFERS at ${difference}`);
     console.log(`  plugin report: ${pluginPath}`);
