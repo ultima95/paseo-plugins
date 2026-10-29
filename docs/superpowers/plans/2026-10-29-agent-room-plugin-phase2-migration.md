@@ -496,3 +496,28 @@ Expected: commit created on `feat/agent-room`; `git status` clean apart from pre
 - **Task 1 only:** re-add the four blocks from `$COMMANDCODE_SCRATCHPAD/phase2-providers-removed.json` into `agents.providers`, then `paseo reload`. Routing shape returns; the old room still cannot run, because the proxy credentials are deleted by design.
 - **Task 2 onwards:** no rollback. Files and credentials are gone.
 - **After Task 4 fails:** stop. Phase 2 is blocked on an agent-room defect and there is no old room to fall back to; the path upgrades to a Phase 1 fix.
+
+---
+
+## Amendments discovered during execution
+
+Two defects in this plan were found while executing it. The tasks above are left as written; this
+section records the correction for whoever reads or re-runs the plan.
+
+1. **Task 0 Step 6 contradicts the no-backup constraint.** Step 6 captures the four `agents.providers`
+   blocks verbatim into `$COMMANDCODE_SCRATCHPAD/phase2-providers-removed.json` while glossing itself
+   as "a rollback aid for config shape only, not a backup of credentials". Those blocks contain
+   `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` for `claude-supervisor`, `claude-lead` and
+   `claude-peer`, so the file *did* hold credentials that Global Constraint 1 says are not preserved
+   anywhere. The captured file must be deleted at the end of the migration
+   (`rm -f "$COMMANDCODE_SCRATCHPAD/phase2-providers-removed.json"`), and the acceptance record must
+   say that it existed and when it was deleted. Until that deletion, the "no credential preserved"
+   claim is false. (Done on 2026-10-29: file deleted, record amended in Deviations 9.)
+
+2. **Global Constraint 7 contradicts spec acceptance 7.** Constraint 7 says "do not edit any file
+   under `agent-room/` except the new acceptance record in Task 5", while spec acceptance 7 requires
+   `agent-room/OVERVIEW.md` to be "updated wherever it still describes the old setup or the
+   side-by-side period". Resolution: read `agent-room/OVERVIEW.md`, record the finding in the
+   acceptance record, and do not edit it unless the record itself is not an agent-room file. That is
+   what was done — the file describes only the Paseo room, so nothing needed changing. A re-run should
+   make the precedence explicit in the constraint itself rather than discovering the conflict here.

@@ -12,7 +12,8 @@ base commit `6c6667a`.
 Evidence sources, named per section: the five task reports under
 `.superpowers/sdd/2026-10-29-agent-room-plugin-phase2-migration/` (`task-0-report.md` …
 `task-4-report.md`), the scratchpad artifacts those reports list, and the read-only re-checks run
-while writing this record (each re-check is quoted with its command).
+while writing this record (each re-check is quoted with its command; long commands are elided with
+`…`).
 
 ## Step 0 — preflight
 
@@ -82,13 +83,16 @@ with 0 `MISSING` (`phase2-delete-list.txt`):
 ```
 
 A rollback aid for the four provider blocks was written to
-`$COMMANDCODE_SCRATCHPAD/phase2-providers-removed.json` (5205 bytes, mode 600). It is
-session-scoped and is **not** a backup: no archive of anything was created.
+`$COMMANDCODE_SCRATCHPAD/phase2-providers-removed.json` (5205 bytes, mode 600) by plan Task 0 Step 6
+— the plan's §Rollback notes only *consume* that file, for the Task-1-only rollback, and did not
+sanction creating it. It was **deleted on 2026-10-29** (see Deviations 9). No archive of anything
+exists.
 
 ## Step 1 — providers
 
-**Before → after.** `~/.paseo/config.json` `agents.providers`: 11 ids before, 7 after
-(`task-1-report.md` §Steps 2–3). Surviving ids:
+**Before → after.** `~/.paseo/config.json` `agents.providers`: 11 before (7 listed in
+`task-1-report.md` §Step 2, plus the four removed), 7 after (`task-1-report.md` §Steps 2–3). Surviving
+ids:
 
 ```
 antigravity, claude, claude-worker, copilot, muse, opencode, pi
@@ -173,9 +177,10 @@ Keep-list integrity: `slp-gc` (104149 B,
 `64d01ac9b25e73d9ac7efbc49441ddb1a0478e73680309ab923404e083adf10b`) are byte-identical before and
 after, and `~/Library/Logs/slp-gc/` still holds its nine entries.
 
-**Skill gone.** `~/.claude/skills/supervisor` is absent (re-checked above), the other 41 skills
-remain, and `grep -rl '"name": *"supervisor"\|^name: *supervisor' ~/.claude/skills ~/.agents/skills`
-returned nothing — no loaded skill named `supervisor`.
+**Skill gone.** `~/.claude/skills/supervisor` is absent (re-checked above); the other skill
+directories are untouched and `supervisor` is the only entry gone. A `grep -rl` for a loaded skill
+named `supervisor` over `~/.claude/skills` and `~/.agents/skills` returned nothing — no loaded skill
+named `supervisor`.
 
 ## Step 3 — gc
 
@@ -218,9 +223,9 @@ migration finished; the counter only ever increases, and every sample after the 
 
 **Log tail.** `~/Library/Logs/slp-gc/launchd.log` is 44 lines / 3792 bytes, mtime `Oct 24 20:59`
 — five days before the deletions — and `diff` shows no growth across Task 3's wait.
-`grep -inE 'error|no such file|claude-'` over the whole file: no matches. `tick` is silent on
-success, so the absence of a new line is expected; the load-bearing evidence is `runs` advancing
-with exit 0.
+`grep -inE 'error|no such file|claude-'` over the whole file: no matches. The log-tick clause the
+spec asks for — Step 4's "writes a fresh line to its log within one tick", restated as acceptance 4's
+"the log shows a tick after the deletions" — is not evidenced; see Deviations 10.
 
 ## Step 4 — smoke room
 
@@ -265,7 +270,8 @@ text `WROTE SMOKE.md`; and `paseo logs aaba4b3d-…` shows the brief arriving fr
 write, then `WROTE SMOKE.md`. The Supervisor's log ends by inspecting and reporting the result.
 
 **Feed.** Room `0bcfe1d9-53af-4ff1-adae-e24784c17fa7`: **3 seats, 8 feed events**, created
-`09:10:15.297Z`, `endedAt 09:14:03.338Z` (3 m 11 s).
+`09:10:15.297Z`, `endedAt 09:14:03.338Z` (the archive stamp, 3 m 48 s after creation). The last feed
+event landed at `09:13:26.463Z`, 3 m 11 s after creation.
 
 ```
 09:11:27.386  message  null       -> supervisor  "Have your Lead launch one Peer that writes SMOKE.md …"
@@ -278,13 +284,14 @@ write, then `WROTE SMOKE.md`. The Supervisor's log ends by inspecting and report
 09:13:26.463  message  supervisor -> room        "DONE. Lead … launched one Peer … SMOKE.md = 10 bytes, exactly phase2-ok\n. One file only."
 ```
 
-The guard fired once, correctly: the Supervisor's first attempt created an unmarked child
-(`ca9963de-5bcc-4e68-a83b-07d8dbc581a5` — an unmarked child, so no seat override applied,
-`inject.ts:32-33`); its provider was `claude-worker/claude-haiku-4-5`. `server/guard.ts` archived
-it and told the Supervisor the rule, and the Supervisor then created the proper Lead and finished.
+The guard fired once, correctly: the Supervisor's first child,
+`ca9963de-5bcc-4e68-a83b-07d8dbc581a5`, carried no `[room:…]` marker, so no seat override applied
+(`inject.ts:32-33`); its provider was `claude-worker/claude-haiku-4-5`. `server/guard.ts` archived it
+and told the Supervisor the rule, and the Supervisor then created the proper Lead and finished.
 
-**Cleanup.** All three smoke agents archived (plus the attempt-1 supervisor and the guard's
-`ca9963de`), `/tmp/phase2-smoke` removed, 0 live smoke rows in `paseo ls` afterwards. The live
+**Cleanup.** All three smoke agents archived, plus the attempt-1 supervisor, which I archived; the
+guard's `ca9963de` had already been archived by the plugin. `/tmp/phase2-smoke` removed, 0 live smoke
+rows in `paseo ls` afterwards. The live
 `minimal-browser` room was untouched: 25 rows before and 25 after, no row added or removed, the
 only diff a status tick on its supervisor.
 
@@ -307,7 +314,11 @@ its own sub-agent and report success while the room never exists, and that failu
 invisible unless the seat tree is checked. Retry room `0bcfe1d9…` is the accepted result. One of
 two attempts is not a rate, but this model is the default for both Supervisor and Lead, so it
 warrants a Phase 1 follow-up (a stronger protocol line near the task, or a post-turn check that a
-Supervisor turn ended with a child when its brief named one).
+Supervisor turn ended with a child when its brief named one). Spec §Failure handling says a failed
+smoke room means stop and escalate to a Phase 1 fix. We retried once instead, because the plugin side
+was verified healthy (room record, seat, feed, injected prompt, no log error) and the failure was
+seat-behaviour non-determinism rather than a deletion regression. Read acceptance 5 as "the saved seat
+can run a full room, at least once"; it is not reproducible on every attempt.
 
 **2. `paseo run --json` returns `agentId`, not `id`.** The plan's `run.json['id']` lookup raises
 `KeyError` against this CLI; the working field is `agentId`
@@ -320,8 +331,8 @@ is not claimed to work here — it was never exercised.
 `assert len(events) >= 3` fails against it. That is a script defect, not a room defect: the same
 assertions pass on `0bcfe1d9…`. This record asserts on the successful room id.
 
-**4. `omp` remains in `paseo provider ls`** though it was never in `agents.providers`. It was there
-before the migration and is unchanged — sourced outside `agents.providers`.
+**4. `omp` remains in `paseo provider ls`;** see Step 1 — sourced outside `agents.providers`,
+unchanged.
 
 **5. Two stale workspace records point at the deleted `/tmp/phase2-smoke`:**
 `wks_ff67ba715422c373` (attempt 1) and `wks_b550834eb395286d` (attempt 2). They were left in place:
@@ -350,18 +361,49 @@ migration. Noted for awareness.
 **8. Cosmetic, non-numeric:** the daemon's global `appendSystemPrompt` made both the Supervisor and
 the Peer call `Activate skill` before working, competing with the room protocol for the first turn.
 
+**9. The rollback aid held credentials until it was deleted.** The rollback aid held the three
+providers' `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` values until it was deleted on 2026-10-29; it
+was the only place those values existed outside the deleted config. Row 1 of the global-constraint
+table is therefore honestly Met.
+
+**10. The spec's log clause is unverified as written.** Spec Step 4 asks that the launchd job "writes
+a fresh line to its log within one tick", restated in acceptance 4 as "the log shows a tick after the
+deletions". `tick` is silent on success, so the absence of a new line is expected rather
+than evidence, and `~/Library/Logs/slp-gc/launchd.log`'s mtime (`Oct 24 20:59`) predates the
+deletions. The substitute evidence is `runs` advancing across the migration (243 → 245 inside Task 3's
+own 70 s wait, 246 at migration end, 255 at this record's re-check) with `last exit code = 0` at every
+sample.
+
 ## Global-constraint check
 
 | Constraint (plan §Global Constraints) | Result |
 |---|---|
-| No archive created | Met. No archive of any deleted file or credential. The single retained artifact is `phase2-providers-removed.json` (mode 600, session scratchpad) — the four provider blocks only, as sanctioned by the brief's §Rollback notes; it is not an archive of the deleted paths or credentials. The two `~/.paseo/config.json.bak-*` files are pre-existing (mtimes `2026-09-21 22:18` and `2026-09-30 15:33`). |
+| No archive created | Met. No archive of any deleted file or credential. The only copy ever made of anything was `phase2-providers-removed.json` (mode 600, session scratchpad) — the four provider blocks only, created by plan Task 0 Step 6 (the plan's §Rollback notes only consumes it). It held the three providers' `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` values and was deleted on 2026-10-29 (Deviations 9), so no credential is preserved anywhere. The two `~/.paseo/config.json.bak-*` files are pre-existing (mtimes `2026-09-21 22:18` and `2026-09-30 15:33`). |
 | Daemon never restarted | Met. `pid 1317`, `startedAt 2026-10-29T04:43:22.838Z` unchanged at every checkpoint; `paseo reload` only, exit 0. |
 | Live `minimal-browser` room untouched | Met. 10 ids identical across the reload; 25 rows before/after the smoke run; supervisor `cf391bb` still listed, never stopped, unarchived. Only agents whose cwd was `/tmp/phase2-smoke` were archived. |
+| Confirm each destructive step in chat | Partially met. The human partner approved the deletion set before the run; the controller relayed that approval, so Tasks 1 and 2 proceeded without a second in-chat prompt. No destructive step ran without approval; both task reports record the substitution. |
 | `slp-room` reduced to exactly two entries | Met. `bin/slp-gc` + `slp-gc.conf`, both unchanged (SHA-256 and Sep 30 mtimes). |
 | `claude-worker` and all five `agentProfiles` present | Met. `claude-worker` is a surviving provider with its `paseo status` row; `daemon.agentProfiles` still has 5 entries (Researcher, Executor, UI/UX Designer, Command Code Default, Claude Default), none naming a removed provider. |
+| launchd plist and log directory untouched | Met. `~/Library/LaunchAgents/com.paseo-slp.slp-gc.plist` (1422 B, SHA-256 `64d01ac9…`) is byte-identical before and after, and `~/Library/Logs/slp-gc/` still holds its nine entries (§Step 2 keep-list integrity). Neither was written, moved or removed by any step; the job itself only ticked. |
 | Both plugins untouched | Met. `paseo plugin ls` still lists agent-room `running` and command-code `running`; neither was stopped or reloaded. Re-checked for this record: `agent-room                      running     yes       /Users/ultima/Workspace/paseo-plugins/agent-room` and `command-code                    running     yes       /Users/ultima/Workspace/paseo-plugins/command-code-provider`. |
 | No `agent-room/` source file modified | Met. The only file added by this migration is this record; `git status` shows nothing else. |
 | Work on `feat/agent-room`, never `main` | Met. Record committed on `feat/agent-room`. |
+
+## Spec acceptance
+
+One row per criterion in the spec's "Acceptance (Phase 2 done when)" list
+(`docs/superpowers/specs/2026-10-29-agent-room-plugin-phase2-migration-design.md`), each pointing at
+the section of this record that carries the evidence.
+
+| # | Criterion (spec) | Result | Evidence |
+|---|---|---|---|
+| 1 | `paseo provider ls` does not list the four removed ids and still lists the surviving providers | Met | §Step 1 — providers: the removed-id `grep` exits 1 with no output, and the 10 rows include `claude`, `codex`, `copilot`, `opencode`, `pi`, `omp`, `antigravity`, `muse`, `command-code`, `claude-worker` (`config.json` at 7 ids). |
+| 2 | `~/.claude/skills/supervisor` does not exist and no loaded skill is named `supervisor` | Met | §Step 2 — files: the path returns `No such file or directory` on re-check; the `grep -rl` for a loaded `supervisor` skill returned nothing. |
+| 3 | `~/.config/slp-room` contains only `bin/slp-gc` and `slp-gc.conf` | Met | §Step 2 — files: `ls -A` gives `bin` + `slp-gc.conf`, `ls -A bin` gives `slp-gc`, both unchanged (SHA-256, Sep 30 mtimes). |
+| 4 | The launchd job is loaded, `slp-gc report` exits 0, and the log shows a tick after the deletions | Report and exit code met; the log clause is unverified as written | §Step 3 — gc: `report` exit 0 (113 lines / 10059 bytes), job listed with `last exit code = 0`, `runs` 243 → 245 → 246 → 255 across the migration. `tick` is silent on success and the log's mtime predates the deletions, so `runs` plus `last exit code = 0` is the substitute evidence — Deviations 10. |
+| 5 | A smoke room runs end to end on the saved seats: Supervisor starts a Lead, the Lead starts a Peer, the Peer writes the file, the feed shows it | Met on the accepted second attempt | §Step 4 — smoke room: room `0bcfe1d9…`, 3 seats / 8 feed events, Peer `aaba4b3d…` wrote `SMOKE.md` (`phase2-ok`, 10 bytes), feed shows `WROTE SMOKE.md` then `DONE`. Attempt 1 failed — Deviations 1, including the spec §Failure handling substitution. |
+| 6 | `agent-room` `npm test` and `npm run typecheck` still pass | Met | Run for this record against an unchanged source tree (the only working-tree changes were Markdown documentation): `npm test` → `Test Files 13 passed (13)`, `Tests 234 passed (234)`; `npm run typecheck` (`tsc --noEmit`) exit 0. |
+| 7 | `agent-room/OVERVIEW.md` and the phase-2 acceptance record are updated | Met as a read, not an edit | `agent-room/OVERVIEW.md` read in full (45 lines): it describes only the Paseo room, with no reference to the old Claude room or the side-by-side period, so no edit was needed — and the plan's constraint 7 forbids editing `agent-room/` files anyway. The acceptance record (this file) is updated. |
 
 ## Not done
 
