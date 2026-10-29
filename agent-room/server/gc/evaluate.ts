@@ -1,0 +1,588 @@
+// The per-process half of the GC port: the process table the reference builds
+// after classification (protection, ownership, footprint) and the two decision
+// rules that read it — staleness and over-memory.
+//
+// Reference (`agent-room/docs/gc-port/slp-gc.bash`, byte-identical to the
+// deployed copy):
+//
+//   chainc                  slp-gc.bash:294   (the 40-step ppid walk)
+//   the GC's own tree       slp-gc.bash:295-298
+//   the invoking agent      slp-gc.bash:299-302
+//   `$ours`                 slp-gc.bash:303   (rows worth reporting)
+//   `$procs`                slp-gc.bash:304-320 (class, owner, ownerState, env/home, footprint, protected)
+//   stale rule              slp-gc.bash:345-359
+//   over-memory rule        slp-gc.bash:360-374
+//   `underDaemon` / `warn`  slp-gc.bash:346, 375
+//
+// Two properties matter more than tidiness:
+//
+// 1. **Refusal order is the contract.** The `why` strings reach the user's
+//    report and fail-closed behaviour depends on which check fires first, so the
+//    order below is the reference's, branch for branch. Reordering the chain
+//    changes what the operator is told and, for the fail-closed arms, which
+//    check gets to answer at all.
+// 2. **Nothing here throws and nothing here shells out.** `rows`, `top`, `env`
+//    and the agent records arrive as values, and every one of them may be empty
+//    — an empty table, no `top` sample, no env row and no agent record are all
+//    ordinary, and each degrades to the fail-closed answer rather than an
+//    exception. The only external behaviour is `classify()` from `procs.ts`.
+//    Task 12 owns `ps`, `top`, `lsof` and the environment reads.
+//
+// `buildProcTable` is called twice in a tick, by construction: `underDaemon`
+// needs the identified daemon pid, and identification needs the table's classes
+// and homes. The pipeline is
+//
+//   const table = buildProcTable({ rows, top, env, agents, selfPid, warnMb });
+//   const identity = resolveIdentity({ procs: table.procs, pidFile, listen, dupes, homeDefault });
+//   const final = buildProcTable({ …input, daemonPid: identity.daemonPid });
+//
+// The second call is the same pure function over the same inputs, so the two
+// tables cannot disagree about anything except `underDaemon`. Both builds are
+// O(rows) and the table is a few hundred rows.
+
+import { classify, type ProcClass, type ProcRow, type TopRow } from "./procs";
+import type {
+  HomeState,
+  IdentityFacts,
+  ProcClassValue,
+} from "./identity";
+
+/**
+ * Agent classes whose process *is* an agent (`agentish`, slp-gc.bash:277): the
+ * reference's own protection and ownership rules key on exactly these.
+ */
+export function isAgentChild(cls: ProcClassValue | null): boolean {
+  return cls === "claude-child" || cls === "codex-child";
+}
+
+/** Agent classes plus the two wait helpers (`agentfam`, slp-gc.bash:278). */
+export function isAgentFamily(cls: ProcClassValue | null): boolean {
+  return isAgentChild(cls) || cls === "slp-wait" || cls === "paseo-wait";
+}
+
+/**
+ * What the per-process rules are allowed to conclude about an owner agent
+ * (slp-gc.bash:312, `$p.ownerState`):
+ *
+ * - `archived` / `live` — the record is in the index.
+ * - `missing` — no record, and the index is complete, so the agent is gone.
+ * - `unknown` — the index could not be trusted (empty, or a record failed to
+ *   parse), so neither of the two above may be claimed.
+ *
+ * `null` (no owner at all) is a separate value; the stale rule refuses it
+ * through its own arm (:355).
+ */
+export type OwnerState = "archived" | "live" | "missing" | "unknown";
+
+/** One process's environment facts (slp-gc.bash:288, `$envBy`'s values). */
+export interface EnvFacts {
+  /** `PASEO_AGENT_ID` when it is a 36-character uuid-shaped token, else null. */
+  agent: string | null;
+  /** The `PASEO_HOME` verdict before the env-unreadable overlay. */
+  home: Exclude<HomeState, "unreadable">;
+  /** Whether the environment could be read at all. */
+  read: boolean;
+}
+
+/** The two agent-record fields the table reads (AGENT_JQ's `{ok, id, archivedAt}`). */
+export interface AgentOwner {
+  id: string;
+  /** `archivedAt` verbatim; non-null means archived (slp-gc.bash:290). */
+  archivedAt: string | null;
+}
+
+/**
+ * One row of the built table (`$procs`, slp-gc.bash:310-320).
+ *
+ * `DecisionEntry` is this without the diagnostics, so the two decision rules
+ * accept a table row *and* a hand-built case in a test.
+ */
+export interface ProcEntry extends DecisionEntry {
+  pgid: number;
+  /** `ps`'s `lstart`, whitespace-collapsed. */
+  lstart: string;
+  /** `rss` in MB — the fallback footprint when `top` did not sample the pid. */
+  rss_mb: number;
+  /** `top`'s physical footprint, or null when `top` had no row for the pid. */
+  mem_mb: number | null;
+  /** `top`'s compressed segment, or null. */
+  cmprs_mb: number | null;
+  /** `footprint_mb`, and which of the two sources produced it. */
+  footprintSource: "top" | "rss";
+  /** `footprint_mb >= warnMb` (slp-gc.bash:375). */
+  warn: boolean;
+}
+
+/** The table plus every pid in it (`$famPids`, slp-gc.bash:321). */
+export interface ProcTable {
+  procs: ProcEntry[];
+  famPids: number[];
+}
+
+export interface ProcTableInput {
+  /** The parsed `ps` table (`parsePs().rows`). */
+  rows: readonly ProcRow[];
+  /** `top -l 1 -stats pid,mem,cmprs`, parsed (`parseTop`). */
+  top: ReadonlyMap<number, TopRow>;
+  /** Per-pid environment facts (`collect_env`'s output). */
+  env: ReadonlyMap<number, EnvFacts>;
+  /** The agent index (`snapshotAgents().agents`). */
+  agents: readonly AgentOwner[];
+  /**
+   * Whether the agent index is complete (`snapshotAgents().index.ok`). False
+   * makes an owner with no record `unknown` rather than `missing`, which the
+   * stale rule refuses — the reference's `$nbad > 0` arm (slp-gc.bash:312).
+   */
+  agentIndexOk?: boolean;
+  /** The GC's own pid (`$$`, the reference's `$selfPid`): its tree is protected. */
+  selfPid: number;
+  /** `PASEO_AGENT_ID` of the GC's own environment (`$invoker`), or null. */
+  invoker?: string | null;
+  /** `SLP_GC_MEM_WARN_MB` (`$warnMb`). */
+  warnMb: number;
+  /** The identified daemon pid (`identity.daemonPid`); omit on the first build. */
+  daemonPid?: number | null;
+}
+
+/**
+ * One row, plus the class `classify` gave it. The reference keeps the classified
+ * rows (`$cl`, slp-gc.bash:292) and resolves every pid through them (`$clBy`,
+ * :293), so the ancestor walk must see *every* row — including the ones the
+ * report later drops.
+ */
+interface ClassifiedRow extends ProcRow {
+  class: ProcClass | null;
+}
+
+/** `def base: split("/") | last` (slp-gc.bash:201), for a token with no slash. */
+function baseName(token: string): string {
+  const slash = token.lastIndexOf("/");
+  return slash === -1 ? token : token.slice(slash + 1);
+}
+
+/** The table every `classify`, `chain` and `underDaemon` call is keyed on. */
+interface Walk {
+  byPid: Map<number, ClassifiedRow>;
+  chain(row: ClassifiedRow | undefined): ClassifiedRow[];
+}
+
+/**
+ * The reference's `chainc` (slp-gc.bash:294): a row, then its ancestors, walking
+ * `ppid` up to 40 steps through *all* classified rows.
+ *
+ * It stops at ppid 1 (`$l.ppid > 1`), at a parent that is not in the table, and
+ * on a cycle (the `index($par.pid) == null` guard), which is why a `ps` sample
+ * taken mid-fork cannot loop. The row itself is element 0 — the reference's
+ * `agentish` ancestor scan therefore sees a row that *is* an agent, and
+ * `chainc(.) | map(.pid) | index($x)` includes the row's own pid.
+ */
+function buildWalk(rows: readonly ClassifiedRow[]): Walk {
+  const byPid = new Map<number, ClassifiedRow>();
+  for (const row of rows) byPid.set(row.pid, row);
+
+  const chain = (row: ClassifiedRow | undefined): ClassifiedRow[] => {
+    if (row === undefined) return [];
+    const out: ClassifiedRow[] = [row];
+    const seen = new Set<number>([row.pid]);
+    for (let step = 0; step < 40; step++) {
+      const last = out[out.length - 1]!;
+      if (last.ppid <= 1) break;
+      const parent = byPid.get(last.ppid);
+      if (parent === undefined || seen.has(parent.pid)) break;
+      out.push(parent);
+      seen.add(parent.pid);
+    }
+    return out;
+  };
+
+  return { byPid, chain };
+}
+
+/**
+ * Build the process table (slp-gc.bash:294-320, 346, 375).
+ *
+ * Order of operations, and why:
+ *
+ * 1. **Classify every row** (`$cl`, :292). The ancestor walk needs the classes
+ *    of rows that never enter the report.
+ * 2. **The GC's own tree** (:295-298): its ancestry, plus every row that
+ *    descends from it. Both are protected — a GC that kills in its own subtree
+ *    kills the tick that is doing the killing.
+ * 3. **The invoking agent** (:299-302): the first agent-class process in the
+ *    GC's own ancestry, and its whole subtree. Independent of any environment,
+ *    because the env of the GC itself is not evidence about the agent that is
+ *    watching.
+ * 4. **`$ours`** (:303): rows with a class of their own, plus rows that descend
+ *    from an agent-class process. A plain `node` under the daemon that no agent
+ *    ever spawned is not part of the Paseo tree and is never reported or
+ *    killed; the same `node` under a `claude-child` is an `agent-descendant`.
+ * 5. **The per-row facts** (:304-320): env, owner, owner state, home, footprint,
+ *    protection. `owner` comes from the row's own `PASEO_AGENT_ID`, falling back
+ *    to the nearest agent-class ancestor's (`:306-308`) — a helper process
+ *    inherits the agent that started it.
+ * 6. **`underDaemon`** (:346, `$ud`) and **`warn`** (:375), the two facts that
+ *    need an input the table itself does not carry (the identified daemon) or a
+ *    configured threshold.
+ */
+export function buildProcTable(input: ProcTableInput): ProcTable {
+  const agentIndexOk = input.agentIndexOk ?? true;
+  const invoker = input.invoker === null || input.invoker === undefined || input.invoker === ""
+    ? null
+    : input.invoker;
+  const daemonPid = input.daemonPid ?? null;
+
+  const classed: ClassifiedRow[] = input.rows.map((row) => ({
+    ...row,
+    class: classify(row.cmd),
+  }));
+  const walk = buildWalk(classed);
+
+  // The GC's own tree: its ancestry (or just itself when the ps sample lost it).
+  const selfRow = walk.byPid.get(input.selfPid);
+  const selfAnc = selfRow !== undefined ? walk.chain(selfRow) : [];
+  const selfTree = new Set<number>(
+    selfRow !== undefined ? selfAnc.map((row) => row.pid) : [input.selfPid],
+  );
+  for (const row of classed) {
+    if (walk.chain(row).some((anc) => anc.pid === input.selfPid)) selfTree.add(row.pid);
+  }
+
+  // The invoking agent, taken from the GC's own ancestry rather than from any env.
+  const selfAgent = selfAnc.find((row) => isAgentChild(row.class));
+  const invokerTree = new Set<number>(
+    selfAgent === undefined
+      ? []
+      : classed
+          .filter((row) => walk.chain(row).some((anc) => anc.pid === selfAgent.pid))
+          .map((row) => row.pid),
+  );
+
+  // `$ownerBy`: id -> archived|live, from the records that are in the index.
+  const ownerBy = new Map<string, "archived" | "live">();
+  for (const rec of input.agents) {
+    if (ownerBy.has(rec.id)) continue;
+    ownerBy.set(rec.id, rec.archivedAt !== null ? "archived" : "live");
+  }
+
+  const procs: ProcEntry[] = [];
+  for (const row of classed) {
+    const ancestors = walk.chain(row);
+    const agentAncestor = ancestors.find((anc) => isAgentChild(anc.class));
+    // `$ours`: a class of its own, or an agent-class ancestor.
+    if (row.class === null && agentAncestor === undefined) continue;
+
+    const env = input.env.get(row.pid) ?? { agent: null, home: "none", read: false };
+    const owner =
+      env.agent ??
+      (agentAncestor === undefined ? null : (input.env.get(agentAncestor.pid)?.agent ?? null));
+    const ownerState: OwnerState | null =
+      owner === null
+        ? null
+        : input.agents.length === 0
+          ? "unknown"
+          : (ownerBy.get(owner) ?? (agentIndexOk ? "missing" : "unknown"));
+    const top = input.top.get(row.pid);
+    const footprint = top === undefined ? row.rss_mb : top.mem;
+
+    const protectedBy =
+      selfTree.has(row.pid)
+        ? "in the GC's own process tree"
+        : owner !== null && invoker !== null && owner === invoker
+          ? "belongs to the invoking agent"
+          : invokerTree.has(row.pid)
+            ? "in the invoking agent's process subtree"
+            : null;
+
+    procs.push({
+      pid: row.pid,
+      ppid: row.ppid,
+      pgid: row.pgid,
+      lstart: row.lstart,
+      etime_s: row.etime_s,
+      class: row.class ?? "agent-descendant",
+      exe: baseName(row.cmd.split(" ")[0] ?? ""),
+      owner,
+      ownerState,
+      envRead: env.read,
+      home: env.read ? env.home : "unreadable",
+      rss_mb: row.rss_mb,
+      mem_mb: top === undefined ? null : top.mem,
+      cmprs_mb: top === undefined ? null : top.cmprs,
+      footprint_mb: footprint,
+      footprintSource: top === undefined ? "rss" : "top",
+      cmd: row.cmd,
+      protected: protectedBy,
+      underDaemon:
+        daemonPid !== null && ancestors.some((anc) => anc.pid === daemonPid),
+      warn: footprint >= input.warnMb,
+    });
+  }
+
+  return { procs, famPids: procs.map((entry) => entry.pid) };
+}
+
+/** `{ eligible: true }` or a refusal naming the rule that fired. */
+export interface Decision {
+  eligible: boolean;
+  /** The reference's text, verbatim: this string is surfaced to the operator. */
+  why: string;
+}
+
+/**
+ * Everything the two rules read beyond the row itself. Named after the
+ * reference's jq arguments so the mapping stays obvious:
+ * `$idt`, `$killMb`, `$oc` (`killComms`), `$warnMb`, `$famPids`, and the
+ * invoking agent's identity (`$invoker`, `$invSub`).
+ */
+export interface DecisionContext {
+  /** `$idt` — the five fields a rule branches on. */
+  identity: IdentityFacts;
+  /** `$killMb`: `SLP_GC_MEM_KILL_MB`. */
+  killMb: number;
+  /** `$oc`: `SLP_GC_KILL_COMMS`. */
+  killComms: readonly string[];
+  /** `$warnMb`: `SLP_GC_MEM_WARN_MB`. Carried for the report; no rule here reads it. */
+  warnMb: number;
+  /** `$famPids`: every pid in the table — a live parent in it means "not orphaned". */
+  famPids: readonly number[];
+  /** `$invoker`: the invoking agent's id, or null when the GC was run by hand. */
+  invoker?: string | null;
+  /**
+   * `$invSub`: the invoking agent's process subtree. Protection is already
+   * encoded in `entry.protected`; this is carried for the tasks that report and
+   * record it (7-11) rather than re-derived per call.
+   */
+  invTree?: readonly number[];
+  /** Overrides the reference's 130 s minimum age for `slp-wait`/`paseo-wait` (`:348`). */
+  minAgeWaitS?: number;
+  /** Overrides the reference's 600 s minimum age for an agent child (`:348`). */
+  minAgeAgentS?: number;
+}
+
+/**
+ * The minimum orphan age the reference applies (slp-gc.bash:348): a wait helper
+ * is cheap to mis-identify and exits on its own, an agent child is not, so the
+ * bar is 130 s versus 600 s. Kept as two named constants so the rule and its
+ * report text can never disagree.
+ */
+export const MIN_AGE_WAIT_S = 130;
+export const MIN_AGE_AGENT_S = 600;
+
+/**
+ * The row facts the rules read — `ProcEntry` minus the diagnostics, so a test can
+ * build a case out of exactly the fields a rule consults.
+ */
+export interface DecisionEntry {
+  pid: number;
+  ppid: number;
+  class: ProcClassValue | null;
+  /** `PASEO_AGENT_ID` of the row or of its nearest agent-class ancestor. */
+  owner: string | null;
+  ownerState: OwnerState | null;
+  /** Whether the row's environment could be read at all. */
+  envRead: boolean;
+  home: HomeState;
+  /** Age in seconds; `-1` when unreadable, which fails every minimum. */
+  etime_s: number;
+  footprint_mb: number;
+  /** The basename of `argv[0]` — the comm the allowlist compares (slp-gc.bash:311, 373). */
+  exe: string;
+  /** Why this process must never be signalled, or null. */
+  protected: string | null;
+  /** `$ud`: descends from the identified daemon (slp-gc.bash:346). */
+  underDaemon: boolean;
+  /** The command line with its argv, verbatim. */
+  cmd: string;
+}
+
+/**
+ * The stale rule (slp-gc.bash:345-359).
+ *
+ * An orphaned agent child or wait helper may be signalled only when *all* of the
+ * following hold. The reference's order is preserved exactly, because each arm's
+ * `why` is shown to the operator and because the fail-closed arms must be
+ * reachable before anything weaker:
+ *
+ * 1. `agentfam` class — nothing else is ever stale-killed (`:349`).
+ * 2. not protected (`:350`).
+ * 3. identification succeeded (`:351`): with no proven Supervisor/daemon, no
+ *    claim about what is "Paseo's" is trustworthy.
+ * 4. `PASEO_HOME` is `match` (`:352`) — an `unreadable` env refuses here.
+ * 5. not daemon-owned (`:353`): a process under the daemon is stopped through the
+ *    daemon, never signalled.
+ * 6. `ppid == 1`, or the parent is not a live Paseo process (`:354`).
+ * 7. `ppid == 1`, or there is an owner (`:355`) — an orphan with no provenance
+ *    cannot be traced back to an agent.
+ * 8. `ppid == 1`, or the owner is `archived`/`missing` (`:356-357`).
+ * 9. age at or above the class's minimum (`:358`).
+ */
+export function staleDecision(entry: DecisionEntry, ctx: DecisionContext): Decision {
+  const minAge =
+    entry.class === "slp-wait" || entry.class === "paseo-wait"
+      ? (ctx.minAgeWaitS ?? MIN_AGE_WAIT_S)
+      : (ctx.minAgeAgentS ?? MIN_AGE_AGENT_S);
+
+  if (!isAgentFamily(entry.class)) {
+    return { eligible: false, why: "not an agent-child/wait class" };
+  }
+  if (entry.protected !== null) {
+    return { eligible: false, why: `protected: ${entry.protected}` };
+  }
+  if (!ctx.identity.ok) {
+    return { eligible: false, why: `identification failed: ${ctx.identity.why}` };
+  }
+  if (entry.home !== "match") {
+    return {
+      eligible: false,
+      why: `PASEO_HOME in the process env is "${entry.home}" (need match): cannot prove it belongs to this home`,
+    };
+  }
+  if (entry.underDaemon) {
+    return {
+      eligible: false,
+      why: "daemon-owned (runs under the daemon): use `paseo agent stop`; never signalled by the stale rule",
+    };
+  }
+  if (entry.ppid !== 1 && ctx.famPids.includes(entry.ppid)) {
+    return {
+      eligible: false,
+      why: `parent pid ${entry.ppid} is a live Paseo process: not orphaned`,
+    };
+  }
+  if (entry.ppid !== 1 && entry.owner === null) {
+    return { eligible: false, why: "no PASEO_AGENT_ID owner and ppid != 1" };
+  }
+  if (entry.ppid !== 1 && entry.ownerState !== "archived" && entry.ownerState !== "missing") {
+    return {
+      eligible: false,
+      why: `not orphaned: ppid ${entry.ppid} and owner ${entry.owner ?? "?"} is ${entry.ownerState ?? "?"}`,
+    };
+  }
+  if (entry.etime_s < minAge) {
+    return {
+      eligible: false,
+      why: `orphan signature but age ${entry.etime_s}s < ${minAge}s`,
+    };
+  }
+  return {
+    eligible: true,
+    why: `orphan: ${
+      entry.ppid === 1
+        ? "reparented to launchd (ppid==1)"
+        : `parent is not a Paseo process and owner ${entry.owner} is ${entry.ownerState}`
+    }, PASEO_HOME matches, age ${entry.etime_s}s >= ${minAge}s`,
+  };
+}
+
+/**
+ * The classes the memory rule may ever consider (`$memclass`, slp-gc.bash:360):
+ * the app main's helper processes and agent descendants. Everything else — the
+ * app main, the Supervisor, the daemon, the agent children themselves and the
+ * wait helpers — is refused by its own arm above.
+ */
+const MEMORY_CLASSES: ReadonlySet<ProcClassValue> = new Set<ProcClassValue>([
+  "renderer",
+  "gpu",
+  "utility",
+  "agent-descendant",
+]);
+
+/**
+ * The over-memory rule (slp-gc.bash:360-374).
+ *
+ * The reference's order again, exactly:
+ *
+ * 1. below or at the threshold — nothing to do (`:361`).
+ * 2. app main or Supervisor — report only (`:362`).
+ * 3. daemon — report only (`:363`).
+ * 4. an agent child itself — report only, use `paseo agent stop` (`:364`).
+ * 5. a class outside `$memclass` — refused (`:365`).
+ * 6. not protected (`:366`).
+ * 7. identification succeeded (`:367`).
+ * 8. a renderer/gpu/utility must be a direct child of the identified app main
+ *    (`:368-369`) — otherwise it is some other Chrome helper on the machine.
+ * 9. an `agent-descendant` must descend from the identified daemon (`:370`).
+ * 10. not an `.app` bundle's executable (`:371`).
+ * 11. not under `/System` or `/Library` (`:372`).
+ * 12. its comm is in the allowlist (`:373`).
+ *
+ * Rules 10-12 are only applied to `agent-descendant` rows, as in the reference:
+ * the helper classes' threat model is different and their comms are not the
+ * configurable allowlist.
+ */
+export function overmemDecision(entry: DecisionEntry, ctx: DecisionContext): Decision {
+  if (entry.footprint_mb <= ctx.killMb) {
+    return {
+      eligible: false,
+      why: `footprint ${entry.footprint_mb} MB <= ${ctx.killMb} MB`,
+    };
+  }
+  if (entry.class === "app-main" || entry.class === "supervisor") {
+    return { eligible: false, why: "never killed: report only" };
+  }
+  if (entry.class === "daemon") {
+    return {
+      eligible: false,
+      why: "report only: the daemon is never memory-killed (it is touched only through an explicit path)",
+    };
+  }
+  if (isAgentChild(entry.class)) {
+    return {
+      eligible: false,
+      why: "report only: an agent child itself is never memory-killed (use `paseo agent stop`)",
+    };
+  }
+  if (entry.class === null || !MEMORY_CLASSES.has(entry.class)) {
+    return { eligible: false, why: "class not allowed for a memory kill" };
+  }
+  if (entry.protected !== null) {
+    return { eligible: false, why: `protected: ${entry.protected}` };
+  }
+  if (!ctx.identity.ok) {
+    return { eligible: false, why: `identification failed: ${ctx.identity.why}` };
+  }
+
+  const helper =
+    entry.class === "renderer" || entry.class === "gpu" || entry.class === "utility";
+  if (helper && entry.ppid !== ctx.identity.appPid) {
+    return {
+      eligible: false,
+      why: `report only: helper is not a direct child of the app main (pid ${ctx.identity.appPid}) that is the Supervisor's parent`,
+    };
+  }
+
+  const descendant = entry.class === "agent-descendant";
+  if (descendant && !entry.underDaemon) {
+    return {
+      eligible: false,
+      why: `report only: not a descendant of the identified daemon (pid ${ctx.identity.daemonPid})`,
+    };
+  }
+
+  // `$p.cmd | split(" -") | .[0]`: the executable part of the command line, cut
+  // at the first argument-looking ` -` (slp-gc.bash:371-372).
+  const executable = entry.cmd.split(" -")[0] ?? "";
+  if (descendant && executable.includes(".app/")) {
+    return {
+      eligible: false,
+      why: "report only: executable inside an .app bundle (GUI app / service): never killed",
+    };
+  }
+  if (descendant && /^\/(?:System|Library)\//.test(executable)) {
+    return {
+      eligible: false,
+      why: "report only: executable under /System or /Library (system service): never killed",
+    };
+  }
+  if (descendant && !ctx.killComms.includes(entry.exe)) {
+    return {
+      eligible: false,
+      why: `report only: comm "${entry.exe}" is not in SLP_GC_KILL_COMMS`,
+    };
+  }
+
+  return {
+    eligible: true,
+    why: `footprint ${entry.footprint_mb} MB > ${ctx.killMb} MB`,
+  };
+}
