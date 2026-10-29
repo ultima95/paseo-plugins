@@ -62,6 +62,16 @@
 //    comparison must keep: the section is asserted to be an array of objects, each with a
 //    `time` key and a `timelineStats` key, and a missing, non-array or restructured section
 //    fails by path rather than passing quietly.
+// 7. **The `dirty=<n>` and `unpushed=<n>` tokens inside `retention[*].note` are collapsed,
+//    the entry shape asserted first** (`normalizeRetentionNotes`): that note is the reference's
+//    `git_state` (`slp-gc.bash:829-833`) — `dirty=<n> unpushed=<n>` for a working tree it
+//    samples — and the tree it samples is the repository this harness itself runs in, so a
+//    live `git status` reading changes between captures (`dirty=1` against `dirty=0`). The
+//    counts are a *live host reading*, used only for the report's `other-worktree` annotation
+//    and read by no rule, gate or verdict. Only each numeric value becomes `<n>`; the rest of
+//    the note — `live agent cwd:`, `never garbage`, and a non-numeric `unpushed=no-upstream`
+//    — is still compared as text, the retention row's own fields are compared as they are,
+//    and a missing, non-array or restructured `retention` entry fails by path.
 //
 // Nothing else about a row is normalised: an empty section on one side against a
 // non-empty one on the other, a different class or owner, a different `why` sentence
@@ -476,6 +486,86 @@ function normalizeDaemonCounters(
   return null;
 }
 
+/** The section of report-only retention rows, and the annotation inside each row's note. */
+const RETENTION = "retention";
+const RETENTION_NOTE = "note";
+
+/** The one value both sides become: "a live `git status` count, whose number is an instant". */
+const GIT_STATE_COUNT = "<n>";
+
+/**
+ * The two counts `git_state` (`slp-gc.bash:829-833`) prints in a retention note —
+ * `dirty=<n> unpushed=<n>` — with the value collapsed. Anchored to the token's own name so
+ * nothing but that one number is replaced: `unpushed=no-upstream` is not a count and stays
+ * as the text it is.
+ */
+const GIT_DIRTY = /\bdirty=\d+/g;
+const GIT_UNPUSHED = /\bunpushed=\d+/g;
+
+/**
+ * Collapse the live `git status` counts inside `retention[*].note` on both sides, after
+ * asserting every entry's shape.
+ *
+ * `retention` is the report-only scan of the home (`collect_retention`, `slp-gc.bash:835-872`;
+ * `collectRetention`, `server/gc/report.ts:529`), and its `other-worktree` rows carry the
+ * `git_state` of a live agent's cwd — one of which is the repository this harness itself runs
+ * in. So the note quotes a reading of a tree that mutates between captures: the 17:49:31Z tick
+ * recorded `dirty=0`, the 17:54:32Z tick `dirty=1`, and each captures a different instant.
+ * The annotation decides nothing — no rule, gate, action or verdict reads `retention` — so the
+ * counts are live host data, not port drift. What the comparison keeps is what a change could
+ * mean:
+ *
+ *  - `retention` exists on both sides and is an **array** (an absent section, or one that
+ *    became a scalar or an object, is a refusal, not a silently equal pair);
+ *  - every entry is a non-null **object** (not an array, not a scalar);
+ *  - every entry carries a **`note`** key and it is a **string** — a restructure that moves or
+ *    drops the annotation fails by path instead of being normalised away;
+ *  - only `dirty=<digits>` and `unpushed=<digits>` lose their number; the rest of the note
+ *    (`live agent cwd:`, `never garbage`, `missing`, `unknown (git status failed)`,
+ *    `unpushed=no-upstream`) is compared as it is.
+ *
+ * Every other field of every entry is untouched, and the row count is still compared by
+ * `firstDifference` (a length mismatch fails). A failure in any assertion above is returned as
+ * the path it refused, so it prints as `DIFFERS at retention[38] (…)` and the run exits 1.
+ */
+function normalizeRetentionNotes(
+  reference: Record<string, unknown>,
+  plugin: Record<string, unknown>,
+): string | null {
+  const sides: readonly (readonly [string, Record<string, unknown>])[] = [
+    ["reference", reference],
+    ["plugin", plugin],
+  ];
+  for (const [label, side] of sides) {
+    const rows = side[RETENTION];
+    if (!Array.isArray(rows)) {
+      return `${RETENTION} (${label} side is not an array: ${JSON.stringify(rows) ?? "<absent>"})`;
+    }
+    for (let index = 0; index < rows.length; index += 1) {
+      const entry = rows[index] as unknown;
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        return `${RETENTION}[${String(index)}] (${label} side is not an object)`;
+      }
+      const row = entry as Record<string, unknown>;
+      if (!Object.hasOwn(row, RETENTION_NOTE)) {
+        return `${RETENTION}[${String(index)}] (${label} side has no ${RETENTION_NOTE} key)`;
+      }
+      if (typeof row[RETENTION_NOTE] !== "string") {
+        return `${RETENTION}[${String(index)}].${RETENTION_NOTE} (${label} side is not a string)`;
+      }
+    }
+  }
+  for (const [, side] of sides) {
+    for (const entry of side[RETENTION] as readonly Record<string, unknown>[]) {
+      const note = entry[RETENTION_NOTE] as string;
+      entry[RETENTION_NOTE] = note
+        .replace(GIT_DIRTY, `dirty=${GIT_STATE_COUNT}`)
+        .replace(GIT_UNPUSHED, `unpushed=${GIT_STATE_COUNT}`);
+    }
+  }
+  return null;
+}
+
 /** The one-line log of what the set comparison skipped, e.g. `procs 1/21 vs 2/21`. */
 function ignoredLine(ignored: readonly RowCount[]): string {
   const parts = ignored.map(
@@ -596,9 +686,14 @@ function main(): void {
   reconcileReportMode(reference, plugin);
   // The daemon's live counters, replaced only once both sides' shapes are asserted to hold.
   const counters = normalizeDaemonCounters(reference, plugin);
+  // The retention note's live `git status` counts, collapsed only once the entry shape holds.
+  const notes = normalizeRetentionNotes(reference, plugin);
 
   const difference =
-    aligned.refusal ?? counters ?? firstDifference(normalize(reference), normalize(plugin));
+    aligned.refusal ??
+    counters ??
+    notes ??
+    firstDifference(normalize(reference), normalize(plugin));
   if (difference !== null) {
     console.log(`DIFFERS at ${difference}`);
     console.log(`  plugin report: ${pluginPath}`);

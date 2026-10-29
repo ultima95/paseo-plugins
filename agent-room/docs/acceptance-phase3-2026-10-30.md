@@ -94,6 +94,7 @@ rather than a decision. Everything not listed here is compared as it is.
 | `why` | `<number> MB` → `<MB>` in every `why` sentence (`WHY_MB`, `EQUIVALENT.why`) | both sides quote a `top` sample taken seconds apart (`footprint 114.0 MB` vs `115.0 MB`); only the numbers go, and the sentence, its `<=`/`>` and the eligibility it states stay compared. The threshold inside the sentence collapses with them, so the thresholds are compared separately as the `warnMb` / `killMb` numbers the report carries |
 | `tree.totalMb`, `tree.appMb`, `tree.orphanMb`, `retention[].kb`, `retention[].count`, `transcripts[].bytes`, `daemonMetrics[].time`, `daemonMetrics[].rss`, `daemonMetrics[].heapUsed` | dropped (`IGNORE`, second block) | sums and sizes *of* the dropped samples: the same instant one level up, and a sum of dropped inputs could only ever fail. What they decide stays compared — `tree.over`, `overall.*`, `totals[].n`, and the thresholds `warnMb`, `killMb`, `treeWarnMb` |
 | `daemonMetrics[].timelineStats` | replaced by `<live counter>` on both sides (`normalizeDaemonCounters`), **after asserting the section's shape**: `daemonMetrics` must be an array of objects, each carrying a `time` key and a `timelineStats` key, and each `timelineStats` an object or `null` | the daemon's own timeline counters, which grow with every agent turn: the 17:59Z re-run read `totalItems` 3748 against the 17:54:32Z report's 3745. Dropping the key by name would drop the section's shape with it, so the object is *replaced* and its shape asserted first — a missing, non-array or restructured `daemonMetrics` fails by path. Verified on three scratched copies of the 17:54:32Z report: an entry with no `timelineStats`, `daemonMetrics` set to a string, and an entry set to a string each printed `DIFFERS at daemonMetrics…`, exit 1 |
+| `retention[*].note`'s `dirty=<n>` / `unpushed=<n>` counts | each numeric value replaced by `<n>` (`dirty=1` → `dirty=<n>`, `unpushed=0` → `unpushed=<n>`; `normalizeRetentionNotes`), **after asserting the section's shape**: `retention` must be an array of objects, each carrying a `note` key, and each `note` a string. Only those two numbers are replaced; the rest of the note, `unpushed=no-upstream` and every other field of the row are compared as they are | the reference's `git_state` (`slp-gc.bash:829-833`) records `dirty=<n> unpushed=<n>` for the working tree it samples, and that tree is the repository **this harness itself runs in**, so the reading changes between captures — the 17:49:31Z tick recorded `dirty=0`, the 17:54:32Z tick `dirty=1`, and a re-read later reads a third value. The counts are used only for the report's `other-worktree` annotation; no rule, gate, action or verdict reads `retention`, so they are a live host reading and not port drift. A missing, non-array or restructured `retention` entry fails by path rather than being normalised away (four scratch-copy controls below) |
 | `procs.ledgerNext` | the port's side is dropped **only when the reference's side is exactly `null`** — asserted on every run (`REPORT_MODE_ONLY`, `reconcileReportMode`) | the reference's `report` verb never computes a ledger: `WANT_LEDGER=1` is set in exactly one place, `do_record` (`slp-gc.bash:1188`), reachable only from `tick` (`:1344`), so its `ledgerNext` is `null` on every host — while the port's file is a *tick's* report and carries the 6 rows that tick wrote (`server/gc/tick.ts:1752`). `null` here is the artifact's zero value, not "no rows" against "rows". This is the one section where the two artifacts are not the same artifact, the exemption is **asserted rather than ignored**, and it covers no rule: a reference that ever produced ledger rows keeps them and is compared normally. The ledger's own rules are pinned by `server/gc/ledger.test.ts` against the same jq, since no reference CLI emits a ledger |
 
 There is no `pct` field in either report (`grep -n "pct" server/gc/report.ts shared/gc.ts`
@@ -128,7 +129,7 @@ against the reference's 0, while the plugin reloaded at 17:44:31Z carries the ga
 reports written since (`20261029T174931Z.json`, `20261029T175431Z.json`) carry
 `procs.orphans: []`.
 
-### The one difference left: `agents.rows` order
+### `agents.rows` order: a non-decision, compared sorted
 
 The two files list the same 300 agent rows, by `id`, in a different order: the reference
 walks the record directory with `find` and takes the filesystem's order
@@ -139,10 +140,10 @@ The harness sorts both sides by `id` (`ORDER_INSENSITIVE`), because order is not
 decision: every row, every field of it and the row count are still compared, and nothing is
 dropped or matched up.
 
-### Repeatability: the daemon counters no longer move the verdict
+### Repeatability: counters and git-state notes no longer move the verdict
 
 `daemonMetrics[].timelineStats` — the counters behind the 17:59Z re-run's
-`daemonMetrics[1].timelineStats.totalItems (3748 vs 3745)` — is now **normalised on both
+`daemonMetrics[1].timelineStats.totalItems (3748 vs 3745)` — is **normalised on both
 sides, with the section's shape asserted first** (`normalizeDaemonCounters`,
 `scripts/gc-equivalence.mts`): `daemonMetrics` must be an array of objects, every entry
 carrying a `time` key and a `timelineStats` key, and every `timelineStats` an object or
@@ -164,8 +165,8 @@ DIFFERS at retention[38].note ("live agent cwd: dirty=1 unpushed=no-upstream; ne
                            vs "live agent cwd: dirty=0 unpushed=no-upstream; never garbage")  exit=1
 ```
 
-The daemon counters are gone from both runs: `20261029T175431Z.json` is `EQUIVALENT`, and
-`20261029T174931Z.json` gets past `daemonMetrics` and names `retention[38].note` instead. That
+The daemon counters are gone from both runs: `20261029T175431Z.json` was `EQUIVALENT`, and
+`20261029T174931Z.json` got past `daemonMetrics` and named `retention[38].note` instead. That
 field is **a live `git status` reading of `/Users/ultima/Workspace/paseo-plugins`**, not a
 decision: `git_state` (`slp-gc.bash:829-833`, port `gitState`) counts the non-empty lines of
 `git -C <cwd> status --porcelain`, and the workspace genuinely changed between the two ticks —
@@ -176,25 +177,62 @@ stored reports *recorded different live states*, and a live re-read can match on
 at a time: with a clean tree the same `note` makes the older report `EQUIVALENT` and the
 newer one `DIFFERS`. It is report-only — the row is `other-worktree`, `count` 1, its own note
 says "never garbage", and no rule, gate or verdict reads `retention` — so it is a live host
-reading and not port drift. **It is not normalised**: this task's remit was the daemon
-counters, so the field is compared as a value and the residual difference is recorded here
-rather than dropped, which is why the older report does *not* print `EQUIVALENT` and the
-two-report claim is not made. Every other section (`procs`, `agents`, `schedules`, `index`,
-`garbage`, `transcripts`, and `daemonMetrics`' row shape) agreed on both runs.
+reading and not port drift. **It was not normalised in that task** — the remit was the daemon
+counters — so the field was compared as a value and the residual difference is recorded here
+rather than dropped. It is normalised now, by the table's `retention[*].note` row.
 
-Both commands were run a second time with this fix committed (clean tree), which is the 17:49:31Z
-tick's state — the pair simply trades places on that one live field:
+### Final state: what the two re-runs actually show
+
+With the retention-note normalisation in place, both stored reports were re-run (one bash
+reference capture per run, throwaway `SLP_GC_STATE_DIR`, `.last-report` untouched, no plugin
+reload), newest and one older. The pair was run twice — before and after the commit — and both
+rounds name the same field:
 
 ```
-20261029T174931Z.json                                                                       exit=0
-EQUIVALENT (… 20261029T174931Z.json, written 2026-10-29T17:49:32.145Z)
-20261029T175431Z.json                                                                       exit=1
-DIFFERS at retention[38].note ("live agent cwd: dirty=0 …" vs "live agent cwd: dirty=1 …")
+$ … scripts/gc-equivalence.mts …/reports/20261029T174931Z.json
+DIFFERS at agents.live (4 vs 6)                                                             exit=1
+$ … scripts/gc-equivalence.mts …/reports/20261029T175431Z.json
+DIFFERS at agents.live (4 vs 6)                                                             exit=1
 ```
 
-So the daemon counters are settled — no run of either report has named `daemonMetrics` since —
-and the one field that still makes the verdict depend on when it is taken is a live `git status`
-reading outside the daemon counters this task covered.
+(The earlier round of the same two commands printed `agents.live (5 vs 6)`; the recorded figure
+is the committed harness's runs.)
+
+Neither report prints `EQUIVALENT`, and the difference is **not** the retention note any more:
+both runs stop earlier, at `agents.live`. That is a population count the comparison keeps as a
+value, and it moved for a live reason: both stored reports recorded `live: 6`,
+`closedUnarchived: 15` at their ticks, while the live re-reads counted `live: 5` (`16`) and then
+`live: 4` (`17`) minutes apart — agents were closed or archived between the capture and the
+re-reads, and the count is still moving. The `agents` rows are the same 300 record files
+(sorted by `id` on both sides), but those records' status changes are a real difference between
+the snapshot and the machine.
+**It is not normalised and was not normalised further**: a count the rules read is a decision,
+not a live sample, so the run stops there. Because `agents` precedes `retention` in the
+report's key order, these runs do not reach the retention field at all — so this record does
+**not** claim that the retention note is the last agreed field, only that it is no longer a
+difference the harness can name.
+
+What the same runs do show is that nothing else was relaxed. Four scratch copies of
+`20261029T175431Z.json` (the stored file untouched) each failed by path, exit 1:
+
+| scratch copy | what the harness printed |
+| --- | --- |
+| `retention[38]` with its `note` key removed | `DIFFERS at retention[38] (plugin side has no note key)` |
+| `retention[38]` set to a string | `DIFFERS at retention[38] (plugin side is not an object)` |
+| `retention` set to `{"0":"x"}` | `DIFFERS at retention (plugin side is not an array: {"0":"x"})` |
+| `retention[38].note` set to the number `7` | `DIFFERS at retention[38].note (plugin side is not a string)` |
+
+And the note's own text is still compared: because `agents.live` stops the harness before
+`retention`, the shipped `normalizeRetentionNotes` was exercised directly (the source text
+imported unchanged, the `main()` call stripped): `dirty=1` vs `dirty=0` and `dirty=3 unpushed=2`
+vs `dirty=10 unpushed=7` collapse to the same note and compare equal, while
+`unpushed=0` vs `unpushed=no-upstream`, a reworded `; never garbage` tail, and a reworded
+`live agent cwd:` prefix each still produce `DIFFERS at retention[0].note (…)`. So only the two
+numbers move, and only `dirty`/`unpushed` tokens that carry digits.
+
+The daemon counters are settled — no run has named `daemonMetrics` since — and the retention
+note is now normalised; the field that still moves the verdict on a stored report is
+`agents.live`, a live population count, which this record leaves compared as a decision.
 
 ## 4. Protected classes — the tests that pin them
 
