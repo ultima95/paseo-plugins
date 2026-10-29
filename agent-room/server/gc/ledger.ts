@@ -27,7 +27,7 @@
 // 3. The rows are proof, so the predicates are the reference's verbatim — the
 //    two timestamp windows included. A row that is merely plausible is dropped.
 
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, type Stats } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { chmod, lstat, open, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -188,18 +188,41 @@ function uidMode(uid: number, mode: number): string {
   return `${uid}:${mode.toString(8)}`;
 }
 
+/**
+ * Test seams. Every field defaults to the real syscall, so production behaviour
+ * is unchanged; they exist so the two ownership layers — the pre-open `lstat`
+ * and the post-open descriptor — can each be driven independently, which no
+ * single real file can do (its uid cannot change inside a test).
+ */
 export interface ReadLedgerOptions {
   /**
-   * The uid the file and its directory must belong to. Defaults to
-   * `process.getuid()`; the seam exists so a test can prove the ownership check
-   * without a second account.
+   * The uid the **file** must belong to. Defaults to `process.getuid()`; the
+   * seam exists so a test can prove the file check without a second account.
    */
   ownerUid?: number;
+  /**
+   * The uid the **state dir** must belong to. Defaults to `ownerUid`, so the
+   * production answer is unchanged; setting it lets a test exercise the dir
+   * gate without the file gate firing first.
+   */
+  stateDirUid?: number;
+  /**
+   * Test seam: applied to the pre-open `lstat` of the ledger. Stands in for a
+   * file written by another account, so the pre-open ownership arm can fire
+   * while the descriptor's (real) stat still matches.
+   */
+  statBeforeOpen?: (info: Stats) => Stats;
+  /**
+   * Test seam: applied to the descriptor's `stat`. Stands in for a file that
+   * changed between the `lstat` and the open, so the post-open re-check can be
+   * shown to fire on its own.
+   */
+  statAfterOpen?: (info: Stats) => Stats;
 }
 
-/** The uid both the ledger and its state dir are expected to belong to, or `null` when unknowable. */
-function resolveUid(options: ReadLedgerOptions): number | null {
-  if (options.ownerUid !== undefined) return options.ownerUid;
+/** A uid an ownership gate compares against, or `null` when it is unknowable. */
+function resolveUid(override: number | undefined): number | null {
+  if (override !== undefined) return override;
   const getuid = process.getuid;
   if (typeof getuid !== "function") return null;
   try {
@@ -237,9 +260,13 @@ export async function readLedger(
   path: string,
   options: ReadLedgerOptions = {},
 ): Promise<{ rows: LedgerRow[]; note: string | null }> {
-  const uid = resolveUid(options);
+  // Two independent ownership gates: the state dir (`uid:0700`) and the file
+  // (`uid:0600`). `stateDirUid` defaults to the file's uid, which is the
+  // reference's single `<owner>` for both.
+  const fileUid = resolveUid(options.ownerUid);
+  const dirUid = options.stateDirUid ?? fileUid;
 
-  let before: Awaited<ReturnType<typeof lstat>>;
+  let before: Stats;
   try {
     before = await lstat(path);
   } catch (error) {
@@ -247,28 +274,30 @@ export async function readLedger(
     if (code === "ENOENT" || code === "ENOTDIR") return { rows: [], note: null };
     return refuse(`lineage.tsv could not be inspected (${code ?? String(error)}): ignored`);
   }
+  if (options.statBeforeOpen) before = options.statBeforeOpen(before);
 
   if (before.isSymbolicLink() || !before.isFile()) {
     return refuse("lineage.tsv is not a regular file (symlink or directory): ignored");
   }
 
-  if (uid !== null) {
-    let dir: Awaited<ReturnType<typeof lstat>>;
+  if (dirUid !== null) {
+    let dir: Stats;
     try {
       dir = await lstat(dirname(path));
     } catch {
       return refuse(`state dir is not readable: ledger ignored`);
     }
-    if (dir.uid !== uid || (dir.mode & 0o777) !== 0o700) {
+    if (dir.uid !== dirUid || (dir.mode & 0o777) !== 0o700) {
       return refuse(
-        `state dir is not owned by uid ${uid} with mode 0700 (is ${uidMode(dir.uid, dir.mode & 0o777)}): ledger ignored`,
+        `state dir is not owned by uid ${dirUid} with mode 0700 (is ${uidMode(dir.uid, dir.mode & 0o777)}): ledger ignored`,
       );
     }
-    if (before.uid !== uid || (before.mode & 0o777) !== 0o600) {
-      return refuse(
-        `lineage.tsv is not owned by uid ${uid} with mode 0600 (is ${uidMode(before.uid, before.mode & 0o777)}): ledger ignored`,
-      );
-    }
+  }
+
+  if (fileUid !== null && (before.uid !== fileUid || (before.mode & 0o777) !== 0o600)) {
+    return refuse(
+      `lineage.tsv is not owned by uid ${fileUid} with mode 0600 (is ${uidMode(before.uid, before.mode & 0o777)}): ledger ignored`,
+    );
   }
 
   if (!Number.isSafeInteger(before.size) || before.size > LEDGER_MAX_BYTES) {
@@ -281,13 +310,14 @@ export async function readLedger(
   try {
     const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     try {
-      const info = await handle.stat();
+      const opened = await handle.stat();
+      const info = options.statAfterOpen ? options.statAfterOpen(opened) : opened;
       if (!info.isFile()) {
         return refuse("lineage.tsv is not a regular file (symlink or directory): ignored");
       }
-      if (uid !== null && (info.uid !== uid || (info.mode & 0o777) !== 0o600)) {
+      if (fileUid !== null && (info.uid !== fileUid || (info.mode & 0o777) !== 0o600)) {
         return refuse(
-          `lineage.tsv is not owned by uid ${uid} with mode 0600 (is ${uidMode(info.uid, info.mode & 0o777)}): ledger ignored`,
+          `lineage.tsv is not owned by uid ${fileUid} with mode 0600 (is ${uidMode(info.uid, info.mode & 0o777)}): ledger ignored`,
         );
       }
       if (info.size > LEDGER_MAX_BYTES) return refuse("lineage.tsv is too large: ignored");
@@ -363,18 +393,23 @@ export async function writeLedger(
   }
 
   const dir = dirname(path);
-  const temp = join(dir, `.lineage.${randomBytes(6).toString("hex")}`);
+  // Inside the `try`: `randomBytes` is the one call here that could throw
+  // before any file exists, and the never-throws contract has no exception.
+  let temp: string | null = null;
   try {
+    temp = join(dir, `.lineage.${randomBytes(6).toString("hex")}`);
     await writeFile(temp, serializeLedger(rows), { flag: "wx", mode: 0o600 });
     await chmod(temp, 0o600);
     await rename(temp, path);
     return { ok: true, note: null };
   } catch (error) {
     // The temp file must not accumulate in the state dir.
-    try {
-      await unlink(temp);
-    } catch {
-      // Already gone, or never created.
+    if (temp !== null) {
+      try {
+        await unlink(temp);
+      } catch {
+        // Already gone, or never created.
+      }
     }
     const code = (error as NodeJS.ErrnoException).code;
     return { ok: false, note: `lineage.tsv could not be written (${code ?? String(error)})` };

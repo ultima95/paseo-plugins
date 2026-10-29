@@ -6,6 +6,7 @@
 // or the reference tool.
 import {
   chmodSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -13,11 +14,12 @@ import {
   rmSync,
   symlinkSync,
   writeFileSync,
+  type Stats,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   LEDGER_CAP,
@@ -217,6 +219,16 @@ describe("parseLedgerTsv", () => {
   });
 });
 
+// --- the ledger's identity ----------------------------------------------------
+
+describe("ledgerKey", () => {
+  it("is exactly `pid|lstart`, the separator the merge and Task 7 both key on", () => {
+    // slp-gc.bash:462 — `$pid + "|" + $lstart`. Pinned literally so the
+    // downstream user of the key cannot drift from the writer of it.
+    expect(ledgerKey(42, LSTART)).toBe("42|Mon Oct 27 10:00:00 2026");
+  });
+});
+
 // --- load: the refusals of slp-gc.bash:703-715 --------------------------------
 
 const dirs: string[] = [];
@@ -241,6 +253,19 @@ function writeStateFile(dir: string, text: string, mode = 0o600, name = "lineage
   writeFileSync(file, text);
   chmodSync(file, mode);
   return file;
+}
+
+/** This account's uid, and one it is definitely not — the identity every ownership case is framed against. */
+const SELF_UID = typeof process.getuid === "function" ? process.getuid() : 0;
+const OTHER_UID = SELF_UID + 1;
+
+/**
+ * A copy of a `Stats` with one field changed. The prototype is kept, so the
+ * `isFile()` / `isSymbolicLink()` predicates still work on the copy — the stat
+ * seams only need to move a uid or a mode, never the file type.
+ */
+function restat(info: Stats, patch: Partial<Pick<Stats, "uid" | "mode">>): Stats {
+  return Object.assign(Object.create(Object.getPrototypeOf(info)) as Stats, info, patch);
 }
 
 describe("readLedger", () => {
@@ -274,6 +299,40 @@ describe("readLedger", () => {
     expect(readFileSync(outside, "utf8")).toBe(tsv(base));
   });
 
+  it("refuses a symlink with a relative target in the same state dir", async () => {
+    // A relative target is resolved against the link's own directory, so it
+    // reaches the target without ever leaving the state dir: the symlink gate
+    // still has to be what refuses it, not the dir or owner gate.
+    const dir = stateDir();
+    const target = writeStateFile(dir, tsv(base), 0o600, "real.tsv");
+    const link = join(dir, "lineage.tsv");
+    symlinkSync("real.tsv", link);
+
+    const result = await readLedger(link);
+    expect(result.rows).toEqual([]);
+    expect(result.note).toMatch(/not a regular file \(symlink or directory\)/);
+    expect(readFileSync(target, "utf8")).toBe(tsv(base));
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+  });
+
+  it("refuses a symlink that climbs out through its parent directory", async () => {
+    // `../real.tsv`: the link's dir passes the 0700 gate and the target is a
+    // perfectly good 0600 file — only the symlink gate stands between them.
+    const outer = stateDir();
+    const inner = join(outer, "state");
+    mkdirSync(inner, { mode: 0o700 });
+    chmodSync(inner, 0o700);
+    const target = writeStateFile(outer, tsv(base), 0o600, "real.tsv");
+    const link = join(inner, "lineage.tsv");
+    symlinkSync(join("..", "real.tsv"), link);
+
+    const result = await readLedger(link);
+    expect(result.rows).toEqual([]);
+    expect(result.note).toMatch(/not a regular file/);
+    expect(readFileSync(target, "utf8")).toBe(tsv(base));
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+  });
+
   it("refuses a directory where the file belongs", async () => {
     const dir = stateDir();
     mkdirSync(join(dir, "lineage.tsv"));
@@ -291,15 +350,77 @@ describe("readLedger", () => {
     expect(result.note).toMatch(/\(is \d+:\d+\)/);
   });
 
-  it("refuses a file with another owner, even at mode 0600", async () => {
+  // --- the two ownership layers, each driven on its own --------------------
+  //
+  // The reference gates the state dir (`uid:0700`, slp-gc.bash:708) *and* the
+  // file (`uid:0600`, :709), and this port re-applies the file gate through the
+  // descriptor after the open. A real file cannot change its uid inside a test,
+  // so each layer gets a seam: `stateDirUid` for the dir, `statBeforeOpen` for
+  // the pre-open file check, `statAfterOpen` for the descriptor. One test per
+  // layer, each asserting that the note it produces is that layer's.
+
+  it("refuses a state dir owned by another uid, before it looks at the file", async () => {
+    // slp-gc.bash:708 — the dir gate is the first ownership gate to run.
     const dir = stateDir();
     const file = writeStateFile(dir, tsv(base), 0o600);
-    // The uid seam stands in for a file written by another account: there is no
-    // way to chown inside a test, and the check must still be provably live.
-    const otherUid = typeof process.getuid === "function" ? process.getuid() + 1 : 4242;
-    const result = await readLedger(file, { ownerUid: otherUid });
+    const result = await readLedger(file, { stateDirUid: OTHER_UID });
     expect(result.rows).toEqual([]);
-    expect(result.note).toContain(`uid ${otherUid}`);
+    expect(result.note).toContain(`state dir is not owned by uid ${OTHER_UID}`);
+    // Not the file arm: this is the dir refusing, on its own.
+    expect(result.note).not.toMatch(/^lineage\.tsv is not owned/);
+  });
+
+  it("refuses a file whose pre-open stat reports another uid: the file arm alone", async () => {
+    // slp-gc.bash:709. The dir gate passes (real uid, 0700) and the descriptor's
+    // own stat would pass too — only the pre-open file gate can refuse this.
+    const dir = stateDir();
+    const file = writeStateFile(dir, tsv(base), 0o600);
+    const result = await readLedger(file, {
+      statBeforeOpen: (info) => restat(info, { uid: OTHER_UID }),
+    });
+    expect(result.rows).toEqual([]);
+    expect(result.note).toMatch(/^lineage\.tsv is not owned by uid /);
+    expect(result.note).toContain(`uid ${SELF_UID}`);
+    expect(result.note).toContain(`(is ${OTHER_UID}:600)`);
+  });
+
+  it("refuses at the descriptor when the file's mode changes after the pre-open stat", async () => {
+    // The race the re-check exists for: the path was 0600 at `lstat`, the open
+    // descriptor is not. Without the second check the bytes would be read.
+    const dir = stateDir();
+    const file = writeStateFile(dir, tsv(base), 0o600);
+    const result = await readLedger(file, {
+      statAfterOpen: (info) => restat(info, { mode: 0o100644 }),
+    });
+    expect(result.rows).toEqual([]);
+    expect(result.note).toMatch(/^lineage\.tsv is not owned by uid /);
+    expect(result.note).toContain(`(is ${SELF_UID}:644)`);
+  });
+
+  it("refuses at the descriptor when the descriptor's uid is another account", async () => {
+    const dir = stateDir();
+    const file = writeStateFile(dir, tsv(base), 0o600);
+    const result = await readLedger(file, {
+      statAfterOpen: (info) => restat(info, { uid: OTHER_UID }),
+    });
+    expect(result.rows).toEqual([]);
+    expect(result.note).toMatch(/^lineage\.tsv is not owned by uid /);
+    expect(result.note).toContain(`uid ${SELF_UID}`);
+    expect(result.note).toContain(`(is ${OTHER_UID}:600)`);
+  });
+
+  it("refuses a file whose owner is another uid when both gates name that uid", async () => {
+    // The whole-reference shape: one `<owner>` for the dir and the file. The
+    // file arm answers (it runs after the dir, which passes at 0700/this uid).
+    const dir = stateDir();
+    const file = writeStateFile(dir, tsv(base), 0o600);
+    const result = await readLedger(file, {
+      ownerUid: OTHER_UID,
+      stateDirUid: SELF_UID,
+    });
+    expect(result.rows).toEqual([]);
+    expect(result.note).toMatch(/^lineage\.tsv is not owned by uid /);
+    expect(result.note).toContain(`uid ${OTHER_UID}`);
   });
 
   it("refuses a file over 4 MB without reading it", async () => {
@@ -380,6 +501,33 @@ describe("writeLedger", () => {
     const parsed = parseLedgerTsv(readFileSync(file, "utf8"));
     expect(parsed).toHaveLength(1);
     expect(parsed[0]?.exe).toBe("/usr/bin/no de");
+  });
+
+  it("never throws when the temp name cannot be generated", async () => {
+    // `randomBytes` is the one call before any file exists; the never-throws
+    // contract has to cover it too, so it lives inside the `try`.
+    vi.resetModules();
+    vi.doMock("node:crypto", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("node:crypto")>();
+      return {
+        ...actual,
+        randomBytes: () => {
+          throw new Error("no entropy");
+        },
+      };
+    });
+    try {
+      const fresh = await import("./ledger");
+      const dir = stateDir();
+      const result = await fresh.writeLedger(join(dir, "lineage.tsv"), [base]);
+      expect(result.ok).toBe(false);
+      expect(result.note).toMatch(/no entropy/);
+      // Nothing was created, and nothing was left behind.
+      expect(readdirSync(dir)).toEqual([]);
+    } finally {
+      vi.doUnmock("node:crypto");
+      vi.resetModules();
+    }
   });
 });
 
