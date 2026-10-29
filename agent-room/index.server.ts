@@ -8,9 +8,21 @@ import type {
   PluginServerContext,
 } from "@getpaseo/plugin/server";
 
-import { adoptRoomRpc, getRoomRpc, launchRoomRpc, listRoomsRpc } from "./shared/rpc";
+import { gcSettingsDefinition, type GcSettings } from "./shared/gc";
+import { adoptRoomRpc, gcRunRpc, gcStatusRpc, getRoomRpc, launchRoomRpc, listRoomsRpc } from "./shared/rpc";
 import { parseSeatMarker, roomSettings } from "./shared/seats";
 import { createRoomEvents, lookupTitle } from "./server/events";
+import { createGcSettingsReader } from "./server/gc/settings";
+import { startScheduler, GC_INTERVAL_MS } from "./server/gc/scheduler";
+import {
+  buildStatus,
+  emptyStatus,
+  mergeGcSettings,
+  resolveGcConfPath,
+  runTick,
+  type TickDeps,
+  type TickResult,
+} from "./server/gc/tick";
 import { createHandlers } from "./server/handlers";
 import { applySeat } from "./server/inject";
 import { consoleLogger } from "./server/logger";
@@ -20,32 +32,173 @@ import { createRoomStore, resolveDataDir } from "./server/store";
 /** The plugin's single store file, inside `resolveDataDir(...)`. */
 const ROOMS_FILE = "rooms.json";
 
+/** The GC's own state dir, a sibling of `rooms.json` inside the plugin's data dir. */
+const GC_DIR = "gc";
+
+/**
+ * How long one GC settings read may take before the tick uses the imported
+ * baseline. A stalled settings read must not hold the scheduler's mutex — the
+ * next tick would be dropped while this one waits forever.
+ */
+const GC_SETTINGS_TIMEOUT_MS = 2_000;
+
 const log = consoleLogger;
+
+/**
+ * Whether the one-time state migration has run in this process. Module-level on
+ * purpose: the plugin loads once per daemon, and a reload creates a new module
+ * instance, which is exactly when the copy should be re-attempted (it is
+ * idempotent — an existing destination is skipped).
+ */
+let gcMigrated = false;
+
+/** Exposed for tests: the migrated flag is process state, and a test must reset it. */
+export function __resetGcMigrated(): void {
+  gcMigrated = false;
+}
 
 function reason(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
 }
 
+/** Resolve with `promise`, or with `fallback` after `timeoutMs`. Never rejects. */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), timeoutMs);
+    timer.unref?.();
+    void promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(fallback);
+      },
+    );
+  });
+}
+
 /**
- * Seat injection and room lifecycle.
+ * The GC seams a test may replace: everything a tick would otherwise read from
+ * the machine. Production passes nothing and gets the real `spawnSync` exec, the
+ * real clock and `process.kill`.
+ */
+export interface GcOverrides {
+  exec?: TickDeps["exec"];
+  legacyStateDir?: TickDeps["legacyStateDir"];
+  now?: TickDeps["now"];
+  signal?: TickDeps["signal"];
+  deleteAgent?: TickDeps["deleteAgent"];
+  deleteSchedule?: TickDeps["deleteSchedule"];
+  notify?: TickDeps["notify"];
+  log?: TickDeps["log"];
+}
+
+/**
+ * Seat injection and room lifecycle, plus the GC.
  *
  * Every agent creation passes through `applySeat`, which only touches agents
  * whose title carries a `[room:…]` marker; everything else is returned unchanged
  * by returning `undefined`. The lifecycle hooks record room membership, enforce
  * the guard and keep the feed, and every one of them swallows its own errors:
  * a broken room must never break an agent.
+ *
+ * The GC is a second, independent contribution to the same plugin: a 60 s
+ * scheduler, two RPCs and its own settings document. Nothing about it may block
+ * the room: its first tick is an interval away, its settings read is lazy and
+ * time-boxed, and an unreadable conf or an invalid settings document falls back
+ * to the reference's defaults instead of failing the load.
  */
-export default function contribute(server: PluginServerContext): () => Promise<void> {
+export default function contribute(
+  server: PluginServerContext,
+  gcOverrides: GcOverrides = {},
+): () => Promise<void> {
   const settings = server.registerSettings(roomSettings);
   const readSettings = createSettingsReader(settings, log);
 
+  const dataDir = resolveDataDir(process.env, os.homedir());
   const store = createRoomStore({
-    file: join(resolveDataDir(process.env, os.homedir()), ROOMS_FILE),
+    file: join(dataDir, ROOMS_FILE),
     now: () => Date.now(),
     newId: () => randomUUID(),
     log,
   });
+
+  // ── GC wiring ───────────────────────────────────────────────────────────────
+  //
+  // Settings precedence, in this direction and no other: the reference's
+  // `slp-gc.conf` is imported **once** per process (a memoised read that never
+  // rejects, `server/gc/settings.ts`) and is the baseline; the plugin's `gc`
+  // settings document is layered *over* it. Registration is synchronous and the
+  // read is lazy, so neither can delay a room hook.
+  const gcDoc = server.registerSettings(gcSettingsDefinition);
+  const confPath = resolveGcConfPath(process.env, os.homedir());
+  const gcBaseline = createGcSettingsReader({ confPath, log });
+  let gcFallbackLogged = false;
+
+  /**
+   * The settings a tick acts on: the imported baseline with the plugin document
+   * merged over it. A document that will not parse, or a read that stalls or
+   * throws, yields the baseline — logged once per plugin load, never thrown.
+   */
+  const readGcSettings = async (): Promise<GcSettings> => {
+    const baseline = await gcBaseline;
+    let document: unknown;
+    try {
+      const state = await withTimeout(
+        gcDoc.read(),
+        GC_SETTINGS_TIMEOUT_MS,
+        { status: "invalid" as const, revision: "0", error: "settings read timed out" },
+      );
+      if (state.status !== "ready") {
+        if (!gcFallbackLogged) {
+          gcFallbackLogged = true;
+          log.warn("gc settings invalid; using the imported baseline", { error: state.error });
+        }
+        return { ...baseline, killComms: [...baseline.killComms] };
+      }
+      document = state.values;
+    } catch (error) {
+      if (!gcFallbackLogged) {
+        gcFallbackLogged = true;
+        log.warn("gc settings unreadable; using the imported baseline", { error: reason(error) });
+      }
+      return { ...baseline, killComms: [...baseline.killComms] };
+    }
+    return mergeGcSettings(baseline, document);
+  };
+
+  /** One tick, with the last result kept for `gc.status`. Never throws. */
+  let lastTick: TickResult | null = null;
+  const runGc = async (options: { reportOnly?: boolean } = {}): Promise<TickResult> => {
+    try {
+      const result = await runTick(
+        {
+          stateDir: join(dataDir, GC_DIR),
+          readSettings: readGcSettings,
+          home: os.homedir(),
+          env: process.env,
+          log,
+          // `migrated` flips inside `runTick`, so the copy happens once per
+          // process: the first tick, whatever started it.
+          migrated: gcMigrated,
+          ...gcOverrides,
+        },
+        options,
+      );
+      gcMigrated = true;
+      lastTick = result;
+      return result;
+    } catch (error) {
+      // `runTick` is written not to throw; this is the belt for a bug in it.
+      log.error("gc tick failed", { error: reason(error) });
+      throw error;
+    }
+  };
+
+  // ── room wiring ─────────────────────────────────────────────────────────────
 
   // Lifecycle hooks fire as soon as the plugin loads, so no handler may touch the
   // store before the file is in memory. A failed load is logged and still lets
@@ -127,8 +280,37 @@ export default function contribute(server: PluginServerContext): () => Promise<v
     return handlers.get(input);
   });
 
+  // The GC screen's two contracts. `gc.status` answers the last tick's captured
+  // result (or an empty status carrying the settings the next tick would use), and
+  // `gc.run` runs exactly one tick: `report` with the acting toggles forced off,
+  // `act` with whatever the settings enable.
+  server.handle(gcStatusRpc, async () => {
+    if (lastTick !== null) return buildStatus(lastTick);
+    const settingsNow = await readGcSettings();
+    return emptyStatus(settingsNow);
+  });
+
+  server.handle(gcRunRpc, async (input) => {
+    const result = await runGc({ reportOnly: input.mode === "report" });
+    return result.acted;
+  });
+
+  // The scheduler is started last, after every handler is registered, and its
+  // first tick is one interval away — a room hook that fires during the load
+  // never races it.
+  const stopGc = startScheduler({
+    intervalMs: GC_INTERVAL_MS,
+    runTick: () => runGc(),
+    onSkip: () => log.warn("gc tick skipped: the previous tick is still running"),
+  });
+
   return async () => {
+    // The scheduler goes first: a tick that fired during the cleanup would write
+    // into a state dir we are about to flush past, and the room store's flush must
+    // not wait on a `ps` sample.
+    stopGc();
     await loaded;
     await store.flush();
   };
 }
+

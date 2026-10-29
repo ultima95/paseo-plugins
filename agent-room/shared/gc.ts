@@ -5,6 +5,7 @@
 // (slp-gc.bash:78-97), `read_config` (slp-gc.bash:1240-1269) and the env block in
 // `usage` (slp-gc.bash:127-133). The reference is bash; this file is the single
 // place where those names, ranges and defaults are written down for the port.
+import { defineSettings } from "@getpaseo/plugin";
 import { z } from "zod";
 
 /**
@@ -80,3 +81,95 @@ export const gcSettings = z.object({
 });
 
 export type GcSettings = z.infer<typeof gcSettings>;
+
+/**
+ * The plugin's `gc` settings document — the second half of the precedence rule
+ * the port runs on: the one-time `slp-gc.conf` import (`server/gc/settings.ts`,
+ * `DEFAULT_GC_SETTINGS`) is the baseline, and this document overrides only the
+ * knobs the user actually saved.
+ *
+ * Every field is optional on purpose. Two behaviours follow from it and both
+ * are the designed ones:
+ *
+ * - a key the document does not carry keeps the imported baseline value, so the
+ *   defaults stay in exactly one place (`DEFAULT_GC_SETTINGS`) instead of being
+ *   restated here as Zod defaults that could drift from it;
+ * - a document that is invalid as a whole — a string where `memWarnMb` belongs,
+ *   an unknown key with the wrong type — is rejected by `registerSettings` and
+ *   the reader falls back to the baseline with one log line. A typo therefore
+ *   never turns a rule off silently and never blocks the plugin from loading.
+ *
+ * The cross-field clamp (`memKillMb >= memWarnMb`) is *not* expressed here: it
+ * is applied by whoever merges the document over the baseline, which is
+ * `mergeGcSettings` in `server/gc/tick.ts`. A validation error there would make
+ * the whole document invalid and lose every other override with it.
+ */
+export const gcSettingsDocumentSchema = gcSettings.partial();
+
+export type GcSettingsDocument = z.infer<typeof gcSettingsDocumentSchema>;
+
+/** The `registerSettings` document the plugin loads (id `gc`). */
+export const gcSettingsDefinition = defineSettings({
+  id: "gc",
+  scope: "host",
+  version: 1,
+  schema: gcSettingsDocumentSchema,
+});
+
+/**
+ * One `act` row (`ActionResult` in `server/gc/apply.ts`): what a tick considered,
+ * whether anything happened, and why not. `gc.run` answers an array of these.
+ */
+export const gcActionSchema = z.object({
+  kind: z.enum(["agent", "schedule", "kill", "refuse"]),
+  /** The record's id (deletes) or the pid as a string (kills); `-` for a refusal row. */
+  id: z.string(),
+  acted: z.boolean(),
+  reason: z.string(),
+  /** The stable refusal key (`<rule>: <text>`), `null` when `acted` is true. */
+  refusedBy: z.string().nullable(),
+  /** Set on a kill row: the pid that was signalled. */
+  pid: z.number().optional(),
+  /** Set on a kill row: the class that was signalled. */
+  pidClass: z.string().optional(),
+});
+
+export type GcAction = z.infer<typeof gcActionSchema>;
+
+/**
+ * The GC screen's one read model: identification, when the last tick ran, when
+ * the next report is due, the settings the tick acted on, the process rows it
+ * judged and every record candidate it considered (refused ones included, so the
+ * screen can show *why* something was not reclaimed).
+ */
+export const gcStatusSchema = z.object({
+  ident: z.object({ ok: z.boolean(), why: z.string() }),
+  lastTickAt: z.string().nullable(),
+  nextReportAt: z.string().nullable(),
+  settings: z.object({
+    apply: z.boolean(),
+    killStale: z.boolean(),
+    killMemory: z.boolean(),
+    memWarnMb: z.number(),
+    memKillMb: z.number(),
+  }),
+  procs: z.array(
+    z.object({
+      pid: z.number(),
+      class: z.string().nullable(),
+      owner: z.string().nullable(),
+      footprintMb: z.number(),
+      warn: z.boolean(),
+    }),
+  ),
+  candidates: z.array(
+    z.object({
+      kind: z.enum(["agent", "schedule"]),
+      id: z.string(),
+      rule: z.string().nullable(),
+      refusedBy: z.string().nullable(),
+    }),
+  ),
+});
+
+export type GcStatus = z.infer<typeof gcStatusSchema>;

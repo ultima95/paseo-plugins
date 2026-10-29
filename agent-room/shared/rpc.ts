@@ -1,6 +1,7 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 
+import { gcActionSchema, gcStatusSchema } from "./gc";
 import { feedEventSchema, roomRecordSchema, seatRecordSchema } from "./room";
 
 const nonEmptyText = z.string().min(1);
@@ -62,4 +63,29 @@ export const getRoomRpc = defineRpc({
     }),
     z.object({ missing: z.literal(true) }),
   ]),
+});
+
+/**
+ * The GC screen's read model: the last tick's identification verdict, when it
+ * ran, when the next report is due, the settings it acted on, and the process and
+ * record candidates it judged. Served from the last tick's captured result, so it
+ * never runs a `ps` sample of its own; before the first tick it answers an empty
+ * status carrying the settings the next tick would use.
+ */
+export const gcStatusRpc = defineRpc({
+  name: "gc.status",
+  input: z.object({}),
+  output: gcStatusSchema,
+});
+
+/**
+ * Run one tick now: `report` writes the sample and (when due) the report without
+ * acting, `act` runs the full tick with the rules the settings enable. Neither
+ * mode overrides a toggle — `act` cannot delete or signal anything a scheduled
+ * tick would have refused, it only moves the tick forward.
+ */
+export const gcRunRpc = defineRpc({
+  name: "gc.run",
+  input: z.object({ mode: z.enum(["report", "act"]) }),
+  output: z.array(gcActionSchema),
 });
