@@ -107,7 +107,7 @@
 // harness names the first one by path so the fix lands in the modules.
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -795,11 +795,14 @@ function newestPluginReport(stateDir: string): string {
   return join(reports, newest);
 }
 
+/** The reference tool, relative to `agent-room/` (the cwd the harness runs from). */
+const REFERENCE_BASH = "docs/gc-port/slp-gc.bash";
+
 /** `report --json`, with a state dir of its own so the live GC state is never touched. */
 function bashReport(): unknown {
   const stateDir = mkdtempSync(join(tmpdir(), "gc-equivalence-state-"));
   try {
-    const stdout = execFileSync("bash", ["docs/gc-port/slp-gc.bash", "report", "--json"], {
+    const stdout = execFileSync("bash", [REFERENCE_BASH, "report", "--json"], {
       encoding: "utf8",
       env: { ...process.env, SLP_GC_STATE_DIR: stateDir },
       maxBuffer: 64 * 1024 * 1024,
@@ -812,6 +815,15 @@ function bashReport(): unknown {
 }
 
 function main(): void {
+  // The controller deleted the reference copy (`a210d5e`); the comparison has no
+  // authority left to run against, so say so once instead of letting `execFileSync`
+  // raise a stack trace for the absent script.
+  if (!existsSync(REFERENCE_BASH)) {
+    console.log("reference removed; equivalence cannot re-run");
+    process.exitCode = 1;
+    return;
+  }
+
   const explicit = process.argv[2];
   const pluginPath = explicit ?? newestPluginReport(pluginStateDir());
   let plugin: Record<string, unknown>;

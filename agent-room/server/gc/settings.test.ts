@@ -2,8 +2,9 @@
 // (slp-gc.bash:1240-1269, 80-97) ported to a typed, non-throwing reader.
 //
 // The live conf lives at ~/.config/slp-room/slp-gc.conf. These tests never touch
-// it: they use inline strings, an injected `readFile`, or the byte-identical copy
-// captured in `docs/gc-port/slp-gc.conf` (Task 1).
+// it: they use inline strings, an injected `readFile`, or the inlined literal of the
+// copy captured in `docs/gc-port/slp-gc.conf` (Task 1), which the controller removed
+// in `a210d5e`.
 import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,6 +26,37 @@ SLP_GC_REPORT_INTERVAL_MIN=15
 SLP_GC_UNKNOWN_KEY=1
 SLP_GC_TICK_BUDGET_S=abc
 SLP_GC_APPLY=1
+`;
+
+/**
+ * `docs/gc-port/slp-gc.conf` verbatim (24 lines), inlined because the controller
+ * removed the reference copy in `a210d5e`. Three live flags, all `0`; every tunable
+ * is commented out, so importing it leaves `DEFAULT_GC_SETTINGS` untouched.
+ */
+const REFERENCE_CONF = `# slp-gc configuration (KEY=VALUE, parsed not sourced; the last value wins). Read by \`slp-gc tick\`
+# only. A flag is on only when its value is exactly 1. install.sh never resets this file: change
+# it here, or with install.sh --gc-apply / --gc-kill / --gc-report-only.
+#
+# Default: report-only. Every tick records memory and writes hourly reports and alerts; nothing
+# is deleted or killed.
+
+# 1 = delete completed schedules and long-archived agents through the paseo CLI.
+SLP_GC_APPLY=0
+# 1 = also SIGTERM proven orphaned agent processes (needs SLP_GC_APPLY=1 to act).
+SLP_GC_KILL_STALE=0
+# 1 = also SIGTERM agent descendants above SLP_GC_MEM_KILL_MB (needs SLP_GC_APPLY=1 to act).
+SLP_GC_KILL_MEMORY=0
+
+# Tunables (uncomment to change; defaults shown):
+# SLP_GC_MEM_WARN_MB=3072
+# SLP_GC_MEM_KILL_MB=4096
+# SLP_GC_TREE_WARN_MB=            (default: 50% of RAM)
+# SLP_GC_KILL_COMMS=              (process names the kill rules may target; alias SLP_GC_ORPHAN_COMMS)
+# SLP_GC_ORPHAN_MIN_AGE_MIN=10
+# SLP_GC_TEST_CONCURRENCY_WARN=3
+# SLP_GC_MAX_KILLS=20             (per tick)
+# SLP_GC_TICK_BUDGET_S=45
+# SLP_GC_REPORT_INTERVAL_MIN=60
 `;
 
 const quietLog = () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() });
@@ -298,17 +330,22 @@ describe("createGcSettingsReader", () => {
   });
 
   it("imports the captured reference conf through the real fs reader", async () => {
-    const settings = await createGcSettingsReader({
-      confPath: join(__dirname, "../../docs/gc-port/slp-gc.conf"),
-      log: quietLog(),
-    });
-    // Every tunable in the shipped conf is commented out; only the three flags
-    // are live, all off.
-    expect(settings).toEqual(DEFAULT_GC_SETTINGS);
-    expect(settings.apply).toBe(false);
-    expect(readFileSync(join(__dirname, "../../docs/gc-port/slp-gc.conf"), "utf8")).toContain(
-      "SLP_GC_APPLY=0",
-    );
+    // The captured conf (`docs/gc-port/slp-gc.conf`, 24 lines) is inlined verbatim
+    // because the controller removed the reference copy in `a210d5e`. It is written
+    // to a temporary file so the real `lstat`/`readFile` reader stays under test.
+    const dir = mkdtempSync(join(tmpdir(), "gc-conf-reference-"));
+    const confPath = join(dir, "slp-gc.conf");
+    writeFileSync(confPath, REFERENCE_CONF);
+    try {
+      const settings = await createGcSettingsReader({ confPath, log: quietLog() });
+      // Every tunable in the shipped conf is commented out; only the three flags
+      // are live, all off.
+      expect(settings).toEqual(DEFAULT_GC_SETTINGS);
+      expect(settings.apply).toBe(false);
+      expect(REFERENCE_CONF).toContain("SLP_GC_APPLY=0");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
