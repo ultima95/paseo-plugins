@@ -2,11 +2,17 @@
 
 Task 14 part A (non-destructive). This record covers the equivalence harness, the
 scheduler and settings evidence, the protected classes, the rule defaults, and the
-one-time state migration. It does **not** cover removing the reference (the launchd
-job `com.paseo-slp.slp-gc`, `~/.config/slp-room`, `docs/gc-port/`) — that is the
-controller's step, after explicit confirmation. Nothing here deletes, unloads,
-restarts or rewrites anything: the harness runs the reference with a throwaway
-`SLP_GC_STATE_DIR`, and every other command reads only.
+one-time state migration. Removing the reference (the launchd job `com.paseo-slp.slp-gc`,
+`~/.config/slp-room`, `docs/gc-port/`) was the controller's step, after explicit
+confirmation, and is recorded in **`## Removal (2026-10-30)`** at the end. Nothing in the
+sections below deletes, unloads, restarts or rewrites anything: the harness ran the
+reference with a throwaway `SLP_GC_STATE_DIR`, and every other command reads only.
+
+> **The reference copy is gone.** `docs/gc-port/slp-gc.bash` and `docs/gc-port/slp-gc.conf`
+> were deleted on 2026-10-30 (`## Removal (2026-10-30)`). Every citation of them in this
+> record — `slp-gc.bash:<line>`, `slp-gc.conf` — is to the **removed reference copy** as it
+> stood when the measurement was taken; the paths no longer exist in the tree, and the line
+> numbers in the code comments are that copy's.
 
 ```
 $ git log --oneline -1        # 2f81974 fix(agent-room): gc equivalence under live process churn
@@ -66,8 +72,9 @@ The harness prints **`EQUIVALENT`** against the report HEAD's own plugin wrote. 
 report is `18f1866`'s — the build the daemon reloaded at 17:44:31Z (`gc conf imported`,
 `~/.paseo/daemon.log:5399`) — and the report tick at 17:54:32Z wrote
 `20261029T175431Z.json`: 200,622 bytes, `generated` 2026-10-29T17:54:31Z, `stat` mtime
-17:54:32.127Z. The reference side is captured on every run as `report --json`
-(`docs/gc-port/slp-gc.bash:1351`), with `SLP_GC_STATE_DIR` pointed at a throwaway
+17:54:32.127Z. The reference side is captured on every run as `report --json` of the
+removed reference copy (`docs/gc-port/slp-gc.bash:1351`, deleted 2026-10-30), with
+`SLP_GC_STATE_DIR` pointed at a throwaway
 directory, so a harness run can never touch the live GC state.
 
 ```
@@ -393,12 +400,15 @@ killMemory)` (`server/gc/tick.ts:1870`). Thresholds, from the same defaults:
 `tickBudgetS 45`, `reportIntervalMin 60`, `cliTimeoutS 30`, `killComms`
 `DEFAULT_KILL_COMMS`.
 
-Where they live: the operator's file is `~/.config/slp-room/slp-gc.conf`
+Where they live: the operator's file **was** `~/.config/slp-room/slp-gc.conf`
 (KEY=VALUE, parsed not sourced; the one live copy, 1,133 bytes, all three flags `0`),
 imported **once per process** and merged over the defaults; the plugin's own `gc`
 settings document is layered on top per tick (`index.server.ts:170-195`); the code
-defaults are `DEFAULT_GC_SETTINGS`. A settings read that times out or is invalid logs
-and falls back to the imported baseline — never to an acting posture.
+defaults are `DEFAULT_GC_SETTINGS`. With the removal (`## Removal (2026-10-30)`) both the
+conf and `~/.config/slp-room` are gone, so the import finds no file and yields
+`DEFAULT_GC_SETTINGS` — the live layers are now the plugin's `gc` settings document over
+the defaults. A settings read that times out or is invalid logs and falls back to the
+imported baseline — never to an acting posture.
 
 ## 6. State migration
 
@@ -445,8 +455,9 @@ Measured now (`wc -l`, `shasum -a 256`, `ls | wc -l`, `stat`):
   5,241,366 B, `reports/*` their own hourly stamps. `alerts.log` has not moved since
   four days *before* the migration, which is only possible if the copy never wrote
   the source. (`memory.jsonl` and `lineage.tsv` in the source do have current mtimes
-  because the reference's launchd job is still ticking — that is the reference
-  writing to itself, not the port; the job is removed by the controller later.)
+  because the reference's launchd job was still ticking at the time of that measurement
+  — that is the reference writing to itself, not the port; the job is removed since, see
+  `## Removal (2026-10-30)`, and `~/Library/Logs/slp-gc` stays in place as an archive.)
 
 ## 7. Live acting cannot be demonstrated on this host
 
@@ -474,3 +485,84 @@ block and refuses on the same arm (`slp-gc.bash:323-342`), so "the port acts lik
 reference" is demonstrable here and "acting works" is not. Acting is covered where it
 can be covered: by construction and refusal tests (`server/gc/apply.test.ts`,
 `kill.test.ts`, `evaluate.test.ts:29-160`), not by a live run.
+
+## Removal (2026-10-30)
+
+The reference was removed by the controller after explicit confirmation, with the port
+already running and sampling. Four commands, each followed by its own check:
+
+1. Unload the launchd job —
+
+   ```
+   $ launchctl bootout gui/501/com.paseo-slp.slp-gc
+   $ launchctl list | grep -c com.paseo-slp.slp-gc
+   0                        # grep exit 1 — no match: nothing is loaded for this label
+   ```
+
+2. Remove its plist —
+
+   ```
+   $ rm ~/Library/LaunchAgents/com.paseo-slp.slp-gc.plist
+   $ ls ~/Library/LaunchAgents/ | grep slp
+                            # no output: the plist is gone, no other slp agent is left
+   ```
+
+3. Remove the operator's config directory —
+
+   ```
+   $ rm -rf ~/.config/slp-room
+   $ ls -d ~/.config/slp-room
+   ls: /Users/ultima/.config/slp-room: No such file or directory
+   ```
+
+4. Remove the reference copy —
+
+   ```
+   $ rm -rf agent-room/docs/gc-port
+   $ git status --short
+    D docs/gc-port/slp-gc.bash
+    D docs/gc-port/slp-gc.conf
+   ```
+
+That is the only trace left of the reference copy: two deletions, committed with this
+record. Every `slp-gc.bash` / `slp-gc.conf` citation earlier in this file is to that copy
+as it stood before this commit.
+
+### The port kept ticking through the removal
+
+Measured at 2026-10-30 09:22:32 local, minutes after the bootout, with no reload, no
+restart and no state reset — `agent-room` stayed `running` the whole time:
+
+```
+$ wc -l ~/.paseo/plugin-data/agent-room/gc/memory.jsonl*
+      14 …/gc/memory.jsonl
+     537 …/gc/memory.jsonl.1
+$ stat -f '%Sm %z %N' ~/.paseo/plugin-data/agent-room/gc/memory.jsonl*
+Oct 30 09:22:32 2026 67,659 …/gc/memory.jsonl
+Oct 30 09:08:32 2026 5,240,966 …/gc/memory.jsonl.1
+```
+
+`memory.jsonl` grew a line at 09:22:32 — the 60 s tick of a plugin that was never
+restarted — and `memory.jsonl.1` holds the rotated predecessor at 537 lines /
+5,240,966 B, so the port's own 5 MB rotation has run and kept exactly one predecessor.
+(The controller's reading ten minutes earlier, 13 lines / 62,827 B at 09:21, is the same
+series one tick back.) GC is therefore evidenced as the plugin's work alone: the launchd
+job that used to write to `~/Library/Logs/slp-gc` is not loaded, and the files above are
+under `~/.paseo/plugin-data/agent-room/gc`.
+
+### `~/Library/Logs/slp-gc` is kept as an archive
+
+The legacy log directory is deliberately **left in place** and is not a live path: the
+reference wrote there, and `server/gc/migrate.ts` was seeded from it read-only (§6). It
+is now only an archive — nothing in the port reads or writes it, and the port's state is
+`~/.paseo/plugin-data/agent-room/gc` alone.
+
+### The basis for the removal
+
+The strict live diff was never fully field-clean: both stored reports stop on live
+population drift (`agents.rows[32].state`, then `retention[9].path`, plus the
+`retention[*].note` `git status` readings), which grows with the age of the snapshot
+rather than with anything the port decides — so the removal was taken on structural
+equivalence plus the harness's semantic controls (the normalisation tables and control
+runs above, where a changed `class`, `why`, `protected`, agent `state` or `reason`, or a
+whole population still each fail), and that is the user's explicit decision.
