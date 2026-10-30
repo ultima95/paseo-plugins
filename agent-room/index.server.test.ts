@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,7 +12,7 @@ import type {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_SETTINGS, roomSettingsSchema } from "./shared/seats";
-import contribute from "./index.server";
+import contribute, { __resetGcMigrated, type GcOverrides } from "./index.server";
 import type { AgentCreateRequest } from "./server/inject";
 import { SEAT_SETTINGS_UNLOADED, SETTINGS_TIMEOUT_MS } from "./server/settings";
 
@@ -106,12 +106,20 @@ function fakePaseo() {
   return { paseo, created };
 }
 
-function contributeWith(read: SeatsRead) {
+/** The `gc` settings document a test wants the plugin to see. */
+type GcRead = () => Promise<unknown>;
+
+const readyGc = (values: unknown = {}): GcRead => {
+  return async () => ({ status: "ready", revision: "1", values });
+};
+
+function contributeWith(read: SeatsRead, gc: GcRead = readyGc(), overrides: GcOverrides = {}) {
   let hook: CreateHook | undefined;
   const hooks: Record<string, LifecycleHook> = {};
   const handled: Array<{ name: string; handler: RegisteredHandler }> = [];
   const server = {
-    registerSettings: () => ({ read, subscribe: () => () => undefined }) as unknown as SeatsSettings,
+    registerSettings: (definition: { id: string }) =>
+      (definition.id === "gc" ? { read: gc, subscribe: () => () => undefined } : { read, subscribe: () => () => undefined }) as unknown as SeatsSettings,
     before: (name: string, handler: CreateHook) => {
       if (name === "agent.create") hook = handler;
       return () => undefined;
@@ -127,7 +135,7 @@ function contributeWith(read: SeatsRead) {
     registerUsageSource: () => undefined,
   } as unknown as PluginServerContext;
 
-  const cleanup = contribute(server);
+  const cleanup = contribute(server, overrides);
 
   /** The handler the daemon would run for `name`, with its narrow types erased. */
   const invoke = (name: string): RpcCall => {
@@ -155,18 +163,26 @@ const hookAgent = (over: Partial<PluginHookAgent> & { id: string }): PluginHookA
 /** The store path resolves at contribute time, so the data dir must be sandboxed. */
 let home: string;
 let previousPaseoHome: string | undefined;
+let previousGcConfig: string | undefined;
 
 beforeEach(async () => {
   loadGate.open();
+  __resetGcMigrated();
   home = await mkdtemp(join(tmpdir(), "agent-room-home-"));
   previousPaseoHome = process.env.PASEO_HOME;
   process.env.PASEO_HOME = home;
+  // Every test gets its own (absent unless it writes one) `slp-gc.conf`, so the
+  // GC never reads the machine's real one and its memoised import is per-test.
+  previousGcConfig = process.env.SLP_GC_CONFIG;
+  process.env.SLP_GC_CONFIG = join(home, "slp-gc.conf");
 });
 
 afterEach(async () => {
   loadGate.open();
   if (previousPaseoHome === undefined) delete process.env.PASEO_HOME;
   else process.env.PASEO_HOME = previousPaseoHome;
+  if (previousGcConfig === undefined) delete process.env.SLP_GC_CONFIG;
+  else process.env.SLP_GC_CONFIG = previousGcConfig;
   await rm(home, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
@@ -186,7 +202,7 @@ describe("agent-room server contribution", () => {
     await expect(cleanup()).resolves.toBeUndefined();
   });
 
-  it("registers the launch, adopt, list and get RPCs in contract order", () => {
+  it("registers the room and GC RPCs in contract order", () => {
     const { handled } = contributeWith(
       readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
     );
@@ -196,9 +212,11 @@ describe("agent-room server contribution", () => {
       "room.adopt",
       "room.list",
       "room.get",
+      "gc.status",
+      "gc.run",
     ]);
-    // Four contracts, four distinct handlers: none registered twice by mistake.
-    expect(new Set(handled.map((entry) => entry.handler)).size).toBe(4);
+    // Six contracts, six distinct handlers: none registered twice by mistake.
+    expect(new Set(handled.map((entry) => entry.handler)).size).toBe(6);
   });
 
   it("binds each contract to its matching handler, not merely to some handler", async () => {
@@ -378,6 +396,236 @@ describe("agent-room server contribution", () => {
     const { create } = contributeWith(read);
     await expect(create(request("[room:lead] x"))).resolves.toMatchObject({
       config: { provider: "claude", model: "claude-opus-5-5" },
+    });
+  });
+
+  it("serves gc.status before any tick has run, with the defaults in force", async () => {
+    const { invoke } = contributeWith(readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }));
+
+    const status = (await invoke("gc.status")({}, {})) as Record<string, unknown>;
+
+    // No tick yet: nothing identified, nothing sampled, and the reference's
+    // report-only defaults — which is exactly what the next tick would act on.
+    expect(status.ident).toEqual({ ok: false, why: "no tick has run yet" });
+    expect(status.lastTickAt).toBeNull();
+    expect(status.procs).toEqual([]);
+    expect(status.candidates).toEqual([]);
+    expect(status.settings).toEqual({
+      apply: false,
+      killStale: false,
+      killMemory: false,
+      memWarnMb: 3072,
+      memKillMb: 4096,
+    });
+  });
+
+  it("lets the plugin's gc document override the imported conf baseline", async () => {
+    await writeFile(
+      process.env.SLP_GC_CONFIG as string,
+      ["# the reference's own conf", "SLP_GC_MEM_WARN_MB=2048", "SLP_GC_KILL_STALE=0"].join("\n"),
+      "utf8",
+    );
+    const gcRead = readyGc({ killStale: true, memWarnMb: 1500 });
+    const { invoke } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+      gcRead,
+    );
+
+    const status = (await invoke("gc.status")({}, {})) as { settings: Record<string, unknown> };
+
+    // The document wins on the two keys it carries; the conf's baseline supplies
+    // everything else (apply stays off, because neither source turned it on).
+    expect(status.settings).toMatchObject({
+      apply: false,
+      killStale: true,
+      killMemory: false,
+      memWarnMb: 1500,
+      memKillMb: 4096,
+    });
+  });
+
+  it("falls back to the imported baseline when the gc settings document is invalid", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await writeFile(process.env.SLP_GC_CONFIG as string, "SLP_GC_MEM_WARN_MB=2048\n", "utf8");
+    const { invoke } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+      // What `registerSettings` answers for a document that does not parse.
+      async () => ({ status: "invalid", revision: "1", error: "memWarnMb: expected number" }),
+    );
+
+    const status = (await invoke("gc.status")({}, {})) as { settings: Record<string, number> };
+
+    expect(status.settings.memWarnMb).toBe(2048);
+    expect(warn).toHaveBeenCalledWith(
+      "[agent-room]",
+      "gc settings invalid; using the imported baseline",
+      { error: "memWarnMb: expected number" },
+    );
+  });
+
+  it("still loads and serves the GC when the conf is malformed", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await writeFile(
+      process.env.SLP_GC_CONFIG as string,
+      ["not a conf line at all", "SLP_GC_MAX_KILLS=banana", "SLP_GC_MEM_WARN_MB=2048"].join("\n"),
+      "utf8",
+    );
+    const { invoke } = contributeWith(readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }));
+
+    const status = (await invoke("gc.status")({}, {})) as { settings: Record<string, number> };
+
+    // The keys that parsed apply, the malformed ones fall back to the defaults,
+    // and the plugin still answers with an empty room and a served status.
+    expect(status.settings.memWarnMb).toBe(2048);
+    await expect(invoke("room.list")({}, {})).resolves.toEqual({ rooms: [] });
+  });
+
+  it("runs one tick for gc.run and keeps its result for gc.status", async () => {
+    const emptyExec = () => ({ code: 0, stdout: "", stderr: "", timedOut: false });
+    const { invoke } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+      readyGc(),
+      {
+        exec: emptyExec,
+        now: () => 1_790_000_000,
+        legacyStateDir: join(home, "no-legacy-state"),
+        notify: () => undefined,
+      },
+    );
+
+    await expect(invoke("gc.run")({ mode: "report" }, {})).resolves.toEqual([]);
+
+    const status = (await invoke("gc.status")({}, {})) as Record<string, unknown>;
+    expect(status.lastTickAt).toBe("2026-09-21T14:13:20Z");
+    expect(status.settings).toMatchObject({ apply: false });
+  });
+
+  it("acts on nothing through gc.run while the toggles are off", async () => {
+    const emptyExec = () => ({ code: 0, stdout: "", stderr: "", timedOut: false });
+    const deleteAgent = vi.fn(async () => undefined);
+    const signal = vi.fn(() => true);
+    const { invoke } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+      readyGc(),
+      {
+        exec: emptyExec,
+        now: () => 1_790_000_000,
+        legacyStateDir: join(home, "no-legacy-state"),
+        notify: () => undefined,
+        deleteAgent,
+        signal,
+      },
+    );
+
+    await expect(invoke("gc.run")({ mode: "act" }, {})).resolves.toEqual([]);
+    expect(deleteAgent).not.toHaveBeenCalled();
+    expect(signal).not.toHaveBeenCalled();
+  });
+
+  it("serves gc.status after a tick whose process phase failed outright", async () => {
+    const brokenExec = () => {
+      throw new Error("spawn ENOENT");
+    };
+    const { invoke } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+      readyGc(),
+      {
+        exec: brokenExec,
+        now: () => 1_790_000_000,
+        legacyStateDir: join(home, "no-legacy-state"),
+        notify: () => undefined,
+      },
+    );
+
+    // The tick still answers — a failed sample is a report, not an exception.
+    await expect(invoke("gc.run")({ mode: "report" }, {})).resolves.toEqual([]);
+
+    const status = (await invoke("gc.status")({}, {})) as {
+      ident: { ok: boolean; why: string };
+      lastTickAt: string | null;
+      settings: Record<string, unknown>;
+      procs: unknown[];
+      candidates: unknown[];
+    };
+
+    // A failed tick is still the last tick: the screen must say why nothing is
+    // known, not fall back to "no tick has run yet".
+    expect(status.ident.ok).toBe(false);
+    expect(status.ident.why).not.toBe("");
+    expect(status.ident.why).not.toBe("no tick has run yet");
+    expect(status.procs).toEqual([]);
+    expect(status.candidates).toEqual([]);
+    expect(status.lastTickAt).toBe("2026-09-21T14:13:20Z");
+    expect(status.settings).toMatchObject({ apply: false, memWarnMb: 3072, memKillMb: 4096 });
+  });
+
+  it("refuses a gc.run that arrives while a scheduled tick is still running", async () => {
+    // I-2: an RPC run must not overlap a scheduled tick. Both paths go through
+    // the one `createTickGate`, so the RPC is *refused* (not queued) and starts
+    // no tick of its own.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let tickStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      tickStarted = resolve;
+    });
+    let releaseTick!: () => void;
+    const released = new Promise<void>((resolve) => {
+      releaseTick = resolve;
+    });
+    const record = vi.fn(async () => {
+      tickStarted();
+      await released;
+      return { line: null, alert: null };
+    });
+    const deleteAgent = vi.fn(async () => undefined);
+    const emptyExec = () => ({ code: 0, stdout: "", stderr: "", timedOut: false });
+
+    const { invoke, cleanup } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+      readyGc({ apply: true }),
+      {
+        exec: emptyExec,
+        now: () => 1_790_000_000,
+        legacyStateDir: join(home, "no-legacy-state"),
+        notify: () => undefined,
+        deleteAgent,
+        // Short interval: the first scheduled tick fires while the test waits.
+        intervalMs: 25,
+        seams: { record },
+      },
+    );
+
+    // The scheduled tick is now mid-tick, holding the gate inside the record phase.
+    await started;
+    expect(record).toHaveBeenCalledTimes(1);
+
+    const rows = (await invoke("gc.run")({ mode: "act" }, {})) as Array<Record<string, unknown>>;
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ kind: "refuse", id: "-", acted: false });
+    expect(String(rows[0]?.refusedBy)).toContain("tick-in-progress");
+    // The strongest evidence: the RPC started no tick at all, so there is no
+    // second acting phase — the seam still has exactly the scheduled tick's call.
+    expect(record).toHaveBeenCalledTimes(1);
+    expect(deleteAgent).not.toHaveBeenCalled();
+    expect(
+      warn.mock.calls.some(
+        (call) => call[0] === "[agent-room]" && call[1] === "gc run refused: a tick is still running",
+      ),
+    ).toBe(true);
+
+    // Teardown order, not an assertion: the scheduled tick this test held open is
+    // still mid-tick below `record`, and it goes on to write the tick's report into
+    // `stateDir` (one `.txt` and, since Task 14, its `.json`). `cleanup()` first, so
+    // the interval stops and no *second* tick can start; then release the tick and
+    // wait for it through the public status, which carries a tick only once
+    // `runTick` has resolved. Without this the `afterEach` that removes the tmp home
+    // races those writes (`ENOTEMPTY`), which says nothing about the mutex above.
+    releaseTick();
+    await cleanup();
+    await vi.waitFor(async () => {
+      const status = (await invoke("gc.status")({}, {})) as { lastTickAt: string | null };
+      expect(status.lastTickAt).not.toBeNull();
     });
   });
 

@@ -3,6 +3,7 @@ import { Icon, SidebarRow } from "@getpaseo/plugin/client/ui";
 import { Pressable } from "react-native";
 
 import { GuardRow, guardRowSchema } from "./client/guard-row";
+import { GcScreen } from "./client/gc-screen";
 import { RoomManagerPanel } from "./client/room-manager";
 import { contributeRoomPills } from "./client/room-pill";
 import { RoomScreen } from "./client/room-screen";
@@ -43,14 +44,41 @@ function RoomsSidebarItem(props: PluginSidebarItemProps) {
 }
 
 /**
+ * The garbage-collection sidebar row: a navigation entry with the Lucide
+ * `Trash2` icon. It opens the GC screen and stays highlighted while that screen
+ * is the one open on this host.
+ */
+function GcSidebarItem(props: PluginSidebarItemProps) {
+  return (
+    <SidebarRow
+      icon="Trash2"
+      active={props.currentScreen?.screenId === "gc"}
+      onPress={() => props.openScreen({ screenId: "gc" })}
+    />
+  );
+}
+
+/**
  * The Room screen, the live view of one room, the sidebar row that opens them,
- * the Command Center entry, `/room`, and the guard's timeline row.
+ * the Command Center entry, `/room`, the guard's timeline row, and the GC screen
+ * with its own sidebar row and Command Center entry.
  */
 export default function contribute(client: PluginClientContext): () => void {
   const disposers = [
     client.addScreen({ id: "rooms", title: "Room", Component: RoomsScreen }),
     client.addScreen({ id: "room", title: () => "Room", Component: RoomScreen }),
     client.addSidebarHeaderItem({ id: "rooms", title: "Room", Component: RoomsSidebarItem }),
+    client.addScreen({ id: "gc", title: "Garbage collection", Component: GcScreen }),
+    client.addSidebarHeaderItem({ id: "gc", title: "Garbage collection", Component: GcSidebarItem }),
+    client.addCommandCenterItem({
+      id: "open-gc",
+      title: "Garbage collection",
+      icon: "Trash2",
+      context: "global",
+      onSelect(ctx) {
+        ctx.openScreen({ screenId: "gc" });
+      },
+    }),
     client.addWorkspacePanel({
       id: "rooms-manager",
       title: "Rooms",

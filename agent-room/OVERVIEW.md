@@ -34,7 +34,18 @@ The live view of one room shows the seat tree depth first from the Supervisor, w
 
 A room uses the providers you have already signed in on the daemon machine, so set each seat to a provider, model, mode, and thinking level that is available there. The plugin needs no account, token, or API key of its own, and Paseo 0.13.1 or newer. A Command Code seat also requires the separate `command-code` plugin installed and enabled on the daemon alongside agent-room, because that plugin is what delivers the seat's role prompt; without it the seat starts but arrives with no room prompt.
 
-Room state is one `rooms.json` under the daemon's plugin data directory (`$PASEO_HOME/plugin-data/agent-room`, or `~/.paseo/plugin-data/agent-room` when `PASEO_HOME` is unset). It holds rooms, seats, and each room's newest 500 feed events, and it is the plugin's only store.
+Room state is one `rooms.json` under the daemon's plugin data directory (`$PASEO_HOME/plugin-data/agent-room`, or `~/.paseo/plugin-data/agent-room` when `PASEO_HOME` is unset). It holds rooms, seats, and each room's newest 500 feed events; the GC state directory below is the plugin's other store.
+
+## Garbage collection
+
+The plugin carries a port of the `slp-gc` collector: one GC screen, one 60 s in-process tick, and three rules that are all off by default.
+
+- **The screen** (`gc.status` and `gc.run`) shows the last tick's own verdicts, the rule toggles and the thresholds they act on, the candidates a reclaim would take with the reason each other row is refused, the process rows with the warn verdict, the newest `alerts.log` lines, and every `gc.run` answer the screen started. Two buttons run one tick now: "Run report now" and "Reclaim now". A run requested while a tick is in flight is refused, never queued.
+- **Three rules, all off**: reclaim (`SLP_GC_APPLY`) deletes completed schedules and long-archived agents through the paseo CLI; kill stale (`SLP_GC_KILL_STALE`) and kill over-memory (`SLP_GC_KILL_MEMORY`) signal processes, and both also require `SLP_GC_APPLY=1`. Off by default is the posture, not a placeholder: the plugin records, samples, reports and alerts, and touches nothing.
+- **Thresholds** come from two layers now — the plugin's own `gc` settings document edited from the screen, and the code defaults: warn at 3072 MB, kill at 4096 MB, tree warn at 50 % of RAM, orphan minimum age 10 min, test-concurrency warn 3, at most 10 signals per tick, a 45 s tick budget, and one report an hour. The reference's `~/.config/slp-room/slp-gc.conf` (KEY=VALUE) was the first layer, imported once per process and logged as `gc conf imported { keys: 3, problems: 0 }`; the removal deleted both the file and `~/.config/slp-room`, so that import now finds nothing and yields the code defaults. A settings read that fails or times out falls back to the imported baseline, never to an acting posture.
+- **State** is one directory, `~/.paseo/plugin-data/agent-room/gc`: `memory.jsonl` with its rotated `.1`, `lineage.tsv`, `alerts.log`, `reports/`, and the `.last-report` and `.alert-stamp` stamps. It was seeded once from the reference's `~/Library/Logs/slp-gc`, read-only, and it keeps the reference's 5 MB rotation with one predecessor.
+- **The watchdog is plugin-only.** The tick is a timer inside the plugin, so it has no supervisor above it: the reference ran under launchd, which restarted it every 60 s whatever the last run did, while here a hung daemon stops its own watchdog with it. What remains is cooperative — a 45 s tick budget, per-command timeouts, and one mutex that keeps a second tick from overlapping the first.
+- **Disabling `agent-room` disables GC entirely**: no tick, no `gc.status` or `gc.run`, no state writes. The state directory and its migrated files stay where they are.
 
 ## Known limits
 
