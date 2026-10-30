@@ -207,23 +207,29 @@ every Peer response has a disposition. Otherwise the report is `STATUS`, and
 the Supervisor sends a `DONE` with a Peer still running back for correction.
 
 The Supervisor prints exactly one room-state block per turn — heartbeat wakes
-and precondition stops included — as its last rows when the turn ends: one
-card per Lead, or the single `**✅ Done** — <outcome>` / `**❓ Waiting on
-you** — <decision>` row. A card is a bold Lead workstream, an em dash and the
-Lead state in backticks, then an optional line indented two spaces with the
-detail and a `peers: <short names>` tail, cards in launch order. A turn that
-keeps spinning prints the block only when its content changed, or when the
-person asks for progress; a turn that ends always prints it last. The person
-always sees the state, and no turn ends on a bare acknowledgement, including
-after a message from the person mid-run. For example:
+and precondition stops included — as its last text when the turn ends, inside a
+`room-status` fenced code block: one card per Lead, or the single
+`**✅ Done** — <outcome>` / `**❓ Waiting on you** — <decision>` row. The room
+plugin renders that fence as a native status card; a host without the plugin
+shows the rows as preformatted text. A card is a bold Lead workstream, an em
+dash and the Lead state in backticks, then an optional line indented two spaces
+with the detail, a `peers: <short names>` tail and, while the Supervisor blocks
+on a Peer, `waiting on <short Peer name>` on that Peer's Lead card (with
+`~<n>m` once the same wait has been re-armed n times), cards in launch order. A
+turn that keeps spinning prints the block only when its content changed, or
+when the person asks for progress; a turn that ends always prints it last. The
+person always sees the state, and no turn ends on a bare acknowledgement,
+including after a message from the person mid-run. For example:
 
-```text
+````text
+```room-status
 **auth refactor** — `running`
   reviewing token store diff · peers: token store, token store diff
 
 **billing export** — `STATUS: waiting on CI`
-  peers: csv writer (permission pending)
+  peers: csv writer (permission pending) · waiting on csv writer · ~2m
 ```
+````
 
 ## Independent judgment and debate
 

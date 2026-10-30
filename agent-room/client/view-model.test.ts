@@ -221,6 +221,22 @@ describe("feedRows", () => {
     expect(rows[0]?.toLabel).toBe("fedcba98");
   });
 
+  it("rewrites a room-status fence as plain lines", () => {
+    const text = [
+      "Answer first.",
+      "",
+      "```room-status",
+      "**auth refactor** — `running`",
+      "  reviewing token store diff · peers: token store",
+      "```",
+    ].join("\n");
+    const rows = feedRows([event({ id: "e1", from: "sup", to: null, text })], seats);
+
+    expect(rows[0]?.text).toBe(
+      "Answer first.\nauth refactor · running · reviewing token store diff · peers: token store",
+    );
+  });
+
   it("formats at as local HH:MM, padding both fields", () => {
     const morning = new Date(2026, 9, 28, 10, 2, 0);
     const early = new Date(2026, 9, 28, 9, 5, 0);

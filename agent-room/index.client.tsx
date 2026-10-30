@@ -7,10 +7,17 @@ import { GcScreen } from "./client/gc-screen";
 import { RoomManagerPanel } from "./client/room-manager";
 import { contributeRoomPills } from "./client/room-pill";
 import { RoomScreen } from "./client/room-screen";
+import { RoomStatusRow } from "./client/room-status-row";
 import { RoomsPopover } from "./client/rooms-popover";
 import { RoomsScreen } from "./client/rooms-screen";
 import { describeError } from "./client/seat-editor";
 import { GUARD_ROW_KIND, GUARD_ROW_VERSION } from "./shared/room";
+import {
+  parseRoomStatusMessage,
+  ROOM_STATUS_KIND,
+  ROOM_STATUS_VERSION,
+  roomStatusSchema,
+} from "./shared/room-status";
 import { launchRoomRpc } from "./shared/rpc";
 
 /**
@@ -126,6 +133,26 @@ export default function contribute(client: PluginClientContext): () => void {
       version: GUARD_ROW_VERSION,
       schema: guardRowSchema,
       Component: GuardRow,
+    }),
+    // The Supervisor's room-state block is written into a `room-status` fence:
+    // this replaces that fence with a native card row, and leaves every other
+    // assistant message alone.
+    client.addTimelineTransformer({
+      id: "room-status",
+      query: { itemType: "assistant_message" },
+      transform({ item }) {
+        const data = parseRoomStatusMessage(item.text);
+        if (data === null) return undefined;
+        return {
+          items: [{ type: "plugin", kind: ROOM_STATUS_KIND, version: ROOM_STATUS_VERSION, data }],
+        };
+      },
+    }),
+    client.addTimelineRenderer({
+      kind: ROOM_STATUS_KIND,
+      version: ROOM_STATUS_VERSION,
+      schema: roomStatusSchema,
+      Component: RoomStatusRow,
     }),
   ];
 

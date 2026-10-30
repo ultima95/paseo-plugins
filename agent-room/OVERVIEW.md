@@ -30,6 +30,8 @@ The Room screen holds the seat editor (a Supervisor seat, a Lead seat, and one e
 
 The live view of one room shows the seat tree depth first from the Supervisor, with each seat's provider, model, and live status, and the room feed oldest first with sender, recipient, and label. Both refresh every 2 seconds. A tap on a seat opens that agent on hosts that offer agent navigation.
 
+The Supervisor ends every turn with one room-state block inside a `room-status` fenced code block. The plugin's timeline transformer parses that fence, and its timeline renderer draws it as a native card: one surface per Lead with the workstream, its live state, the current detail, running Peers, and the Peer the Supervisor is blocking on. The reply text around the fence stays Markdown, the room feed shows the same rows as plain lines, and a host without the plugin shows the fence as preformatted text.
+
 ## Setup
 
 A room uses the providers you have already signed in on the daemon machine, so set each seat to a provider, model, mode, and thinking level that is available there. The plugin needs no account, token, or API key of its own, and Paseo 0.13.1 or newer. A Command Code seat also requires the separate `command-code` plugin installed and enabled on the daemon alongside agent-room, because that plugin is what delivers the seat's role prompt; without it the seat starts but arrives with no room prompt.

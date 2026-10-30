@@ -1,3 +1,4 @@
+import { parseRoomStatusMessage, roomStatusLine } from "../shared/room-status";
 import type { FeedEvent, SeatMarkerRecord, SeatRecord } from "../shared/room";
 
 /** One tree row: the seat and how far to indent it from the root. */
@@ -124,6 +125,25 @@ export function timeOfDay(at: string): string {
 }
 
 /**
+ * A message as the feed shows it. A room-state fence is a card in the agent
+ * timeline and is rewritten here as one plain line per card, because the feed
+ * renders text without markdown and the raw fence and `**` markers would be
+ * noise.
+ */
+function feedText(text: string): string {
+  const parsed = parseRoomStatusMessage(text);
+  if (parsed === null) return text;
+  const lines = parsed.cards.map(roomStatusLine);
+  if (parsed.terminal !== null) {
+    const label = parsed.terminal.kind === "done" ? "✅ Done" : "❓ Waiting on you";
+    lines.push(`${label} — ${parsed.terminal.text}`);
+  }
+  return [parsed.before, lines.join("\n"), parsed.after]
+    .filter((part) => part.length > 0)
+    .join("\n");
+}
+
+/**
  * The feed in the order the store keeps it (chronological), with each agent id
  * replaced by the label of the seat that owns it. `null` is the user, so a task
  * the user sent reads `You → Sup`; an id with no seat is shown by its prefix
@@ -146,7 +166,7 @@ export function feedRows(feed: FeedEvent[], seats: SeatRecord[]): FeedRow[] {
     fromLabel: labelOf(event.from),
     toLabel: labelOf(event.to),
     label: event.label,
-    text: event.text,
+    text: feedText(event.text),
     kind: event.kind,
   }));
 }
