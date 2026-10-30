@@ -733,6 +733,11 @@ export async function collectProcsPhase(input: ProcsPhaseInput): Promise<ProcsPh
     listen,
     dupes: ps.dupes,
     homeDefault: runtime.homeDefault,
+    // This code runs in a child of the daemon, so either "this is the daemon" or
+    // "the daemon spawned this process" is the spec's replacement for the
+    // Supervisor-env proof.
+    selfPid: process.pid,
+    selfPpid: process.ppid,
   });
   const table = buildProcTable({ ...common, daemonPid: ident.daemonPid });
 
@@ -1366,6 +1371,7 @@ function emptyProcsPhase(why: string): ProcsPhase {
     daemon: false,
     listener: false,
     homeBound: false,
+    inProcess: false,
     supHome: "unreadable",
     listen: null,
     supervisorPid: null,

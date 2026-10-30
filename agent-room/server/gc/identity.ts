@@ -95,6 +95,17 @@ export interface Identity extends IdentityFacts {
   listener: boolean;
   /** The Supervisor's home is this home (`match`), or unset while this is the default home (`none`). */
   homeBound: boolean;
+  /**
+   * The daemon named by `paseo.pid` is the very process running this code.
+   *
+   * The spec's agreed parity break (phase 3, §"Identity, apply authorization"):
+   * inside the daemon the Supervisor-env proof is circular, so the plugin proves
+   * the stronger thing instead — that it *is* the identified daemon. Reported so
+   * the screen can show which proof held; `false` whenever the caller cannot
+   * name its own pid. Optional on the type because the report must stay
+   * byte-identical to the reference's `$idt`, which has no such field.
+   */
+  inProcess?: boolean;
   /** `$sup.home // "unreadable"` — reported verbatim in the refusal, as the reference does. */
   supHome: HomeState;
   /** `$pf.listen` verbatim: the `host:port` the pid file advertises, when it carries one. */
@@ -119,6 +130,18 @@ export interface IdentityInput {
    * duplicates present and refuses (`:334-335`).
    */
   dupes: number;
+  /**
+   * This caller's own pid, when it has one. Equality with the identified daemon
+   * is the in-daemon proof that replaces the Supervisor-env check; absent or
+   * non-numeric means "cannot prove it", never "assume it".
+   */
+  selfPid?: number | null;
+  /**
+   * The pid that spawned this caller. Paseo runs a plugin's server code in a
+   * child of the daemon, so "the daemon that hosts this code" is normally the
+   * parent — accepting only `selfPid` would refuse on every real install.
+   */
+  selfPpid?: number | null;
   /** `$HOME_IS_DEFAULT`: the GC's own `PASEO_HOME` is the default one (slp-gc.bash:784). */
   homeDefault: boolean;
 }
@@ -188,6 +211,13 @@ export function resolveIdentity(input: IdentityInput): Identity {
   const listener = single !== undefined && listeners.includes(single.pid);
   const supHome: HomeState = sup === undefined ? "unreadable" : (sup.home ?? "unreadable");
   const homeBound = supHome === "match" || (supHome === "none" && input.homeDefault);
+  // `homeBound || inProcess`, never `inProcess` alone: an out-of-process caller
+  // keeps the reference's proof exactly, and a caller that cannot name its own
+  // pid (`selfPid` absent) is never treated as the daemon.
+  const inProcess =
+    single !== undefined &&
+    ((typeof input.selfPid === "number" && single.pid === input.selfPid) ||
+      (typeof input.selfPpid === "number" && single.pid === input.selfPpid));
 
   // One predicate behind both `ok` and `why` (slp-gc.bash:334-335): only exactly
   // zero proves the `ps` sample was a table, so every refusal from this arm also
@@ -196,7 +226,7 @@ export function resolveIdentity(input: IdentityInput): Identity {
   // `why: "ok"` — a refusal the operator cannot act on.
   const duplicated = !(input.dupes === 0);
 
-  const ok = !duplicated && pidFile && supervisor && daemon && listener && homeBound;
+  const ok = !duplicated && pidFile && supervisor && daemon && listener && (homeBound || inProcess);
 
   const why = ((): string => {
     if (duplicated) return "duplicate pid rows in the ps output";
@@ -204,8 +234,8 @@ export function resolveIdentity(input: IdentityInput): Identity {
     if (!supervisor) return 'pid in paseo.pid is not a live "Paseo Supervisor" child of an app main';
     if (!daemon) return 'no single "Paseo Daemon" child of the Supervisor';
     if (!listener) return "the daemon does not own the listener from paseo.pid";
-    if (!homeBound) {
-      return `the Supervisor's PASEO_HOME is "${supHome}": not proven to serve this home (an unreadable env always refuses; a readable env without PASEO_HOME is accepted only for the default home)`;
+    if (!homeBound && !inProcess) {
+      return `the Supervisor's PASEO_HOME is "${supHome}" and this process is not the daemon the pid file names: not proven to serve this home (an unreadable env refuses unless the caller is that daemon; a readable env without PASEO_HOME is accepted only for the default home)`;
     }
     return "ok";
   })();
@@ -218,6 +248,7 @@ export function resolveIdentity(input: IdentityInput): Identity {
     daemon,
     listener,
     homeBound,
+    inProcess,
     supHome,
     listen: pf?.listen ?? null,
     supervisorPid: sup?.pid ?? null,

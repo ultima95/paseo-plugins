@@ -52,6 +52,7 @@ describe("resolveIdentity — a healthy machine", () => {
       daemon: true,
       listener: true,
       homeBound: true,
+      inProcess: false,
       supHome: "match",
       listen: "127.0.0.1:6767",
       supervisorPid: 150,
@@ -258,6 +259,70 @@ describe("resolveIdentity — the home binding (slp-gc.bash:333, 340)", () => {
       expect(identity.supHome).toBe("unreadable");
       expect(identity.why).toContain('the Supervisor\'s PASEO_HOME is "unreadable"');
     }
+  });
+});
+
+describe("resolveIdentity — the in-daemon proof (phase 3 parity break)", () => {
+  const withSelf = (selfPid: number | undefined, home: HomeState = "unreadable", selfPpid?: number) =>
+    resolveIdentity(
+      input({
+        procs: [proc(100, 1, "app-main", "unreadable"), proc(150, 100, "supervisor", home), proc(200, 150, "daemon")],
+        listen: [200],
+        ...(selfPid === undefined ? {} : { selfPid }),
+        ...(selfPpid === undefined ? {} : { selfPpid }),
+      }),
+    );
+
+  it("accepts when the identified daemon spawned this process", () => {
+    const identity = withSelf(48609, "unreadable", 200);
+    expect(identity.inProcess).toBe(true);
+    expect(identity.ok).toBe(true);
+  });
+
+  it("still refuses when the daemon is neither this process nor its parent", () => {
+    const identity = withSelf(48609, "unreadable", 999);
+    expect(identity.inProcess).toBe(false);
+    expect(identity.ok).toBe(false);
+  });
+
+  it("accepts an unreadable Supervisor home when this process is the identified daemon", () => {
+    const identity = withSelf(200);
+    expect(identity.homeBound).toBe(false);
+    expect(identity.inProcess).toBe(true);
+    expect(identity.ok).toBe(true);
+    expect(identity.why).toBe("ok");
+  });
+
+  it("refuses when this process is not the identified daemon", () => {
+    const identity = withSelf(999);
+    expect(identity.inProcess).toBe(false);
+    expect(identity.ok).toBe(false);
+    expect(identity.why).toContain("this process is not the daemon the pid file names");
+  });
+
+  it("never treats an absent self pid as the daemon", () => {
+    expect(withSelf(undefined).inProcess).toBe(false);
+    expect(withSelf(undefined).ok).toBe(false);
+  });
+
+  it("still prefers the env proof when both hold", () => {
+    const identity = withSelf(200, "match");
+    expect(identity.homeBound).toBe(true);
+    expect(identity.inProcess).toBe(true);
+    expect(identity.ok).toBe(true);
+  });
+
+  it("does not let the in-daemon proof rescue a failed supervisor or listener", () => {
+    const notListening = resolveIdentity(
+      input({
+        procs: [proc(100, 1, "app-main", "unreadable"), proc(150, 100, "supervisor", "unreadable"), proc(200, 150, "daemon")],
+        listen: [201],
+        selfPid: 200,
+      }),
+    );
+    expect(notListening.inProcess).toBe(true);
+    expect(notListening.ok).toBe(false);
+    expect(notListening.why).toBe("the daemon does not own the listener from paseo.pid");
   });
 });
 
