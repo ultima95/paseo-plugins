@@ -65,10 +65,28 @@ never throw: a missing, unreadable or malformed conf logs and yields
   (`:28`), `is idempotent: a second cleanup does not disturb anything` (`:61`). A
   reloaded plugin therefore starts from zero intervals, never from two.
 
-## 3. Equivalence — `EQUIVALENT`
+## 3. Equivalence — structurally equivalent; residual explained; harness unrerunnable
 
-The harness prints **`EQUIVALENT`** against the report HEAD's own plugin wrote. HEAD
-`2f81974` changes only `scripts/gc-equivalence.mts`, so the server code that wrote the
+The harness printed **`EQUIVALENT`** at the time of the measurement, against the report
+HEAD's own plugin wrote. That single run is no longer the whole answer, and this heading
+says what the record actually establishes: the two artifacts are **structurally
+equivalent** (every decision compared, the normalisation list below explained row by
+row), the residual is **explained** (two named agent records the daemon changed after the
+reports were written — *Final verdicts*, below), and the harness is now
+**unrerunnable**, because it needs the reference as its second side:
+
+```
+$ cd agent-room && node --experimental-strip-types scripts/gc-equivalence.mts
+reference removed; equivalence cannot re-run                                          exit=1
+```
+
+`scripts/gc-equivalence.mts` shells `bash docs/gc-port/slp-gc.bash report --json`
+(`:799`, `:805`) for the reference side, and that file was deleted on 2026-10-30
+(`## Removal (2026-10-30)`). The harness refuses rather than comparing one side against
+itself. **Neither stored report is `EQUIVALENT`** (*Final verdicts*, `:345`): the honest
+conclusion is structural equivalence plus the controls below, not a green diff.
+
+HEAD `2f81974` changes only `scripts/gc-equivalence.mts`, so the server code that wrote the
 report is `18f1866`'s — the build the daemon reloaded at 17:44:31Z (`gc conf imported`,
 `~/.paseo/daemon.log:5399`) — and the report tick at 17:54:32Z wrote
 `20261029T175431Z.json`: 200,622 bytes, `generated` 2026-10-29T17:54:31Z, `stat` mtime
@@ -393,8 +411,9 @@ imported conf that says nothing new leaves the GC report-only:
 | signal proven orphans | `SLP_GC_KILL_STALE` → `killStale` | `false` |
 | signal agent descendants over the kill threshold | `SLP_GC_KILL_MEMORY` → `killMemory` | `false` |
 
-The kill flags are additionally gated on `apply`: `settings.apply && (killStale ||
-killMemory)` (`server/gc/tick.ts:1870`). Thresholds, from the same defaults:
+The kill flags are additionally gated on `apply`, and **both** acting phases sit behind
+the same two gates: `settings.apply && gate === null && (killStale || killMemory)`
+(`server/gc/tick.ts:1879`, §9). Thresholds, from the same defaults:
 `memWarnMb 3072`, `memKillMb 4096` (floor 1024, `slp-gc.bash:83`), `treeWarnMb null`
 (50 % of RAM), `orphanMinAgeMin 10`, `testConcurrencyWarn 3`, `maxKills 10`,
 `tickBudgetS 45`, `reportIntervalMin 60`, `cliTimeoutS 30`, `killComms`
@@ -566,3 +585,132 @@ rather than with anything the port decides — so the removal was taken on struc
 equivalence plus the harness's semantic controls (the normalisation tables and control
 runs above, where a changed `class`, `why`, `protected`, agent `state` or `reason`, or a
 whole population still each fail), and that is the user's explicit decision.
+
+## Final whole-branch review (2026-10-30) — two production fixes
+
+Two defects the review found, both fixed in one commit on `feat/agent-room-gc`; no other
+rule, gate, threshold or message changed. Files: `server/gc/tick.ts`,
+`server/gc/tick.test.ts`, this record.
+
+### Finding 1 — the kill phase is behind the apply gate
+
+**Defect.** The kill block was gated only on the settings —
+`if (settings.apply && (settings.killStale || settings.killMemory))` — while
+`gate = applyGateRefusal(ident, index)` was consulted for the deletes alone. The
+reference refuses the whole of `do_apply`, kills included, before either of its loops
+(`slp-gc.bash:1050-1057`), so the port could send a signal on a tick whose own gate said
+the index is incomplete — routine, because `agents.ts` fails the whole index on one
+record it cannot reduce (one agent mid-write).
+
+**Fix.** The kill block is now
+`if (settings.apply && gate === null && (settings.killStale || settings.killMemory))`
+(`server/gc/tick.ts:1879`). With `apply` on and `gate !== null` the refusal row is
+emitted **once**, in the acting block above, and names the gate that refused
+(`refused: identification failed: …` / `refused: index incomplete: …`, `refusedBy`
+`identification: …` / `index-incomplete: …`); no delete and no signal is attempted, and
+no per-candidate row is produced. (`server/gc/tick.ts:1812-1818`, `:1876-1879`.)
+
+**Tests** (`server/gc/tick.test.ts`, describe
+`runTick — the apply gate covers the kill phase`):
+
+| test | world | assertion |
+| --- | --- | --- |
+| `signals nothing and emits one refusal naming the index when the index is incomplete` | real identification (`ident.ok`), a real `ps` table with `process.pid` an over-threshold unprotected `agent-descendant` (`overmem.eligible: true`), plus one unreadable agent record (`invalid JSON`) so `index.ok` is false; `apply`, `killStale`, `killMemory` all on | `signal` not called, `deleteAgent` not called, `acted` has exactly one row, `kind: "refuse"`, `refusedBy` contains `index-incomplete` and the broken record's path, and no `kill` row |
+| `sends the signal in the same world when the index holds` | identical, without the broken record | `index` is `{ok: true, why: []}`, `signal` called once with `(process.pid, "SIGTERM")`, one acted `kill` row, no `refuse` row |
+
+**Mutation result.** With `gate === null &&` deleted from the kill condition (the
+pre-fix line restored verbatim, nothing else touched):
+`server/gc/tick.test.ts` → **1 failed | 31 passed**, the failure being
+`expect(test.signal).not.toHaveBeenCalled()` — the mock recorded
+`[ <pid>, "SIGTERM" ]` while `index.ok` was false. With the gate restored: **32 passed**.
+So the test fails exactly when the gate is removed.
+
+### Finding 2 — the kill phase re-reads the agent records
+
+**Defect.** `reevaluate` passed the tick's `agentsSnapshot` into `reevaluateProc`, so the
+`ownerState` behind a stale-eligibility decision could be a whole tick stale — while the
+reference re-reads the agent records before every signal (`recheck`, `slp-gc.bash:1116`).
+
+**Fix.** The kill phase now re-reads them **once per phase, not once per candidate**
+(`server/gc/tick.ts:1891-1925`), and passes that snapshot into `reevaluateProc`. A
+re-read that fails — throws, or comes back with an incomplete index — **refuses the
+phase** the way an incomplete index refuses the deletes (`:1054-1057`): one `refuse` row
+with `refusedBy: index-incomplete: the kill phase's agent re-read failed`, and no signal
+from a decision whose inputs could not be read. A phase with no candidate reads nothing,
+because the reference's `recheck` lives inside its per-pid loop. Test:
+`refuses the kill phase once when its own agent re-read is incomplete` (the tick's index
+held; a record appears mid-tick through the `procs` seam, so only the phase's own re-read
+is incomplete → one refusal row, no signal). Full suite: `883 passed`; `tsc --noEmit`
+clean.
+
+## Accepted gaps (final whole-branch review, 2026-10-30)
+
+Three gaps, recorded rather than silently carried. The first is the serious one: a
+capability the spec promised was not delivered.
+
+### Gap 1 — the spec's deliberate parity break was NOT implemented (delivered-capability gap)
+
+The design rules one deliberate departure from the reference: *"Replacement of the
+Supervisor proof with index-plus-listener gating"* — inside the daemon the
+Supervisor-serves-this-home proof is circular, so the authorised gate was to be a
+successful agent/schedule index read, a listener matching `paseo.pid`, and a resolved
+daemon entry (`docs/superpowers/specs/2026-10-29-agent-room-plugin-phase3-gc-design.md`,
+*Identity, apply authorization, and the one deliberate parity break*).
+
+**Not implemented.** `server/gc/identity.ts:190` keeps the reference's arm
+(`homeBound = supHome === "match" || (supHome === "none" && homeDefault)`) and `:199`
+includes `homeBound` in `ok`, refusing with the reference's own sentence at `:207`.
+
+**Consequence.** On this host the Supervisor's `PASEO_HOME` is `"unreadable"`, so
+`homeBound` is false, `ident.ok` is false, and `applyGateRefusal` refuses **every**
+acting tick (`identification failed: …`, §7 and Finding 1 above). The delivered port is
+therefore report-only on this host: **no rule can act even with `apply`, `killStale` and
+`killMemory` all enabled**, which is why no live act was ever demonstrated (§7). The
+spec's replacement gate would have admitted this home.
+
+**Decision needed.** Either implement the replacement (drop `homeBound` from `ok` and
+gate on `index.ok` + `listener` + a resolved daemon entry, as the design rules), or keep
+the reference's `homeBound` arm on purpose — and, if it is kept, accept in writing that
+the plugin does not act on a host whose Supervisor env is unreadable, which is this host.
+
+### Gap 2 — the reference's `needsProof` / `paseo agent inspect` compensation is not ported
+
+The reference marks a garbage row `needsProof` when an agent-class process's env could
+not be read, and `do_apply` then requires `paseo agent inspect --home … --json` to prove
+the agent archived and not running before the delete, refusing otherwise (the "env of
+agent-class processes is unreadable and `paseo agent inspect` did not prove it archived
+and not running" arm). The port has no such field and no `agent inspect` call: the same
+fact is **rendered as text only**, in the row's `reason` — *"NOTE: the env of N
+agent-class process(es) is unreadable, so --apply must first prove it archived and not
+running with `paseo agent inspect`"* (`server/gc/evaluate.ts:1652`) — and the delete
+proceeds on the record evidence.
+
+**Mitigation.** The plugin runs as the same uid as the agents it inspects, from inside
+the daemon that owns them, so env reads succeed for them by construction and `envBlind`
+is structurally ~0: the reference's compensation exists for a scan run from outside
+that tree, and the port is on the inside. Measured: the `20261030T015431Z.json` report
+carries `envBlind: [32916]` — one row, a same-uid `claude` child whose `ps -eww` read
+failed (`envRead: false`, `home: "unreadable"`) — against `garbage: 0` rows that tick.
+
+**When it matters.** When a tick has **an agent-class process whose env this uid cannot
+read** *and* **a garbage-shaped record for that agent**, the port would delete on the
+record alone: "no live process carries this owner" is *unknown* rather than *proven*, so
+the record of an agent that is in fact still running can be removed. It cannot matter for
+a cross-uid process (the plugin cannot signal or delete another user's work into
+existence) but it does matter for a same-uid read that failed, which is the one shape
+observed on this host.
+
+### Gap 3 — the reference's reserved 20 s kill window is not ported
+
+When the tick budget was exhausted by the record phase, the reference re-stamped the
+tick, set the budget to a hard 20 s, set `KILLS_ONLY=1` (no deletes, no report) and ran
+an `evaluate light` plus `do_apply` so the kill phase still got a window in that tick:
+*"tick budget (${TICK_BUDGET_S}s) used up by record: kill phase runs in a reserved 20 s
+window (deletes and report skipped)"* (`slp-gc.bash:1311-1318`, and `:1061` for the
+`KILLS_ONLY` no-delete arm).
+
+The port has no reserved window: the budget is one `tickBudgetS` per tick, so a slow
+collection phase ends the tick and the kills are deferred to the next one (60 s later).
+**Availability only** — no kill is ever made or skipped on evidence the port lacks, and
+nothing is left in an inconsistent state; a stale row simply lives up to one tick longer
+than it would under the reference.

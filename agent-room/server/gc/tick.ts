@@ -32,10 +32,12 @@
 //    reach the acting modules, so a rule that is off in the settings cannot act
 //    even if its call site were reached by mistake.
 // 4. **Identification failure refuses everything.** `do_apply` returns before
-//    its loop when `.procs.ident.ok` is not true (`:1050-1053`) and before that
+//    its loops when `.procs.ident.ok` is not true (`:1050-1053`) and before that
 //    when the index is incomplete (`:1054-1057`); both gates are reproduced here,
 //    the identification one in the tick because the acting modules only know
-//    about the index.
+//    about the index. The refusal covers the kills as well as the deletes: the
+//    reference's two loops are both behind these returns, so a refused tick emits
+//    one refusal row and sends no signal.
 // 5. **The I/O lives here and nowhere else.** `ps`, `top`, `lsof`, `vm_stat`,
 //    `sysctl`, the `paseo` CLI and the state-dir files are this module's; the
 //    decision modules stay pure. Every call takes the reference's `run_to` budget
@@ -1809,6 +1811,10 @@ export async function runTick(
 
   if (settings.apply) {
     if (gate !== null) {
+      // One row, not one per candidate: `do_apply` refuses the whole run on either
+      // gate and returns before *both* of its loops (`:1050-1057`), so the kills
+      // below are refused by this same row and nothing is even considered. The row
+      // names the gate that refused (`identification: …` / `index-incomplete: …`).
       acted.push(gate);
     } else {
       for (const candidate of unsigned) {
@@ -1867,39 +1873,88 @@ export async function runTick(
     }
   }
 
-  if (settings.apply && (settings.killStale || settings.killMemory)) {
+  // The kills sit behind the *same* two gates as the deletes: `do_apply` answers
+  // both refusals before either loop runs (`:1050-1057`), so a refused run signals
+  // nothing — and `gate`, already reported once above, is the whole of the refusal.
+  if (settings.apply && gate === null && (settings.killStale || settings.killMemory)) {
     const kinds: KillKind[] = [];
     if (settings.killStale) kinds.push("stale");
     if (settings.killMemory) kinds.push("mem");
-    const kills = await phase(
-      log,
-      "kills",
-      () =>
-        signalCandidates(
-          {
-            candidates: killCandidates(decided, procsPhase.orphans, runtime, settings.killComms),
-            maxKills: settings.maxKills,
-            budgetS: settings.tickBudgetS,
-            startedAt,
-            // The toggles, explicitly: a rule that is off in the settings cannot
-            // signal, whatever the caller's candidate list contains.
-            kinds,
-            memKillMb: settings.memKillMb,
-            killComms: settings.killComms,
-          },
-          {
-            signal:
-              deps.signal ??
-              ((pid: number, signal: "SIGTERM") => process.kill(pid, signal)),
-            reevaluate: (candidate) =>
-              reevaluateProc(candidate, { runtime, settings, agents: agentsSnapshot, log }),
-            now: () => epochOf(clock),
-            log,
-          },
-        ),
-      [],
-    );
-    acted.push(...kills);
+    const killList = killCandidates(decided, procsPhase.orphans, runtime, settings.killComms);
+
+    // The reference's `recheck` (`:1116`) re-reads the agent records before *every*
+    // signal, so the owner state a stale-eligibility decision reads is never older
+    // than the signal it authorises; the tick's own snapshot can be a whole tick
+    // stale. One re-read per kill phase, not one per candidate: the same freshness
+    // for a bounded cost. A phase with no candidate reads nothing, because the
+    // reference's recheck lives inside its per-pid loop.
+    let killAgents: AgentSnapshot | null = null;
+    if (killList.length > 0) {
+      try {
+        const reread = await snapshotAgents(paseoHome, { log });
+        // An incomplete re-read is a failed re-read: the reference's `recheck` fails
+        // outright when its own record scan fails (`:1028`), and a stale-eligibility
+        // decision must not be taken on half the records.
+        if (reread.index.ok === true) {
+          killAgents = reread;
+        } else {
+          warnLog(log)("gc kills refused: the agent index is incomplete", {
+            problems: reread.index.why.length,
+          });
+        }
+      } catch (error) {
+        warnLog(log)("gc kills refused: the agent records could not be re-read", {
+          error: reasonOf(error),
+        });
+      }
+    }
+
+    if (killList.length > 0) {
+      if (killAgents === null) {
+        // A re-read that failed refuses the phase the way an incomplete index refuses
+        // the deletes (`:1054-1057`): one row for the phase, and no signal from a
+        // decision whose inputs could not be read.
+        acted.push({
+          kind: "refuse",
+          id: "-",
+          acted: false,
+          reason:
+            "refused: the agent records could not be re-read before the kill phase (the re-read threw, or its own index is incomplete), so no signal was sent",
+          refusedBy: "index-incomplete: the kill phase's agent re-read failed",
+        });
+      } else {
+        const freshAgents: AgentSnapshot = killAgents;
+        const kills = await phase(
+          log,
+          "kills",
+          () =>
+            signalCandidates(
+              {
+                candidates: killList,
+                maxKills: settings.maxKills,
+                budgetS: settings.tickBudgetS,
+                startedAt,
+                // The toggles, explicitly: a rule that is off in the settings cannot
+                // signal, whatever the caller's candidate list contains.
+                kinds,
+                memKillMb: settings.memKillMb,
+                killComms: settings.killComms,
+              },
+              {
+                signal:
+                  deps.signal ??
+                  ((pid: number, signal: "SIGTERM") => process.kill(pid, signal)),
+                reevaluate: (candidate) =>
+                  reevaluateProc(candidate, { runtime, settings, agents: freshAgents, log }),
+                now: () => epochOf(clock),
+                log,
+              },
+            ),
+          [],
+        );
+        acted.push(...kills);
+      }
+    }
   }
 
   const epoch = epochOf(clock);

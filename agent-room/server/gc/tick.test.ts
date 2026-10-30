@@ -624,6 +624,103 @@ describe("runTick — the acting phases, with something to act on", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The apply gate covers the kills (do_apply's refusals precede both loops)
+// ---------------------------------------------------------------------------
+//
+// `do_apply` answers its two refusals before either of its loops (`:1050-1057`),
+// so a run it refuses deletes *and* signals nothing. These two tests use the same
+// world twice — a real identification, a real `ps` table with `process.pid` an
+// over-threshold, unprotected `agent-descendant` (i.e. one killable candidate),
+// and both kill toggles on — and differ only in whether a second agent record is
+// readable. With one unreadable record the whole index fails (`agents.ts` fails the
+// index on one record it cannot reduce), which is routine while an agent is being
+// written.
+
+/** A record the index cannot reduce: invalid JSON, so `index.ok` is false. */
+async function writeBrokenRecord(paseoHome: string): Promise<string> {
+  const path = join(paseoHome, "agents", "workspace-a", "broken-record.json");
+  await writeFile(path, "{ this is not a record", "utf8");
+  return path;
+}
+
+const KILL_WORLD = { apply: true, killStale: true, killMemory: true, memWarnMb: 512, memKillMb: 1024 };
+
+describe("runTick — the apply gate covers the kill phase", () => {
+  it("signals nothing and emits one refusal naming the index when the index is incomplete", async () => {
+    const test = await world(KILL_WORLD);
+    const broken = await writeBrokenRecord(test.deps.paseoHome ?? join(workspace, "paseo"));
+
+    const result = await runTick(test.deps);
+
+    // The world really is a world: identification holds and there is a candidate
+    // the memory rule would authorise a signal for.
+    expect(result.report.procs.ident.ok).toBe(true);
+    const row = result.report.procs.procs.find((entry) => entry.pid === process.pid);
+    expect(row?.protected).toBeNull();
+    expect(row?.overmem).toEqual({ eligible: true, why: "footprint 4096 MB > 1024 MB" });
+    // …and the index really is incomplete, for the record that cannot be read.
+    expect(result.report.index.ok).toBe(false);
+    expect(result.report.index.why.join("; ")).toContain("invalid JSON in the record");
+    expect(result.report.index.why.join("; ")).toContain(broken);
+
+    // The gate refused the whole acting half: no signal, no delete…
+    expect(test.signal).not.toHaveBeenCalled();
+    expect(test.deleteAgent).not.toHaveBeenCalled();
+    // …and one row says why, naming the gate that refused — not one row per
+    // candidate, and no kill row at all.
+    expect(result.acted).toHaveLength(1);
+    expect(result.acted[0]).toMatchObject({ kind: "refuse", id: "-", acted: false });
+    expect(String(result.acted[0]?.refusedBy)).toContain("index-incomplete");
+    expect(String(result.acted[0]?.refusedBy)).toContain("invalid JSON in the record");
+    expect(result.acted.some((entry) => entry.kind === "kill")).toBe(false);
+  });
+
+  it("sends the signal in the same world when the index holds", async () => {
+    const test = await world(KILL_WORLD);
+
+    const result = await runTick(test.deps);
+
+    expect(result.report.procs.ident.ok).toBe(true);
+    expect(result.report.index).toEqual({ ok: true, why: [] });
+    // The gate holds, so the kill phase runs and the candidate is signalled once.
+    expect(test.signal).toHaveBeenCalledTimes(1);
+    expect(test.signal).toHaveBeenCalledWith(process.pid, "SIGTERM");
+    const kill = result.acted.find((entry) => entry.kind === "kill" && entry.acted);
+    expect(kill).toMatchObject({ id: String(process.pid), acted: true, refusedBy: null });
+    // No gate row: nothing was refused.
+    expect(result.acted.some((entry) => entry.kind === "refuse")).toBe(false);
+  });
+
+  it("refuses the kill phase once when its own agent re-read is incomplete", async () => {
+    // The tick's index held; a record appears between that scan and the kill phase
+    // (the seam writes it after the process phase), so the phase's own re-read is the
+    // one that cannot be completed. A signal authorised by that re-read must not be
+    // sent, and the refusal is one row for the phase, not one per candidate.
+    const test = await world(KILL_WORLD);
+    test.deps.seams = {
+      procs: async (input) => {
+        const phase = await collectProcsPhase(input);
+        await writeBrokenRecord(test.deps.paseoHome ?? join(workspace, "paseo"));
+        return phase;
+      },
+    };
+
+    const result = await runTick(test.deps);
+
+    // The gate held at the tick's own scan, so this is the kill phase's own answer…
+    expect(result.report.index).toEqual({ ok: true, why: [] });
+    expect(result.report.procs.ident.ok).toBe(true);
+    // …it refused, once, naming the re-read, and sent nothing.
+    expect(test.signal).not.toHaveBeenCalled();
+    const refusals = result.acted.filter((entry) => entry.kind === "refuse");
+    expect(refusals).toHaveLength(1);
+    expect(String(refusals[0]?.refusedBy)).toContain("index-incomplete");
+    expect(String(refusals[0]?.refusedBy)).toContain("kill phase's agent re-read");
+    expect(result.acted.some((entry) => entry.kind === "kill")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The status fields added for the screen (fix round 1)
 // ---------------------------------------------------------------------------
 
