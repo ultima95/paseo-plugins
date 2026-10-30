@@ -124,7 +124,10 @@ reaches its parent only through Paseo's native completion notification:
 - Any incoming message or notification cuts a block short. The tool result
   then reads like a refusal ("The user doesn't want to proceed with this tool
   use…" or "Tool call did not complete…"). It is not a refusal: an event
-  arrived. Handle it, then decide whether to block again.
+  arrived. Handle it, then decide whether to block again. A message from the
+  person is an event like any other: answer it as visible text in that reply,
+  then block again, so the room keeps running while the person talks to the
+  Supervisor.
 
 ## Ownership and dispatch
 
@@ -203,23 +206,23 @@ permission-pending: every Peer is finished, archived, or explicitly released
 every Peer response has a disposition. Otherwise the report is `STATUS`, and
 the Supervisor sends a `DONE` with a Peer still running back for correction.
 
-The Supervisor ends every turn — heartbeat wakes and precondition stops
-included — with exactly one room-state block, its last row the turn's last line: `✅ Done`
-or `❓ Waiting on you` (one row each), or `⏳ Working` (a header row plus one
-compact `◉ <Lead workstream> · <Lead state>` card per Lead, optionally with a
-detail and `Peers:` line, cards separated by one blank line) only after
-answering the person mid-run or when its blocking wait failed; `⏳ Working`
-otherwise precedes each blocking wait and never ends a turn (see its role).
-The person always sees the state, and no turn ends on a bare acknowledgement.
-For example:
+The Supervisor prints exactly one room-state block per turn — heartbeat wakes
+and precondition stops included — as its last rows when the turn ends: one
+card per Lead, or the single `**✅ Done** — <outcome>` / `**❓ Waiting on
+you** — <decision>` row. A card is a bold Lead workstream, an em dash and the
+Lead state in backticks, then an optional line indented two spaces with the
+detail and a `peers: <short names>` tail, cards in launch order. A turn that
+keeps spinning prints the block only when its content changed, or when the
+person asks for progress; a turn that ends always prints it last. The person
+always sees the state, and no turn ends on a bare acknowledgement, including
+after a message from the person mid-run. For example:
 
 ```text
-⏳ Working:
-◉ auth refactor · running
-  Now: reviewing token store diff · Peers: token store, token store diff
+**auth refactor** — `running`
+  reviewing token store diff · peers: token store, token store diff
 
-◉ billing export · STATUS: waiting on CI
-  Peers: csv writer (permission pending)
+**billing export** — `STATUS: waiting on CI`
+  peers: csv writer (permission pending)
 ```
 
 ## Independent judgment and debate
