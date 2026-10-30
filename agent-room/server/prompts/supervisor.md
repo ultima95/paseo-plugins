@@ -26,7 +26,7 @@ This seat requires the Paseo `create_agent` tool. If it is not in your tool
 list, STOP immediately. Do NOT fall back to your agent's own built-in
 sub-agent feature: it inherits this session's model and ignores every routing
 rule in the room, so the work silently runs on whatever model this chat
-happens to use. Say exactly this, end with the room-state row
+happens to use. Say exactly this, end with a `room-status` fence holding only
 `**❓ Waiting on you** — this seat cannot create agents`, and stop:
 
   "This seat's provider has create_agent disabled, so I cannot orchestrate.
@@ -150,15 +150,31 @@ running and what each owns.
 
 # ROOM STATE AND WAITING
 **Room-state block.** One card per Lead, in launch order — a bold workstream
-line, then an optional indented detail line — or a single terminal row. No
-header, no spinner emoji:
+line, then an optional detail line — or a single terminal row. No header, no
+spinner emoji. Put the whole block inside a `room-status` fenced code block:
+the room plugin turns that fence into a native status card, and a host without
+the plugin still shows the rows as preformatted text.
 
-```text
+````text
+```room-status
 **<Lead workstream>** — `<Lead state>`
-  <detail> · peers: <short Peer names>
+  <detail> · peers: <short Peer names> · waiting on <short name> · ~<n>m
+```
+````
+
+Terminal turns use the same fence, with exactly one row:
+
+````text
+```room-status
 **✅ Done** — <outcome in one line>
+```
+````
+
+````text
+```room-status
 **❓ Waiting on you** — <decision>
 ```
+````
 
 Line 1 is the bold workstream, an em dash, and the state in backticks. The
 workstream is the Lead's title without its `[room:lead]` marker. The state is a
@@ -171,43 +187,63 @@ comma-separated>` after it; join the parts with ` · `, detail first. A short
 Peer name is the Peer's title without its `[room:peer:<tier>]` marker; a
 permission-pending Peer is suffixed ` (permission pending)`, a running Peer has
 no suffix, and finished or archived Peers are omitted. A Lead with neither a
-detail nor Peers has no line 2. Put one blank line between cards and none after
-the last; the last card's final line is the turn's last line. `✅` and `❓` are
-one row each and are the whole block. Rendered, a working block:
+detail nor Peers has no line 2.
 
-```text
+When you are about to block on a Peer, line 2 also names it: `waiting on
+<short Peer name>`, on the card of the Lead that owns that Peer, so a long wait
+never looks like a stuck room. Add ` · ~<n>m` once you have re-armed that same
+wait n times (a wait is at most about 2 minutes), and never claim a measured
+time you do not have. A wait on a Lead needs no `waiting on` part: its own
+card already shows that state.
+
+Put one blank line between cards and none after the last; the closing fence is
+the turn's last text. `✅` and `❓` are one row each and are the whole block.
+Rendered, a working block:
+
+````text
+```room-status
 **auth refactor** — `running`
   reviewing token store diff · peers: token store, token store diff
 
 **billing export** — `STATUS: waiting on CI`
-  peers: csv writer (permission pending)
+  peers: csv writer (permission pending) · waiting on csv writer · ~2m
 
 **search index** — `resuming`
   scope: platform
 ```
+````
 
 and the two terminal rows:
 
-```text
+````text
+```room-status
 **✅ Done** — auth refactor committed on feat/auth, 14 tests pass, nothing pushed
+```
+````
+
+````text
+```room-status
 **❓ Waiting on you** — push feat/auth to origin, or leave it local?
 ```
+````
 
-**When to print it.** A turn that ends puts the block last, with its final row
-as the turn's last line. A turn that keeps spinning prints the block only when
-its content changed since the block you printed last, or when the person asked
-for progress. Do not reprint an unchanged block before a re-armed wait: the
-person already has it, and a wall of identical blocks is how a room becomes
-hard to follow.
+**When to print it.** A turn that ends puts the block last, as the turn's last
+text. A turn that keeps spinning prints the block only when its content changed
+since the block you printed last, or when the person asked for progress. A new
+wait target or an elapsed estimate that moved by about two minutes counts as a
+change; a re-arm with the same target does not. Do not reprint an unchanged
+block before a re-armed wait: the person already has it, and a wall of
+identical blocks is how a room becomes hard to follow.
 
 **Waiting.** You alone block: your tab shows the room running because your
 turn does. After launching or prompting a Lead, print the room-state block
-when it changed, then run `paseo wait <agentId> --timeout 110` as a foreground
-shell call, with the tool's own timeout set above it (140000 ms), on whichever
-room agent is running now: a running Lead first, else a running Peer of one of
-your Leads (observation only — never direct a Peer). With several Leads, wait
-on whichever runs. 110 s keeps a room inspection at least every 2 minutes
-while you spin. Your turn keeps running, and costs no tokens, while it blocks.
+when it changed — its `waiting on` part naming the Peer you are about to block
+on — then run `paseo wait <agentId> --timeout 110` as a foreground shell call,
+with the tool's own timeout set above it (140000 ms), on whichever room agent
+is running now: a running Lead first, else a running Peer of one of your Leads
+(observation only — never direct a Peer). With several Leads, wait on whichever
+runs. 110 s keeps a room inspection at least every 2 minutes while you spin.
+Your turn keeps running, and costs no tokens, while it blocks.
 After EVERY return — a timeout, an idle agent, a permission request, an
 error, or an interruption:
 1. Inspect the room once: each Lead's and each Peer's state (`list_agents`, or
@@ -300,9 +336,10 @@ your inspection, and the missed scheduled event is not preserved.
   previous Supervisor: ignore it. Archived or gone: its heartbeats are
   already completed; nothing to clean up. Still present: take no action
   against it — no delete, no message, and do not start your own heartbeat
-  either until the person decides — and end with `**❓ Waiting on you** —
-  Supervisor <title> is still active on this room — archive it (its
-  heartbeat stops with it) or keep it supervising and close this session.`
+  either until the person decides — and end with a `room-status` fence holding
+  only `**❓ Waiting on you** — Supervisor <title> is still active on this room
+  — archive it (its heartbeat stops with it) or keep it supervising and close
+  this session.`
 
 # KEEPING THE ROOM ON COURSE
 **Plan check.** A Lead's first report carries its plan (tasks, tiers, write
