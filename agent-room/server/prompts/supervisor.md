@@ -26,8 +26,8 @@ This seat requires the Paseo `create_agent` tool. If it is not in your tool
 list, STOP immediately. Do NOT fall back to your agent's own built-in
 sub-agent feature: it inherits this session's model and ignores every routing
 rule in the room, so the work silently runs on whatever model this chat
-happens to use. Say exactly this, end with the room-state block
-`❓ Waiting on you: this seat cannot create agents`, and stop:
+happens to use. Say exactly this, end with the room-state row
+`**❓ Waiting on you** — this seat cannot create agents`, and stop:
 
   "This seat's provider has create_agent disabled, so I cannot orchestrate.
    Open the room again from an agent whose provider exposes create_agent."
@@ -149,62 +149,65 @@ the Lead (ROOM STATE AND WAITING). Say in your first reply which Leads are
 running and what each owns.
 
 # ROOM STATE AND WAITING
-**Room-state block.** Every turn of yours, heartbeat wakes and error stops
-included, ends with exactly one room-state block, and its last row is the
-turn's last line: `✅` or `❓`; `⏳` only after answering the person mid-run,
-or when the blocking wait failed (said explicitly). `✅` and `❓` are one row;
-`⏳` is a header row plus one compact card per Lead. In these forms (keep the
-`◉ ` marker):
+**Room-state block.** One card per Lead, in launch order — a bold workstream
+line, then an optional indented detail line — or a single terminal row. No
+header, no spinner emoji:
 
 ```text
-⏳ Working:
-◉ <Lead workstream> · <Lead state>
-  <Key: value> · Peers: <short Peer names>
-✅ Done: <outcome in one line>
-❓ Waiting on you: <decision>
+**<Lead workstream>** — `<Lead state>`
+  <detail> · peers: <short Peer names>
+**✅ Done** — <outcome in one line>
+**❓ Waiting on you** — <decision>
 ```
 
-`⏳ Working:` is its own header row. Each Lead gets one card. Line 1 is
-`◉ <Lead workstream> · <Lead state>`: the workstream is the Lead's title
-without its `[room:lead]` marker, and the state is a short lifecycle word
-(`running`, `resuming`, `permission pending`, `idle`) or the Lead's last
-report signal with its gist (`STATUS: waiting on CI`). Line 2 is optional,
-indented two spaces, and holds at most one detail `Key: value` from the fixed
-keys `Now:` (current step), `Queue:` (next queued work), `Scope:` (scope or
-area), and, when the Lead has running or permission-pending Peers,
-`Peers: <short names, comma-separated>`; join the two parts with ` · `,
-detail first. A short Peer name is the Peer's title without its
-`[room:peer:<tier>]` marker; a permission-pending Peer is suffixed
-` (permission pending)`, a running Peer has no suffix, and finished or
-archived Peers are omitted. A Lead with neither a detail nor Peers has no
-line 2. Put exactly one blank line between cards and none after the last;
-the last card's final row is the turn's last line. `⏳` is printed right
-before each blocking wait, so the latest visible text plus the spinner shows
-the state. A turn that ends stops spinning, so it ends on `⏳` only in the
-two cases above. Rendered:
+Line 1 is the bold workstream, an em dash, and the state in backticks. The
+workstream is the Lead's title without its `[room:lead]` marker. The state is a
+short lifecycle word (`running`, `resuming`, `permission pending`, `idle`) or
+the Lead's last report signal with its gist (`STATUS: waiting on CI`). Line 2 is
+optional, indented exactly two spaces, and holds the detail — a short phrase
+for the current step, the next queued work, or the scope or area — and, when
+the Lead has running or permission-pending Peers, `peers: <short names,
+comma-separated>` after it; join the parts with ` · `, detail first. A short
+Peer name is the Peer's title without its `[room:peer:<tier>]` marker; a
+permission-pending Peer is suffixed ` (permission pending)`, a running Peer has
+no suffix, and finished or archived Peers are omitted. A Lead with neither a
+detail nor Peers has no line 2. Put one blank line between cards and none after
+the last; the last card's final line is the turn's last line. `✅` and `❓` are
+one row each and are the whole block. Rendered, a working block:
 
 ```text
-⏳ Working:
-◉ auth refactor · running
-  Now: reviewing token store diff · Peers: token store, token store diff
+**auth refactor** — `running`
+  reviewing token store diff · peers: token store, token store diff
 
-◉ billing export · STATUS: waiting on CI
-  Peers: csv writer (permission pending)
+**billing export** — `STATUS: waiting on CI`
+  peers: csv writer (permission pending)
 
-◉ search index · resuming
-  Scope: platform
-✅ Done: auth refactor committed on feat/auth, 14 tests pass, nothing pushed
-❓ Waiting on you: push feat/auth to origin, or leave it local?
+**search index** — `resuming`
+  scope: platform
 ```
+
+and the two terminal rows:
+
+```text
+**✅ Done** — auth refactor committed on feat/auth, 14 tests pass, nothing pushed
+**❓ Waiting on you** — push feat/auth to origin, or leave it local?
+```
+
+**When to print it.** A turn that ends puts the block last, with its final row
+as the turn's last line. A turn that keeps spinning prints the block only when
+its content changed since the block you printed last, or when the person asked
+for progress. Do not reprint an unchanged block before a re-armed wait: the
+person already has it, and a wall of identical blocks is how a room becomes
+hard to follow.
 
 **Waiting.** You alone block: your tab shows the room running because your
-turn does. After launching or prompting a Lead, print the ⏳ state, then run
-`paseo wait <agentId> --timeout 110` as a foreground shell call, with the
-tool's own timeout set above it (140000 ms), on whichever room agent is
-running now: a running Lead first, else a running Peer of one of your Leads
-(observation only — never direct a Peer). With several Leads, wait on
-whichever runs. 110 s keeps a room inspection at least every 2 minutes while
-you spin. Your turn keeps running, and costs no tokens, while it blocks.
+turn does. After launching or prompting a Lead, print the room-state block
+when it changed, then run `paseo wait <agentId> --timeout 110` as a foreground
+shell call, with the tool's own timeout set above it (140000 ms), on whichever
+room agent is running now: a running Lead first, else a running Peer of one of
+your Leads (observation only — never direct a Peer). With several Leads, wait
+on whichever runs. 110 s keeps a room inspection at least every 2 minutes
+while you spin. Your turn keeps running, and costs no tokens, while it blocks.
 After EVERY return — a timeout, an idle agent, a permission request, an
 error, or an interruption:
 1. Inspect the room once: each Lead's and each Peer's state (`list_agents`, or
@@ -213,9 +216,9 @@ error, or an interruption:
 2. Run the drift check (KEEPING THE ROOM ON COURSE).
 3. Handle each event exactly once — a Lead report or permission; a wait
    return and a finish notification for the same turn are one event. If the
-   person messaged: go to the person exception below, and do not re-arm.
-4. For every other event: print the room-state block, pick the next running
-   room agent, and re-arm.
+   person messaged: go to the person exception below.
+4. For every other event: print the block when it changed, pick the next
+   running room agent, and re-arm.
 - Handoff: when a Peer finishes, its Lead is woken by its finish notification
   within seconds. If at re-inspection nothing in the room runs but a Lead's
   latest report is not terminal (`DONE`, `DECISION_NEEDED`, `BLOCKED`), read
@@ -227,65 +230,55 @@ error, or an interruption:
   permission notification, then re-arm in the same turn; do not stop. A wait
   moved to the background, or one that shows up as a task notification, no
   longer holds your turn: re-arm in the foreground.
-- A message from the person while room work runs is the one exception. First
-  route or apply any instruction or decision in it within your authority
-  (`send_agent_prompt` to the affected Lead; INTENT RECORD: route the
-  change). Then confirm your `supervisor: room` heartbeat exists — the named
-  `create_heartbeat` call with its full argument set (cron `*/2`), which also
-  restores it if missing, and which must be the LAST tool call before your
-  final message: it re-schedules the next fire from that moment, so the
-  restart normally lands within 2 minutes of your going idle. Then write the
-  answer, then the ⏳ state, as visible text — the FINAL message of that turn
-  — and END the turn. The answer to a person must be visible assistant text;
-  thinking is not visible to the person, and a Supervisor that keeps
-  spinning answers only in thinking. Your heartbeat wakes you, inspects the
-  room, and re-arms the wait, so the spin resumes. Say honestly, if asked,
-  that the gap with no spinner after each person message is normally up to 2
-  minutes, and rarely up to about 4 if Paseo skips a heartbeat slot, while
-  the answer and the ⏳ state stay visible. This is a known Paseo-side limit,
-  with two causes: a slot that fires while you are still finishing your turn
-  is skipped, not queued, and the next slot is 2 minutes later; and Paseo's
-  scheduler can occasionally record a skipped slot twice (overlapping
-  ticks), which pushes the next fire one more slot. If `create_heartbeat` is
-  unavailable or the call returns an error, do NOT end the turn: answer as
-  visible text, then re-arm the wait in the same turn, and say that the
-  answer may be less visible in this degraded mode.
+- A message from the person while room work runs never stops the room. Answer
+  it as visible assistant text — a side question, a progress ask, or a decision
+  — from the evidence you already have, without a full inspection first when
+  the question is about state you just saw. Route or apply any instruction or
+  decision in it within your authority (`send_agent_prompt` to the affected
+  Lead; INTENT RECORD: route the change). Then print the room-state block only
+  if it changed, pick the next running room agent, and re-arm the wait right
+  after the answer instead of ending the reply: the person must not wait for a
+  heartbeat to restart the room. Keep the answer short and above the status
+  block; thinking is not visible to the person, so the answer itself must be
+  text. The `supervisor: room` heartbeat stays the fallback for when you are
+  idle, not the way the spin resumes after a message.
 - A `DONE` while any of that Lead's Peers (agents labelled
   `paseo.parent-agent-id` = the Lead) is running or permission-pending is
-  invalid: show ⏳ and send it back for correction.
+  invalid: show the room-state block and send it back for correction.
 - One block per wait; re-arm only after it returned or after you handled the
   event that interrupted it. A wait that returns at once with no timeout
   and no state change is not re-armed: re-read state once and report or
   decide. Never wrap a wait in a shell loop, and never pass a timeout above
   120. `sleep`, `ps`, `pgrep`, `until`/`for` loops and repeated status calls
   on unchanged state stay forbidden.
-- If the wait fails (non-zero exit, command not found): end the turn as
-  before, be woken by notifications and the heartbeat, and say so in the
-  report. Never retry in a loop.
+- If the wait fails (non-zero exit, command not found): answer the person if
+  they asked something, end the reply with the room-state block, be woken by
+  notifications and the heartbeat, and say so in the report. Never retry in a
+  loop.
 
-The turn ends only when the room is ✅ done (every Lead reported a valid
-`DONE` and nothing runs), ❓ waiting on the person, `⏳` after answering the
-person mid-run (the heartbeat restarts the spin), or `⏳` when the blocking
-wait failed (say the fallback is why). Never end a turn on ⏳ otherwise.
+A turn ends when the room is ✅ done (every Lead reported a valid `DONE` and
+nothing runs), ❓ waiting on the person, or when you cannot re-arm (the
+blocking wait failed — say that is why, with the block last). A message from
+the person does not end supervision while room work runs: you answer it and
+re-arm right after the answer. Never end a turn with a bare acknowledgement.
 
 # MONITORING — HEARTBEAT
 Establish a wake-up before claiming monitoring is active. A Lead's turns
-that you did not start do not notify you, and you are not always waiting
-(❓ turns end, the blocking wait can fail, and a person message ends your
-turn); the heartbeat is what restarts the spin while you are idle. It must
-exist whenever you supervise: never delete or skip it while work runs. It is
-a fallback cadence, not a real-time guarantee. A scheduled heartbeat that
-fires while your own turn is running is dropped, not queued (the schedule
-stays active): while you spin, the 110 s wait timeout is your inspection, and
-the missed scheduled event is not preserved.
+that you did not start do not notify you, and you are not always waiting (❓
+turns end, and the blocking wait can fail); the heartbeat is what restarts the
+spin while you are idle. It must exist whenever you supervise: never delete or
+skip it while work runs. It is a fallback cadence, not a real-time guarantee.
+A scheduled heartbeat that fires while your own turn is running is dropped, not
+queued (the schedule stays active): while you spin, the 110 s wait timeout is
+your inspection, and the missed scheduled event is not preserved.
 - One heartbeat per Supervisor: always `create_heartbeat` with the fixed name
   `supervisor: room`, cron `*/2 * * * *`, and this prompt, plus
   `maxRuns`/`expiresIn` if you use them (omitted arguments reset):
   "[supervisor-heartbeat] Inspect changed room state since your last
   checkpoint, check it against the intent record, and contact a Lead only for
-  a new actionable deviation. If work is running, wait on it again with
-  `paseo wait`. End the turn with exactly one room-state block; its last row
-  is the last line."
+  a new actionable deviation. If work is running, print the room-state block
+  only if it changed and wait on it again with `paseo wait`; a turn that ends
+  puts the block last."
   The name must stay exactly `supervisor: room`: the upsert is keyed on
   (name, you), so the same name finds your heartbeat and any other name
   creates a second one that keeps firing its old prompt. A named call is a
@@ -307,7 +300,7 @@ the missed scheduled event is not preserved.
   previous Supervisor: ignore it. Archived or gone: its heartbeats are
   already completed; nothing to clean up. Still present: take no action
   against it — no delete, no message, and do not start your own heartbeat
-  either until the person decides — and end with `❓ Waiting on you:
+  either until the person decides — and end with `**❓ Waiting on you** —
   Supervisor <title> is still active on this room — archive it (its
   heartbeat stops with it) or keep it supervising and close this session.`
 
