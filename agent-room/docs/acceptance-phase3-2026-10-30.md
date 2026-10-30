@@ -645,8 +645,8 @@ clean.
 
 ## Accepted gaps (final whole-branch review, 2026-10-30)
 
-Three gaps, recorded rather than silently carried. The first is the serious one: a
-capability the spec promised was not delivered.
+Three gaps, recorded rather than silently carried. Gap 1 was a delivered-capability gap
+at merge time and was closed on 2026-10-30; Gaps 2 and 3 remain open by decision.
 
 ### Gap 1 — the spec's deliberate parity break was NOT implemented (delivered-capability gap)
 
@@ -657,21 +657,37 @@ successful agent/schedule index read, a listener matching `paseo.pid`, and a res
 daemon entry (`docs/superpowers/specs/2026-10-29-agent-room-plugin-phase3-gc-design.md`,
 *Identity, apply authorization, and the one deliberate parity break*).
 
-**Not implemented.** `server/gc/identity.ts:190` keeps the reference's arm
-(`homeBound = supHome === "match" || (supHome === "none" && homeDefault)`) and `:199`
-includes `homeBound` in `ok`, refusing with the reference's own sentence at `:207`.
+**Resolved on 2026-10-30** (this section originally recorded the gap and the decision it
+needed).
 
-**Consequence.** On this host the Supervisor's `PASEO_HOME` is `"unreadable"`, so
-`homeBound` is false, `ident.ok` is false, and `applyGateRefusal` refuses **every**
-acting tick (`identification failed: …`, §7 and Finding 1 above). The delivered port is
-therefore report-only on this host: **no rule can act even with `apply`, `killStale` and
-`killMemory` all enabled**, which is why no live act was ever demonstrated (§7). The
-spec's replacement gate would have admitted this home.
+The replacement gate is implemented as the design rules, with one detail the design
+could not know: Paseo runs a plugin's server code in a **child** of the daemon, not in
+the daemon process. So "this code serves this home" is proven by the identified daemon
+being either the running process or the one that spawned it:
 
-**Decision needed.** Either implement the replacement (drop `homeBound` from `ok` and
-gate on `index.ok` + `listener` + a resolved daemon entry, as the design rules), or keep
-the reference's `homeBound` arm on purpose — and, if it is kept, accept in writing that
-the plugin does not act on a host whose Supervisor env is unreadable, which is this host.
+- `resolveIdentity` accepts `selfPid` and `selfPpid`; `inProcess` is true when the pid
+  `paseo.pid` names equals either. `ok` now requires
+  `!duplicated && pidFile && supervisor && daemon && listener && (homeBound || inProcess)`
+  (`server/gc/identity.ts`).
+- `tick` passes `process.pid` and `process.ppid`; the plugin's server process runs as a
+  child of the identified `Paseo Daemon` (observed: `selfPid 48609`, `selfPpid 1320`).
+- An absent or non-numeric self pid never counts as the daemon, and the in-process proof
+  cannot rescue a failed Supervisor, duplicate rows or a listener mismatch (tests
+  `resolveIdentity — the in-daemon proof`).
+- `homeBound` is still computed and reported; the report's `$idt` stays byte-identical to
+  the reference, so `inProcess` is internal to the identity object and never serialized.
+- The rest of the gate is unchanged: `applyGateRefusal` still requires `index.ok`, and
+  every candidate is re-evaluated and signature-checked before it is touched.
+
+**Live evidence.** After a reload, a forced report (`reports/20261030T033940Z.json`)
+carries `ident.ok: true`, `why: "ok"`, `homeBound: false`, `supHome: "unreadable"`,
+`daemonPid: 1320`, `listener: true`. Suite 890/890, typecheck clean. With every rule
+still off, that report listed 161 eligible garbage candidates — so enabling `apply` now
+acts, which is the capability this gap was blocking.
+
+**Per-rule posture is unchanged by this fix:** stale kills still require the process
+env's `PASEO_HOME` to match, memory kills still require class + allowlist + daemon
+descent, and orphans still need a ledger or env proof.
 
 ### Gap 2 — the reference's `needsProof` / `paseo agent inspect` compensation is not ported
 
