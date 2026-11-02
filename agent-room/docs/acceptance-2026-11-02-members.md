@@ -26,7 +26,7 @@ v24.3.0
 
 This record's own commit is the one that follows `f563563` on this branch. Through `f563563` the
 branch is 22 commits and 43 files under `agent-room/` (`5734 insertions(+), 99 deletions(-)`),
-including 9 new test files and additions to 7 existing ones.
+including 9 new test files and additions to 8 existing ones.
 
 ## 1. Full suite — 1100 of 1100 green
 
@@ -45,10 +45,10 @@ ones: `index.server.test.ts`, `server/store.test.ts`, `server/events.test.ts`, `
 `server/inject.test.ts`, `server/render.test.ts`, `server/prompts/prompts.test.ts` and
 `client/view-model.test.ts`.
 
-That block is the run on the committed tree, and it is one of two identical runs: the same command
-run minutes earlier, before the commit, reported the same `42 passed (42)` and `1100 passed (1100)`
-with a 970 ms duration. Durations vary run to run; the counts do not, and sections 2–3 below are from
-the same committed-tree sequence.
+That block quotes the 906 ms run. The same four commands were run three times across the edits, and
+every run reported the same counts — `42 passed (42)`, `1100 passed (1100)` — while the durations came
+in at 906 ms, 787 ms and 725 ms; the run on the committed tree itself was the 725 ms one. Durations
+vary run to run; the counts do not, and sections 2–3 below are from the same sequence.
 
 ## 2. Typecheck — clean
 
@@ -84,9 +84,9 @@ role, your role's brief, your member section when the member has one, and your
 role table; follow them for this whole session.
 ```
 
-which matches the protocol's own wording (`protocol.md`: "your member section when the member has
-one") instead of telling a worker that its prompt holds four things when a bound seat's prompt holds
-five.
+matching the protocol's own prompt-composition paragraph, which already names "your member section when
+the member has one" in that position. The edit aligns the worker template with the paragraph it
+restates, rather than leaving the template a sentence behind it.
 
 ## 4. Spec acceptance mapping
 
@@ -129,10 +129,10 @@ The first command prints nothing, and `server/guard.test.ts` appears nowhere in 
 the hierarchy rules were not relaxed to let members exist, and the member seats ride the existing role
 grammar. `server/guard.ts` is untouched too.
 
-### 4b. Two gaps, reported rather than papered over
+### 4b. Three gaps, reported rather than papered over
 
-Two halves of items 1 and 2 are argued from composition rather than pinned by a single test. Both are
-recorded here as they stand, not rounded up:
+Three halves of items 1, 2 and 3 are argued from composition rather than pinned by a single test. All
+three are recorded here as they stand, not rounded up.
 
 - **Item 1** — no test launches a *second* room on the same member and compares the two seat configs.
   What is pinned is the mechanism: the launch reads the member record and forces its seat
@@ -146,13 +146,27 @@ recorded here as they stand, not rounded up:
   not exercised with a non-matching lesson. `handlers.test.ts` and `events.test.ts` both stub
   `lessonsFor`, so the exclusion is proven by code reading, not by a test. A one-line store test
   (two lessons, one scope each, expect one back) would close it.
+- **Item 3** — the final clause, "accepting one appends it and the next room's prompt contains it", is
+  composed from two tests and not chained by either. `member-store.test.ts` › `accepts and rejects
+  pending candidates` pins the first half — an accept appends the lesson — and `render.test.ts` plus
+  the `handlers.test.ts` member tests pin that a lesson in a loaded scope renders into the prompt. No
+  test renders a prompt from a store that accepted a candidate: `acceptPending` appears only in
+  `member-store.test.ts` and `member-handlers.test.ts` (plus a never-called stub in `events.test.ts`),
+  and neither file renders a prompt. **Item 3's prompt-rendering clause is therefore not directly
+  covered** — nothing asserts that the *next* room's prompt contains the lesson an accept just wrote,
+  only that the accept stores it and that a stored lesson in scope renders. A test that accepts a
+  candidate on a real store and then renders the next room's prompt from that store would close it.
+
+None of the three is a behaviour defect as far as code reading shows; they are the places where this
+record's evidence stops short of the spec's sentence, stated plainly so a later task can close them.
 
 ## 5. Migration demonstration
 
 The seed test, run alone, and a real `members.json` it produces. The sample comes from a throwaway
 `mkdtemp` sandbox that loaded the real `createMemberStore`, ran the real `migrateMembers` against a
 store reporting `migratedFromV1()`, and printed the file the store wrote; the throwaway test file was
-deleted after the run, so the suite counts in section 1 are unaffected.
+deleted after the run, so the suite counts in section 1 are unaffected. This sample is illustrative; it
+was produced by a one-off run and is not reproducible from the suite.
 
 ```
 $ cd agent-room && npx vitest run index.server.test.ts \
