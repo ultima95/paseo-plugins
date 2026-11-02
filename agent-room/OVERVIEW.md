@@ -30,9 +30,38 @@ Legacy titles are read, never written. A room created before this grammar keeps 
 
 A title that names no configured role is unmanaged. The plugin never modifies, records, or steers such an agent, whatever its parent or its task looks like. The one exception is a child created by a room seat, which the guard treats as a violation and archives, as described under The guard.
 
+## Members
+
+A member is a durable Supervisor or Lead: a name, a role (`supervisor` or `lead`), a seat, a memory policy, a charter, and the lessons it has learned. A role is the seat recipe every room shares; a member is the identity that keeps what that seat learned, so it outlives one room and is reused by the next. Members are not worker roles. A worker is launched by a Lead for one bounded outcome and carries no memory of its own, so only the two seats a room binds — Supervisor and Lead — can be bound to a member.
+
+A room launched on a member runs that member's seat. The Supervisor is created on it directly — the plugin forces the member's provider, model, mode, thinking level, and feature values onto the create request, the same way a title forces a role's — and the Supervisor's role table shows the Lead member's provider and model, so the first Lead it launches arrives on the Lead member's seat and the plugin completes that seat from the member. A room launched with no member named runs the catalog role's seat and records no member ids, which is what every room created before members looks like. The first load of a version 1 `rooms.json` seeds two members from the saved catalog — `default-supervisor` and `default-lead`, named after the Supervisor and Lead roles and carrying their seats — and never re-seeds: an existing or corrupt `members.json` is left alone. The Members screen writes one whole member record at a time, its charter, and the accept or reject of a pending candidate, and shows the lessons and episodes the member has accumulated.
+
+## Memory scopes
+
+Memory is scoped so a lesson reaches the rooms it is true for and no others. A scope is one of three strings:
+
+- `global` — true for every room on this daemon.
+- `repo:<sha8>` — one repository, identified by the first eight hex characters of the SHA-256 of its normalized identity.
+- `workspace:<path>` — one workspace directory, matched exactly after normalizing its trailing slash.
+
+A room loads the lessons in `global`, its repository's scope when it has one, and its own workspace's scope. Repository identity is the normalized `origin` remote — host and path, without the transport, the user, or a `.git` suffix, so two clones of one repository share a scope — and a repository with no remote falls back to its root path. A room whose directory cannot be resolved loads `global` only.
+
+## Promotion
+
+A finished room proposes; it does not write lessons by itself. When a room is archived, its episodes become candidates — one per decision and one per rejection — scoped to the room's repository, or to its workspace when it has no repository, and each candidate is routed by the member's memory policy:
+
+- `human` — every candidate waits in the member's `pending.jsonl` until someone accepts it on the Members screen. Accepting writes a lesson; rejecting appends a tombstone carrying the same id, so the candidate is not proposed again.
+- `auto` — a candidate whose scope type is listed in `autoScopes` becomes a lesson without review. The default `autoScopes` is `["repo", "workspace"]`, so a repository or workspace lesson is promoted while a `global` one still waits for review.
+
+A candidate is dropped when the same lesson already exists in the same scope. Its id is content-addressed from the scope and the normalized text, so the same decision in the same scope always proposes the same candidate.
+
+## Episodes
+
+An episode is a deterministic row taken from what a Supervisor or Lead turn actually said. Five signals become facts and nothing else does: `DECISION_NEEDED` becomes a decision, `REJECT` a rejection, `BLOCKED` a blocked row, and `ACCEPT` and `DONE` an outcome. A worker's signals reach its Lead as messages and contribute no episode of their own. The signals are read from the room feed row a turn already wrote, an obvious credential in the text is replaced with `[redacted]` before the fact is stored, and closing a room adds one `outcome` fact carrying a shortened copy of the room's task. An episode is not retrieved into a prompt in v1: only the lessons promoted from it reach a prompt, and the Members screen shows the rest read-only.
+
 ## Prompt delivery
 
-Every role gets its prompt through `config.systemPrompt`: any system prompt the caller already set is kept first, and the shared protocol, the role's kind prompt, the role's own brief, and a role table rendered from the saved catalog are appended after it, in that order. The brief is how a `Reviewer` becomes the worker prompt plus review-specific instructions. Turn reports are not relayed by the plugin. A child's report reaches its parent through Paseo's native `notifyOnFinish` completion notification.
+Every role gets its prompt through `config.systemPrompt`: any system prompt the caller already set is kept first, and the shared protocol, the role's kind prompt, the role's own brief, the member section when the seat is bound to a member, and a role table rendered from the saved catalog are appended after it, in that order. The member section names the member, its charter, and up to 12 of the lessons in the scopes the room loads, newest first; an oversized charter, lessons beyond 12, or a section over its cap are truncated deterministically and the room feed gets one `member note`. The brief is how a `Reviewer` becomes the worker prompt plus review-specific instructions. Turn reports are not relayed by the plugin. A child's report reaches its parent through Paseo's native `notifyOnFinish` completion notification.
 
 The separate `command-code` plugin carries the same prompt to Command Code roles. It is not bundled with agent-room. Command Code has no ACP field for a session system prompt, so that plugin stages the prompt in a per-connection file and ships a small Command Code mod that appends it.
 
@@ -52,7 +81,7 @@ The Supervisor ends every turn with one room-state block inside a `room-status` 
 
 A room uses the providers you have already signed in on the daemon machine, so set each role to a provider, model, mode, and thinking level that is available there. The plugin needs no account, token, or API key of its own, and Paseo 0.13.1 or newer. A Command Code role also requires the separate `command-code` plugin installed and enabled on the daemon alongside agent-room, because that plugin is what delivers the role prompt; without it the agent starts but arrives with no room prompt.
 
-Room state is one `rooms.json` under the daemon's plugin data directory (`$PASEO_HOME/plugin-data/agent-room`, or `~/.paseo/plugin-data/agent-room` when `PASEO_HOME` is unset). It holds rooms, the room's role seats, and each room's newest 500 feed events; the GC state directory below is the plugin's other store.
+Room state is `rooms.json` (version 2) and `members.json` (version 1) under the daemon's plugin data directory (`$PASEO_HOME/plugin-data/agent-room`, or `~/.paseo/plugin-data/agent-room` when `PASEO_HOME` is unset). Member memory lives in `members/<memberId>/`: `charter.md`, `lessons.jsonl`, `pending.jsonl`, and `episodes/<roomId>.jsonl`. `rooms.json` is forward-only after version 2. It holds rooms, the member ids a room is bound to, the room's role seats, and each room's newest 500 feed events; the GC state directory below is the plugin's other store.
 
 ## Garbage collection
 
@@ -73,4 +102,9 @@ The plugin carries a port of the `slp-gc` collector: one GC screen, one 60 s in-
 - An agent created without a parent link, from a detached `create_agent` call or the `paseo` CLI in a role's shell, escapes the guard entirely. Only a child the Paseo MCP `create_agent` tool created carries the link the guard reads, so avoiding the other forms is a prompt rule only.
 - Roles are global. Every room running at the same time uses the same saved catalog, and a role change applies to the next agent created, including a worker a running Lead launches later. Role names are reserved on this daemon, and a role rename is not supported: add a role under the new name and archive the old one, which keeps legacy titles resolvable.
 - A title is the only pre-create channel the plugin has. Paseo's `agent.create` hook exposes no labels, so an agent titled with an ordinary `Word: text` that happens to equal a configured role name is read as that role.
-- `rooms.json` is forward-only after role seats: do not roll the plugin back, because the previous schema cannot read role-only seats.
+- One Lead member per room, and every Lead in a room shares it. A room binds one Supervisor member and one Lead member; a second Lead launched later runs the same member, memory included.
+- The pre-create hook sees no parent and no room, so it recognizes a Lead member's seat by matching provider and model. Two Lead members saved on the same seat are indistinguishable there, and the first one in the list is the member that seat is read as.
+- Global candidates are not produced by a live room in v1. A room's candidates are scoped to its repository or workspace, so a `global` lesson arrives only through an explicit import or a test, and it defaults to pending under the shipped policies.
+- The `room-status` card does not show member names. The role tree and the room list name the member behind a bound seat; the Supervisor's status card stays role-only.
+- No worker members, no mid-room memory edits, and no cross-member memory. Only a Supervisor or Lead seat has member memory; lessons are promoted when the room closes and a member's lessons are read by that member alone.
+- `rooms.json` is forward-only after version 2: do not roll the plugin back, because the previous schema cannot read member bindings or role-only seats.
