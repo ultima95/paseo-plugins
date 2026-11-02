@@ -66,6 +66,27 @@ const seat = (
   title: `[room:${marker.seat}] ${agentId}`,
 });
 
+const roleSeat = (
+  agentId: string,
+  roomId: string,
+  parentId: string | null,
+  role: { id: string; name: string; kind: "supervisor" | "lead" | "worker" },
+): SeatRecord => ({
+  agentId,
+  roomId,
+  parentId,
+  roleId: role.id,
+  roleName: role.name,
+  roleKind: role.kind,
+  provider: "claude",
+  model: "claude-opus-5-5",
+  title: `${role.name}: ${agentId}`,
+});
+
+const SUPERVISOR = { id: "supervisor", name: "Supervisor", kind: "supervisor" as const };
+const LEAD = { id: "lead", name: "Lead", kind: "lead" as const };
+const WORKER = { id: "implementer", name: "Implementer", kind: "worker" as const };
+
 const feedOf = (id: string) => ({
   roomId: "R",
   kind: "message" as const,
@@ -80,16 +101,64 @@ describe("createRoomStore", () => {
     const a = make();
     await a.load();
     a.addRoom(room("R"));
-    a.addSeat(seat("R", "R", null, { seat: "supervisor" }));
-    a.addSeat(seat("L", "R", "R", { seat: "lead" }));
+    a.addSeat(roleSeat("R", "R", null, SUPERVISOR));
+    a.addSeat(roleSeat("L", "R", "R", LEAD));
     a.appendFeed({ roomId: "R", kind: "message", from: "L", to: "R", label: "DONE", text: "ok" });
     await a.flush();
 
     const b = make();
     await b.load();
     expect(b.room("R")!.seats.map((s) => s.agentId)).toEqual(["R", "L"]);
+    expect(b.seat("R")).toMatchObject({
+      roleId: "supervisor",
+      roleName: "Supervisor",
+      roleKind: "supervisor",
+    });
+    expect(b.seat("R")?.marker).toBeUndefined();
     expect(b.room("R")!.feed[0]).toMatchObject({ label: "DONE", from: "L", to: "R" });
     expect(b.children("R").map((s) => s.agentId)).toEqual(["L"]);
+  });
+
+  it("still loads a seat recorded with a legacy marker only", async () => {
+    await writeFile(
+      file,
+      JSON.stringify({ version: 1, rooms: [room("R")], seats: [seat("L", "R", "R", { seat: "lead" })], feed: [] }),
+      "utf8",
+    );
+    const s = make();
+    await s.load();
+
+    expect(s.seat("L")?.marker).toEqual({ seat: "lead" });
+    expect(s.seat("L")?.roleId).toBeUndefined();
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it("accepts a role-only seat and rejects a seat with neither a role nor a marker", () => {
+    const s = make();
+    s.addSeat({
+      agentId: "A1",
+      roomId: "R1",
+      parentId: null,
+      roleId: "supervisor",
+      roleName: "Supervisor",
+      roleKind: "supervisor",
+      provider: "claude",
+      model: "claude-opus-5-5",
+      title: "Supervisor: x",
+    });
+    expect(s.seat("A1")?.roleKind).toBe("supervisor");
+
+    s.addSeat({
+      agentId: "A2",
+      roomId: "R1",
+      parentId: null,
+      provider: "claude",
+      model: "claude-opus-5-5",
+      title: "no role",
+    } as never);
+
+    expect(s.seat("A2")).toBeUndefined();
+    expect(log.error).toHaveBeenCalledWith("rejected invalid seat", { error: expect.any(String) });
   });
 
   it("caps feed per room, dropping the oldest", () => {
@@ -162,7 +231,7 @@ describe("createRoomStore", () => {
     s.addRoom(room("R"));
     for (let i = 0; i < 20; i += 1) {
       s.appendFeed(feedOf(`#${i}`));
-      s.addSeat(seat(`P${i}`, "R", "R", { seat: "peer", tier: "default" }));
+      s.addSeat(roleSeat(`P${i}`, "R", "R", WORKER));
     }
     await Promise.all([s.flush(), s.flush()]);
 
@@ -186,8 +255,8 @@ describe("createRoomStore", () => {
     const s = make();
     s.addRoom(room("R"));
     s.addRoom(room("X"));
-    s.addSeat(seat("R", "R", null, { seat: "supervisor" }));
-    s.addSeat(seat("X", "X", null, { seat: "supervisor" }));
+    s.addSeat(roleSeat("R", "R", null, SUPERVISOR));
+    s.addSeat(roleSeat("X", "X", null, SUPERVISOR));
     s.appendFeed({ ...feedOf("r"), roomId: "R" });
     s.appendFeed({ ...feedOf("x"), roomId: "X" });
 
@@ -234,7 +303,7 @@ describe("createRoomStore load guard", () => {
     const s = make();
     await s.load();
     s.addRoom(room("NEW"));
-    s.addSeat(seat("NEW", "NEW", null, { seat: "supervisor" }));
+    s.addSeat(roleSeat("NEW", "NEW", null, SUPERVISOR));
     s.appendFeed({ ...feedOf("note"), roomId: "NEW" });
     await s.flush();
 

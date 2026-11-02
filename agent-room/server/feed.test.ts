@@ -4,7 +4,30 @@ import type { SeatRecord } from "../shared/room";
 import type { SeatMarker } from "../shared/seats";
 import { SIGNALS, feedFromTurn, labelFor } from "./feed";
 
-const seat = (agentId: string, roomId: string, parentId: string | null, marker: SeatMarker): SeatRecord => ({
+const roleSeat = (
+  agentId: string,
+  roomId: string,
+  parentId: string | null,
+  role: { id: string; name: string; kind: "supervisor" | "lead" | "worker" },
+): SeatRecord => ({
+  agentId,
+  roomId,
+  parentId,
+  roleId: role.id,
+  roleName: role.name,
+  roleKind: role.kind,
+  provider: "claude",
+  model: "claude-opus-5-5",
+  title: `${role.name}: ${agentId}`,
+});
+
+/** A seat recorded before roles existed: a marker and no role fields. */
+const legacySeat = (
+  agentId: string,
+  roomId: string,
+  parentId: string | null,
+  marker: SeatMarker,
+): SeatRecord => ({
   agentId,
   roomId,
   parentId,
@@ -14,9 +37,10 @@ const seat = (agentId: string, roomId: string, parentId: string | null, marker: 
   title: `[room:${marker.seat}] ${agentId}`,
 });
 
-const supervisor = seat("S1", "S1", null, { seat: "supervisor" });
-const lead = seat("L1", "S1", "S1", { seat: "lead" });
-const peer = seat("P1", "S1", "L1", { seat: "peer", tier: "cheap" });
+const supervisor = roleSeat("S1", "S1", null, { id: "supervisor", name: "Supervisor", kind: "supervisor" });
+const lead = roleSeat("L1", "S1", "S1", { id: "lead", name: "Lead", kind: "lead" });
+const worker = roleSeat("P1", "S1", "L1", { id: "implementer", name: "Implementer", kind: "worker" });
+const legacySupervisor = legacySeat("S2", "S2", null, { seat: "supervisor" });
 
 describe("SIGNALS", () => {
   it("covers every protocol signal and disposition", () => {
@@ -84,7 +108,7 @@ describe("feedFromTurn", () => {
   it("attributes a user message naming a child to that child", () => {
     const events = feedFromTurn({
       agent: lead,
-      childIds: [peer.agentId],
+      childIds: [worker.agentId],
       timeline: [
         { type: "user_message", text: "P1: format the logs" },
         { type: "assistant_message", text: "STATUS waiting on P1" },
@@ -103,7 +127,7 @@ describe("feedFromTurn", () => {
   it("attributes a plain user message to the agent's parent", () => {
     const events = feedFromTurn({
       agent: lead,
-      childIds: [peer.agentId],
+      childIds: [worker.agentId],
       timeline: [{ type: "user_message", text: "brief: split the work" }],
     });
 
@@ -124,10 +148,22 @@ describe("feedFromTurn", () => {
     ]);
   });
 
+  it("still labels a legacy-marker supervisor's message as the task", () => {
+    const events = feedFromTurn({
+      agent: legacySupervisor,
+      childIds: ["L2"],
+      timeline: [{ type: "user_message", text: "fix the auth retry loop" }],
+    });
+
+    expect(events).toEqual([
+      { kind: "message", from: null, to: "S2", label: "task", text: "fix the auth retry loop" },
+    ]);
+  });
+
   it("attributes the final reply to the agent, addressed to its parent", () => {
     const events = feedFromTurn({
       agent: lead,
-      childIds: [peer.agentId],
+      childIds: [worker.agentId],
       timeline: [
         { type: "user_message", text: "status?" },
         { type: "assistant_message", text: "DONE\nall three peers finished" },
@@ -145,7 +181,7 @@ describe("feedFromTurn", () => {
 
   it("falls back to reply when the final message carries no signal", () => {
     const events = feedFromTurn({
-      agent: peer,
+      agent: worker,
       childIds: [],
       timeline: [
         { type: "user_message", text: "go" },
@@ -159,7 +195,7 @@ describe("feedFromTurn", () => {
   it("isolates the current turn from the history the tail refetch returned", () => {
     const events = feedFromTurn({
       agent: lead,
-      childIds: [peer.agentId],
+      childIds: [worker.agentId],
       timeline: [
         { type: "user_message", text: "older instruction" },
         { type: "assistant_message", text: "DONE older" },
@@ -208,7 +244,7 @@ describe("feedFromTurn", () => {
 
   it("ignores other timeline item kinds when isolating the turn", () => {
     const events = feedFromTurn({
-      agent: peer,
+      agent: worker,
       childIds: [],
       timeline: [
         { type: "assistant_message", text: "DONE history" },

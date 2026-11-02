@@ -11,7 +11,7 @@ import type {
 } from "@getpaseo/plugin/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { DEFAULT_SETTINGS, roomSettingsSchema } from "./shared/seats";
+import { DEFAULT_SETTINGS, roomSettingsSchema } from "./shared/roles";
 import contribute, { __resetGcMigrated, type GcOverrides } from "./index.server";
 import type { AgentCreateRequest } from "./server/inject";
 import { SEAT_SETTINGS_UNLOADED, SETTINGS_TIMEOUT_MS } from "./server/settings";

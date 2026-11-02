@@ -3,7 +3,8 @@ import type { PluginHookAgent, PluginHookContext } from "@getpaseo/plugin/server
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { FeedEvent, RoomRecord, SeatRecord } from "../shared/room";
-import { DEFAULT_SETTINGS, type SeatMarker } from "../shared/seats";
+import { DEFAULT_SETTINGS } from "../shared/roles";
+import type { SeatMarker } from "../shared/seats";
 import { createRoomEvents, lookupTitle } from "./events";
 import type { Logger } from "./logger";
 import type { RoomStore } from "./store";
@@ -105,6 +106,7 @@ const room = (id: string): RoomRecord => ({
   createdAt: "2026-10-28T09:00:00.000Z",
 });
 
+/** A seat recorded before roles existed: a marker and no role fields. */
 const seat = (
   agentId: string,
   roomId: string,
@@ -120,6 +122,28 @@ const seat = (
   model: "claude-opus-5-5",
   title,
 });
+
+type RoleShape = { id: string; name: string; kind: "supervisor" | "lead" | "worker" };
+
+const roleSeat = (
+  agentId: string,
+  roomId: string,
+  parentId: string | null,
+  role: RoleShape,
+): SeatRecord => ({
+  agentId,
+  roomId,
+  parentId,
+  roleId: role.id,
+  roleName: role.name,
+  roleKind: role.kind,
+  provider: "claude",
+  model: "claude-opus-5-5",
+  title: `${role.name}: ${agentId}`,
+});
+
+const SUPERVISOR: RoleShape = { id: "supervisor", name: "Supervisor", kind: "supervisor" };
+const LEAD: RoleShape = { id: "lead", name: "Lead", kind: "lead" };
 
 const agent = (over: Partial<PluginHookAgent> & { id: string }): PluginHookAgent => ({
   id: over.id,
@@ -156,10 +180,7 @@ function eventsWith(
 function storedRoom() {
   return fakeStore({
     rooms: [room("S1")],
-    seats: [
-      seat("S1", "S1", null, { seat: "supervisor" }),
-      seat("L1", "S1", "S1", { seat: "lead" }),
-    ],
+    seats: [roleSeat("S1", "S1", null, SUPERVISOR), roleSeat("L1", "S1", "S1", LEAD)],
   });
 }
 
@@ -190,11 +211,35 @@ describe("onCreated — membership", () => {
         roomId: "S1",
         parentId: null,
         marker: { seat: "supervisor" },
+        roleId: "supervisor",
+        roleName: "Supervisor",
+        roleKind: "supervisor",
         provider: "claude",
         model: "claude-opus-5-5",
         title: "[room:supervisor] fix auth retry",
       }),
     );
+  });
+
+  it("records a role seat from a role title", async () => {
+    const fake = fakeStore();
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store);
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    expect(fake.addSeat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "S1",
+        roleId: "supervisor",
+        roleName: "Supervisor",
+        roleKind: "supervisor",
+        title: "Supervisor: fix auth",
+      }),
+    );
+    // A role title is not a legacy marker, so no marker is recorded.
+    expect(fake.addSeat.mock.calls[0][0]).not.toHaveProperty("marker");
+    expect(fake.addRoom).toHaveBeenCalledWith(expect.objectContaining({ id: "S1", task: "fix auth" }));
   });
 
   it("adds a lead to the supervisor's room without archiving it", async () => {
@@ -214,10 +259,57 @@ describe("onCreated — membership", () => {
         roomId: "S1",
         parentId: "S1",
         marker: { seat: "lead" },
+        roleId: "lead",
+        roleName: "Lead",
+        roleKind: "lead",
         model: "claude-opus-5-5",
       }),
     );
     expect(handleFor("L2").archive).not.toHaveBeenCalled();
+  });
+
+  it("places a worker role title under a role-seated lead", async () => {
+    const { store, addSeat } = storedRoom();
+    const { paseo, handleFor } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store);
+
+    await created.onCreated(
+      { agent: agent({ id: "R1", parentAgentId: "L1", title: "Reviewer: audit the diff" }) },
+      ctx,
+    );
+
+    expect(addSeat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "R1",
+        roomId: "S1",
+        parentId: "L1",
+        roleId: "reviewer",
+        roleName: "Reviewer",
+        roleKind: "worker",
+        model: "claude-sonnet-5-5",
+      }),
+    );
+    expect(addSeat.mock.calls[0][0]).not.toHaveProperty("marker");
+    expect(handleFor("R1").archive).not.toHaveBeenCalled();
+  });
+
+  it("reads a legacy-marker parent's role from its stored seat", async () => {
+    const { store, addSeat } = fakeStore({
+      rooms: [room("S1")],
+      seats: [seat("L1", "S1", "S1", { seat: "lead" })],
+    });
+    const { paseo, handleFor } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store);
+
+    await created.onCreated(
+      { agent: agent({ id: "I1", parentAgentId: "L1", title: "Implementer: fix rounding" }) },
+      ctx,
+    );
+
+    expect(addSeat).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: "I1", roomId: "S1", roleId: "implementer" }),
+    );
+    expect(handleFor("I1").archive).not.toHaveBeenCalled();
   });
 
   it("places a peer the lead created in the same room", async () => {
@@ -231,12 +323,22 @@ describe("onCreated — membership", () => {
     );
 
     expect(addSeat).toHaveBeenCalledWith(
-      expect.objectContaining({ agentId: "P1", roomId: "S1", parentId: "L1", model: "claude-haiku-4-5" }),
+      expect.objectContaining({
+        agentId: "P1",
+        roomId: "S1",
+        parentId: "L1",
+        // The legacy tier resolves to the role the catalog maps it to.
+        roleId: "mechanic",
+        roleName: "Mechanic",
+        roleKind: "worker",
+        marker: { seat: "peer", tier: "cheap" },
+        model: "claude-haiku-4-5",
+      }),
     );
     expect(handleFor("P1").archive).not.toHaveBeenCalled();
   });
 
-  it("stores an unknown tier as parsed, seats the default model and notes the fallback", async () => {
+  it("maps an unknown legacy tier to a worker role and notes the fallback", async () => {
     const { store, addSeat, appendFeed } = storedRoom();
     const { paseo } = fakePaseo();
     const { created, ctx } = eventsWith(paseo, store);
@@ -251,6 +353,9 @@ describe("onCreated — membership", () => {
         agentId: "P2",
         roomId: "S1",
         marker: { seat: "peer", tier: "zzz" },
+        roleId: "implementer",
+        roleName: "Implementer",
+        roleKind: "worker",
         model: "claude-sonnet-5-5",
       }),
     );
@@ -260,7 +365,11 @@ describe("onCreated — membership", () => {
     );
     const text = appendFeed.mock.calls[0][0].text;
     expect(text).toContain("zzz");
-    expect(text).toContain("default");
+    expect(text).toContain("Implementer");
+    expect(log.warn).toHaveBeenCalledWith(
+      "unknown legacy peer tier; using a worker role",
+      expect.objectContaining({ agentId: "P2", tier: "zzz", roleId: "implementer" }),
+    );
   });
 
   it("records no fallback note when the tier exists", async () => {
@@ -344,20 +453,22 @@ describe("onCreated — membership", () => {
 });
 
 describe("onCreated — guard", () => {
-  const guardCases: Array<[string, SeatRecord, PluginHookAgent]> = [
+  const guardCases: Array<[string, SeatRecord, PluginHookAgent, string]> = [
     [
       "a peer that spawns a peer",
       seat("P1", "S1", "L1", { seat: "peer", tier: "default" }),
       agent({ id: "P9", parentAgentId: "P1", title: "[room:peer:default] nested work" }),
+      "creates no agents",
     ],
     [
       "a lead that spawns an unmarked agent",
       seat("L1", "S1", "S1", { seat: "lead" }),
       agent({ id: "X9", parentAgentId: "L1", title: "format the logs" }),
+      "may only create worker-role agents",
     ],
   ];
 
-  it.each(guardCases)("archives the child when %s", async (_name, violator, child) => {
+  it.each(guardCases)("archives the child when %s", async (_name, violator, child, rule) => {
     const seeded = storedRoom();
     const { store, addSeat, appendFeed } = seeded;
     // Seeded directly so the store spy records only what the handler does.
@@ -383,7 +494,9 @@ describe("onCreated — guard", () => {
     expect(message).toContain(child.id);
     expect(message).toContain(child.title!);
     expect(message).toContain("archived");
-    expect(message).toContain("[room:");
+    // The rule comes from the catalog and names the role to use next time.
+    expect(message).toContain(rule);
+    expect(message).toContain("Rule broken:");
   });
 
   it("tells the peer's lead with a room-guard timeline row", async () => {
@@ -408,14 +521,14 @@ describe("onCreated — guard", () => {
         childId: "P9",
         childTitle: "[room:peer:cheap] nested",
         violatorId: "P1",
-        rule: expect.stringContaining("[room:peer"),
+        rule: expect.stringContaining("creates no agents"),
       },
     });
     // The violating peer itself gets the message, not a timeline row.
     expect(handleFor("P1").timeline.append).not.toHaveBeenCalled();
   });
 
-  it("names the peer marker rule when a lead spawns an unmarked agent", async () => {
+  it("names the worker role a lead should have used for an unmarked child", async () => {
     const { store } = storedRoom();
     const { paseo, handleFor } = fakePaseo();
     const { created, ctx } = eventsWith(paseo, store);
@@ -426,8 +539,9 @@ describe("onCreated — guard", () => {
     );
 
     const message = handleFor("L1").send.mock.calls[0][0] as string;
-    expect(message).toContain("[room:peer:<tier>]");
-    expect(message).toContain("[room:peer:default]");
+    expect(message).toContain("Lead may only create worker-role agents");
+    expect(message).toContain('"Implementer: <outcome>"');
+    expect(message).not.toContain("[room:");
     expect(handleFor("L1").timeline.append).not.toHaveBeenCalled();
   });
 
@@ -442,7 +556,44 @@ describe("onCreated — guard", () => {
     );
 
     expect(handleFor("X9").archive).toHaveBeenCalledTimes(1);
-    expect(handleFor("S1").send.mock.calls[0][0]).toContain("[room:lead]");
+    expect(handleFor("S1").send.mock.calls[0][0]).toContain('"Lead: <workstream>"');
+  });
+
+  it("archives a child whose title carries an unknown role", async () => {
+    const supervisor = roleSeat("S1", "S1", null, SUPERVISOR);
+    const fake = fakeStore({ seats: [supervisor] });
+    const { paseo, handleFor } = fakePaseo({ S1: supervisor.title });
+    const { created, ctx } = eventsWith(paseo, fake.store);
+
+    await created.onCreated(
+      { agent: agent({ id: "C1", parentAgentId: "S1", title: "Boss: do it" }) },
+      ctx,
+    );
+
+    expect(handleFor("C1").archive).toHaveBeenCalled();
+    expect(fake.appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "guard", label: "archived" }),
+    );
+  });
+
+  it("still guards a child of a seat whose role left the catalog", async () => {
+    // The seat names a role the settings no longer list: the recorded role data
+    // is what keeps the hierarchy enforced.
+    const auditor: SeatRecord = {
+      ...roleSeat("A1", "S1", "L1", { id: "auditor", name: "Auditor", kind: "worker" }),
+      title: "Auditor: check the ledger",
+    };
+    const fake = fakeStore({ rooms: [room("S1")], seats: [auditor] });
+    const { paseo, handleFor } = fakePaseo({ A1: auditor.title });
+    const { created, ctx } = eventsWith(paseo, fake.store);
+
+    await created.onCreated(
+      { agent: agent({ id: "C1", parentAgentId: "A1", title: "check the ledger" }) },
+      ctx,
+    );
+
+    expect(handleFor("C1").archive).toHaveBeenCalledTimes(1);
+    expect(handleFor("A1").send.mock.calls[0][0]).toContain("Auditor creates no agents");
   });
 
   it("archives a lead a supervisor should not have created", async () => {
@@ -505,7 +656,7 @@ describe("onCreated — guard", () => {
         childId: "X9",
         childTitle: "nested unmarked work",
         violatorId: "P5",
-        rule: expect.stringContaining("[room:peer"),
+        rule: expect.stringContaining("creates no agents"),
       },
     });
     // The room is still unknown, so the feed keeps nothing and warns.
@@ -559,7 +710,7 @@ describe("onTurnEnded", () => {
   it("appends the turn's feed events for a stored seat", async () => {
     const { store, appendFeed } = fakeStore({
       rooms: [room("S1")],
-      seats: [seat("S1", "S1", null, { seat: "supervisor" }), seat("L1", "S1", "S1", { seat: "lead" }), storedPeer],
+      seats: [roleSeat("S1", "S1", null, SUPERVISOR), roleSeat("L1", "S1", "S1", LEAD), storedPeer],
     });
     const { paseo, handleFor } = fakePaseo({}, [
       { item: { type: "user_message", text: "P1: take the second item" } },

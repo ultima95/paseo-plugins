@@ -134,8 +134,9 @@ export function feedFromTurn(input: {
   items.forEach((item, index) => {
     if (item.type === "user_message") {
       const from = childNamedIn(item.text, childIds) ?? agent.parentId;
-      const label =
-        from === null && agent.marker.seat === "supervisor" ? "task" : "instruction";
+      // A seat recorded from a role title carries no marker; a legacy one does.
+      const supervisor = agent.roleKind === "supervisor" || agent.marker?.seat === "supervisor";
+      const label = from === null && supervisor ? "task" : "instruction";
       drafts.push({ kind: "message", from, to: agent.agentId, label: labelFor(item.text, label), text: item.text });
       return;
     }
