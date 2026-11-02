@@ -303,7 +303,7 @@ describe("agent-room server contribution", () => {
       thinkingOptionId: "xhigh",
     });
     // The launch carries the Supervisor's prompt itself (I4), not only the hook.
-    expect(created[0]?.config.systemPrompt).toContain("## Room seats");
+    expect(created[0]?.config.systemPrompt).toContain("## Room roles");
   });
 
   it("swallows lifecycle failures instead of throwing at the daemon", async () => {
