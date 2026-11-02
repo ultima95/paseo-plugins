@@ -9,7 +9,19 @@ import type {
 } from "@getpaseo/plugin/server";
 
 import { gcSettingsDefinition, type GcSettings } from "./shared/gc";
-import { adoptRoomRpc, gcRunRpc, gcStatusRpc, getRoomRpc, launchRoomRpc, listRoomsRpc } from "./shared/rpc";
+import {
+  adoptRoomRpc,
+  gcRunRpc,
+  gcStatusRpc,
+  getRoomRpc,
+  launchRoomRpc,
+  listRoomsRpc,
+  memberCharterRpc,
+  memberGetRpc,
+  memberListRpc,
+  memberPendingRpc,
+  memberSaveRpc,
+} from "./shared/rpc";
 import { parseRoleTitle, roomSettings } from "./shared/roles";
 import { parseSeatMarker } from "./shared/seats";
 import { createRoomEvents, lookupTitle } from "./server/events";
@@ -28,6 +40,7 @@ import {
 import { createHandlers } from "./server/handlers";
 import { applySeat, carriesRoomPrompt } from "./server/inject";
 import { indexMembers } from "./server/member-index";
+import { createMemberHandlers } from "./server/member-handlers";
 import { createMemberStore } from "./server/member-store";
 import { migrateMembers } from "./server/migrate-members";
 import { renderMemberSection } from "./server/render";
@@ -280,6 +293,16 @@ export default function contribute(
   // the load first.
   const handlers = createHandlers({ store, readSettings: launchSettings, members, repoIdFor });
 
+  // The member screen's RPCs read and write the same store the seats do, with the
+  // same clock and id source, so a member saved here is indistinguishable from
+  // one the seed wrote.
+  const memberHandlers = createMemberHandlers({
+    members,
+    now: () => Date.now(),
+    newId: () => randomUUID(),
+    log,
+  });
+
   /** Wait for the load, then run the handler; a handler failure is logged, not thrown. */
   const afterLoad = <Name extends keyof PluginLifecycleEvents>(
     name: Name,
@@ -365,6 +388,34 @@ export default function contribute(
   server.handle(getRoomRpc, async (input) => {
     await loaded;
     return handlers.get(input);
+  });
+
+  // The member screen's five contracts: one whole-record write (`save`), one
+  // whole-member read (`get`), and the three edits — a charter, and settling one
+  // promotion candidate. Each waits for the same load the room RPCs wait for.
+  server.handle(memberListRpc, async () => {
+    await loaded;
+    return memberHandlers.list();
+  });
+
+  server.handle(memberGetRpc, async (input) => {
+    await loaded;
+    return memberHandlers.get(input);
+  });
+
+  server.handle(memberSaveRpc, async (input) => {
+    await loaded;
+    return memberHandlers.save(input);
+  });
+
+  server.handle(memberCharterRpc, async (input) => {
+    await loaded;
+    return memberHandlers.charter(input);
+  });
+
+  server.handle(memberPendingRpc, async (input) => {
+    await loaded;
+    return memberHandlers.pending(input);
   });
 
   // The GC screen's two contracts. `gc.status` answers the last tick's captured

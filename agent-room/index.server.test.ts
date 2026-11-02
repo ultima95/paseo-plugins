@@ -234,7 +234,7 @@ describe("agent-room server contribution", () => {
     await expect(cleanup()).resolves.toBeUndefined();
   });
 
-  it("registers the room and GC RPCs in contract order", () => {
+  it("registers the room, member and GC RPCs in contract order", () => {
     const { handled } = contributeWith(
       readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
     );
@@ -244,11 +244,16 @@ describe("agent-room server contribution", () => {
       "room.adopt",
       "room.list",
       "room.get",
+      "member.list",
+      "member.get",
+      "member.save",
+      "member.charter",
+      "member.pending",
       "gc.status",
       "gc.run",
     ]);
-    // Six contracts, six distinct handlers: none registered twice by mistake.
-    expect(new Set(handled.map((entry) => entry.handler)).size).toBe(6);
+    // Eleven contracts, eleven distinct handlers: none registered twice by mistake.
+    expect(new Set(handled.map((entry) => entry.handler)).size).toBe(11);
   });
 
   it("binds each contract to its matching handler, not merely to some handler", async () => {
@@ -272,6 +277,31 @@ describe("agent-room server contribution", () => {
       missing: true,
     });
     expect(created).toHaveLength(1);
+  });
+
+  it("binds each member contract to the member store, not to a room handler", async () => {
+    await seedMember();
+    const { invoke } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+
+    // `member.list` answers members while `room.list` answers rooms: a swap
+    // between the two stores would fail both shapes.
+    await expect(invoke("member.list")({}, {})).resolves.toEqual({ members: [MEMBER] });
+    await expect(invoke("room.list")({}, {})).resolves.toEqual({ rooms: [] });
+
+    // The whole-member read carries what the seed wrote, and the missing arm is
+    // the `room.get` shape's sibling.
+    await expect(invoke("member.get")({ memberId: "mem-1" }, {})).resolves.toMatchObject({
+      member: MEMBER,
+      charter: "Ship it.",
+      lessons: [],
+      pending: [],
+      episodes: [],
+    });
+    await expect(invoke("member.get")({ memberId: "mem-2" }, {})).resolves.toEqual({
+      missing: true,
+    });
   });
 
   it("holds a launch until the room store has loaded", async () => {
