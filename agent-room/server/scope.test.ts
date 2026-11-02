@@ -6,6 +6,7 @@ import {
   createRepoResolver,
   normalizeRemoteUrl,
   repoIdFromText,
+  scopesFor,
 } from "./scope";
 
 const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
@@ -66,5 +67,19 @@ describe("candidateScope", () => {
   it("uses the repo when one resolved, else the workspace", () => {
     expect(candidateScope("/a/b", "8f3c1a2b")).toBe(repoScope("8f3c1a2b"));
     expect(candidateScope("/a/b/", null)).toBe(workspaceScope("/a/b"));
+  });
+});
+
+describe("scopesFor", () => {
+  it("lists global, then the repo, then the exact workspace", () => {
+    expect(scopesFor("/a/b/", "8f3c1a2b")).toEqual([
+      "global",
+      repoScope("8f3c1a2b"),
+      workspaceScope("/a/b"),
+    ]);
+  });
+
+  it("drops the repo scope when the directory is in no repository", () => {
+    expect(scopesFor("/a/b", null)).toEqual(["global", workspaceScope("/a/b")]);
   });
 });

@@ -1,11 +1,12 @@
 import type { PaseoAgentConfig, PaseoApi, PaseoWorkspaceAgentCreateOptions } from "@getpaseo/client";
 import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 
-import { workspaceScope, type MemberRecord, type MemberRole } from "../shared/member";
+import { GLOBAL_SCOPE, type MemberRecord, type MemberRole } from "../shared/member";
 import { seatTitleForRole, type Role, type RoomSettings } from "../shared/roles";
 import { adoptRoomRpc, getRoomRpc, launchRoomRpc, listRoomsRpc } from "../shared/rpc";
 import type { MemberStore } from "./member-store";
 import { renderMemberSection, renderSystemPrompt, type MemberRender } from "./render";
+import { scopesFor } from "./scope";
 import type { RoomStore } from "./store";
 
 export interface HandlerDeps {
@@ -109,11 +110,11 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
         memberSection = renderMemberSection({
           name: supervisorMember.name,
           charter: deps.members.charter(supervisorMember.id),
-          lessons: deps.members.lessonsFor(supervisorMember.id, [
-            "global",
-            ...(repoId !== null ? [`repo:${repoId}`] : []),
-            ...(cwd !== null ? [workspaceScope(cwd)] : []),
-          ]),
+          // With no directory there is no repo or workspace to scope to.
+          lessons: deps.members.lessonsFor(
+            supervisorMember.id,
+            cwd === null ? [GLOBAL_SCOPE] : scopesFor(cwd, repoId),
+          ),
         });
       }
 

@@ -99,3 +99,13 @@ export function createRepoResolver(deps: ScopeDeps): (cwd: string) => Promise<st
 export function candidateScope(cwd: string, repoId: string | null): string {
   return repoId !== null ? repoScope(repoId) : workspaceScope(cwd);
 }
+
+/**
+ * The scopes a room loads: global, its repo, and its exact workspace. One list
+ * for every reader — the launch's member section, the create hook's, and the
+ * `member note` the events handler appends when that section truncated — so a
+ * lesson cannot reach one seat and be invisible to another.
+ */
+export function scopesFor(cwd: string, repoId: string | null): string[] {
+  return ["global", ...(repoId !== null ? [repoScope(repoId)] : []), workspaceScope(cwd)];
+}

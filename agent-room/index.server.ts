@@ -26,9 +26,12 @@ import {
   type TickResult,
 } from "./server/gc/tick";
 import { createHandlers } from "./server/handlers";
+import { applySeat, carriesRoomPrompt } from "./server/inject";
+import { indexMembers } from "./server/member-index";
 import { createMemberStore } from "./server/member-store";
-import { createRepoResolver } from "./server/scope";
-import { applySeat } from "./server/inject";
+import { migrateMembers } from "./server/migrate-members";
+import { renderMemberSection } from "./server/render";
+import { createRepoResolver, scopesFor } from "./server/scope";
 import { consoleLogger } from "./server/logger";
 import { createSettingsReader } from "./server/settings";
 import { createRoomStore, resolveDataDir } from "./server/store";
@@ -232,27 +235,39 @@ export default function contribute(
 
   // ── room wiring ─────────────────────────────────────────────────────────────
 
-  // Lifecycle hooks fire as soon as the plugin loads, so no handler may touch the
-  // store before the file is in memory. A failed load is logged and still lets
-  // hooks run against an empty store.
-  const loaded = store.load().catch((error: unknown) => {
-    log.error("room store load failed", { error: reason(error) });
-  });
-
-  // Task 10 owns the full wiring (migration, hook index). The launch handler
-  // needs the store and the repo resolver now, so it gets them here.
+  // The members a room's seats can be bound to. Loaded after the room store
+  // because the one-time seed reads the room store's migration state.
   const members = createMemberStore({
     dir: dataDir,
     now: () => Date.now(),
     newId: () => randomUUID(),
     log,
   });
-  const membersLoaded = members.load().catch((error: unknown) => {
-    log.error("member store load failed", { error: reason(error) });
-  });
+
+  // One resolver for the whole process: it memoizes a `git` lookup per cwd, and
+  // every reader of a room's scopes must see the same repository id.
   const repoIdFor = createRepoResolver({ log });
 
-  const events = createRoomEvents({ store, readSettings, lookupTitle, log });
+  // Lifecycle hooks fire as soon as the plugin loads, so no handler may touch the
+  // store before the file is in memory. Rooms first, then members, then the
+  // one-time member seed for a v1 rooms file. A failed load is logged and still
+  // lets hooks run against an empty store.
+  const loaded = (async () => {
+    await store.load();
+    await members.load();
+    await migrateMembers({ store, members, readSettings, now: () => Date.now(), log });
+  })().catch((error: unknown) => {
+    log.error("room store load failed", { error: reason(error) });
+  });
+
+  const events = createRoomEvents({
+    store,
+    readSettings,
+    lookupTitle,
+    log,
+    members,
+    repoIdFor,
+  });
 
   // Two readers over the same settings, deliberately: `agent.create` must never
   // break, so it keeps the lenient one (a stalled read becomes default seats),
@@ -292,12 +307,33 @@ export default function contribute(
     if (title === null || title === undefined) return;
     if (!title.includes(":") && !title.trimStart().startsWith("[")) return;
     try {
+      // The member index below is only as good as the store behind it, and the
+      // load is still in flight for the first creates after a daemon start.
+      await loaded;
       const settings = await readSettings();
       const known =
         parseRoleTitle(title, settings.roles) !== null || parseSeatMarker(title) !== null;
       if (!known) return;
-      const applied = applySeat(request, settings);
+      // `room.launch` and `room.adopt` built this request's seat and prompt,
+      // member included; re-applying the role would undo the member.
+      if (carriesRoomPrompt(request.config.systemPrompt)) return;
+
+      const index = indexMembers(members.list());
+      const repoId = await repoIdFor(request.config.cwd);
+      const applied = applySeat(request, settings, index, (member) =>
+        renderMemberSection({
+          name: member.name,
+          charter: members.charter(member.id),
+          lessons: members.lessonsFor(member.id, scopesFor(request.config.cwd, repoId)),
+        }),
+      );
       if (!applied) return;
+      if (applied.memberTruncated === true) {
+        log.warn("member section truncated", {
+          memberId: applied.member?.id,
+          role: applied.role.id,
+        });
+      }
       if (applied.fallbackFrom !== undefined) {
         log.warn("unknown legacy peer tier", { tier: applied.fallbackFrom, role: applied.role.id });
       }
@@ -313,7 +349,6 @@ export default function contribute(
   // propagate instead of being swallowed the way the lifecycle hooks are.
   server.handle(launchRoomRpc, async (input, { paseo }) => {
     await loaded;
-    await membersLoaded;
     return handlers.launch(input, paseo);
   });
 
@@ -378,6 +413,9 @@ export default function contribute(
     // not wait on a `ps` sample.
     stopGc();
     await loaded;
+    // Members before rooms: the member seed is what makes a migrated room's
+    // bindings resolvable, so it must land before the file that names them.
+    await members.flush();
     await store.flush();
   };
 }

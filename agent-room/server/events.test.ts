@@ -2,11 +2,13 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginHookContext } from "@getpaseo/plugin/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { CHARTER_PROMPT_CAP, type Lesson, type MemberRecord } from "../shared/member";
 import type { FeedEvent, RoomRecord, SeatRecord } from "../shared/room";
 import { DEFAULT_SETTINGS } from "../shared/roles";
 import type { SeatMarker } from "../shared/seats";
-import { createRoomEvents, lookupTitle } from "./events";
+import { createRoomEvents, lookupTitle, type RoomEventsDeps } from "./events";
 import type { Logger } from "./logger";
+import type { MemberStore } from "./member-store";
 import type { RoomStore } from "./store";
 
 type FakeHandle = {
@@ -100,6 +102,63 @@ function fakeStore(seed: { rooms?: RoomRecord[]; seats?: SeatRecord[] } = {}) {
   return { store, addRoom, addSeat, appendFeed, endRoom, rooms, seats, feed };
 }
 
+/** A member a room may be bound to; `provider` matches the hook agent's own. */
+const member = (over: Partial<MemberRecord> = {}): MemberRecord => ({
+  id: "sup-1",
+  name: "Ada",
+  role: "supervisor",
+  provider: "claude",
+  model: "claude-opus-5-6",
+  memory: { promotion: "human", autoScopes: ["repo", "workspace"] },
+  createdAt: "2026-11-01T09:00:00.000Z",
+  updatedAt: "2026-11-01T09:00:00.000Z",
+  ...over,
+});
+
+/**
+ * The events handler reads the member store only: `get` for the bound seat,
+ * `charter`/`lessonsFor` for the section it re-renders. The rest is here so the
+ * fake is a `MemberStore`, not a cast.
+ */
+function fakeMembers(
+  records: Record<string, MemberRecord> = {},
+  options: {
+    charter?: string;
+    lessons?: Lesson[];
+    /** Observe the scopes the handler asks the store for. */
+    onScopes?: (scopes: readonly string[]) => void;
+  } = {},
+): MemberStore {
+  const all = Object.values(records);
+  const charters = new Map(all.map((record) => [record.id, options.charter ?? ""]));
+  return {
+    load: async () => undefined,
+    missingFile: () => false,
+    list: () => all,
+    get: (id) => records[id],
+    upsert: async () => undefined,
+    charter: (id) => charters.get(id) ?? "",
+    writeCharter: async (id, text) => {
+      charters.set(id, text);
+    },
+    lessons: () => options.lessons ?? [],
+    lessonsFor: (_id, scopes) => {
+      options.onScopes?.(scopes);
+      return options.lessons ?? [];
+    },
+    hasLesson: () => false,
+    pending: () => [],
+    hasPending: () => false,
+    appendLesson: async () => false,
+    appendPending: async () => false,
+    acceptPending: async () => null,
+    rejectPending: async () => false,
+    appendEpisode: async () => undefined,
+    episodes: async () => [],
+    flush: async () => undefined,
+  };
+}
+
 const room = (id: string): RoomRecord => ({
   id,
   task: "fix auth",
@@ -169,12 +228,15 @@ function eventsWith(
   paseo: PaseoApi,
   store: RoomStore,
   titles: (paseo: PaseoApi, agentId: string) => Promise<string | null> = async () => null,
+  overrides: Partial<Pick<RoomEventsDeps, "members" | "repoIdFor">> = {},
 ) {
   const created = createRoomEvents({
     store,
     readSettings: async () => DEFAULT_SETTINGS,
     lookupTitle: titles,
     log,
+    members: overrides.members ?? fakeMembers(),
+    repoIdFor: overrides.repoIdFor ?? (async () => null),
   });
   const ctx: PluginHookContext = { paseo, signal: new AbortController().signal };
   return { created, ctx };
@@ -489,6 +551,271 @@ describe("onCreated — membership", () => {
     );
 
     expect(addRoom).toHaveBeenCalledWith(expect.objectContaining({ id: "S2", task: "second room" }));
+  });
+});
+
+describe("onCreated — member bindings", () => {
+  /** A store whose `addRoom` behaves like the real one: it keeps the record. */
+  function bindingStore(binding: { supervisorMemberId?: string | null; leadMemberId?: string | null } = {}) {
+    const fake = fakeStore();
+    fake.addRoom.mockImplementation((record: RoomRecord) => {
+      if (binding.supervisorMemberId !== undefined) {
+        record.supervisorMemberId = binding.supervisorMemberId;
+      }
+      if (binding.leadMemberId !== undefined) record.leadMemberId = binding.leadMemberId;
+      fake.rooms.push(record);
+    });
+    return fake;
+  }
+
+  const LONG_CHARTER = "x".repeat(CHARTER_PROMPT_CAP + 1);
+
+  it("records the launch's member bindings on the room", async () => {
+    const { store, addRoom } = fakeStore();
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store);
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    // agent.created cannot know the launch input; it writes nulls and relies on
+    // RoomStore.bindRoomMembers merging the launch's pending binding.
+    expect(addRoom).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "S1", supervisorMemberId: null, leadMemberId: null }),
+    );
+  });
+
+  it("appends a member note when the supervisor section truncated", async () => {
+    const fake = bindingStore({ supervisorMemberId: "sup-1" });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers({ "sup-1": member() }, { charter: LONG_CHARTER }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    expect(fake.appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        roomId: "S1",
+        kind: "note",
+        from: null,
+        to: "sup-1",
+        label: "member note",
+        text: "member section truncated",
+      }),
+    );
+  });
+
+  it("does not note a member section that fits", async () => {
+    const fake = bindingStore({ supervisorMemberId: "sup-1" });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers({ "sup-1": member() }, { charter: "Use pnpm." }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    expect(fake.appendFeed).not.toHaveBeenCalled();
+  });
+
+  it("scopes the member section with the room's repo and exact workspace", async () => {
+    const scopes: Array<readonly string[]> = [];
+    const fake = bindingStore({ supervisorMemberId: "sup-1" });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers(
+        { "sup-1": member() },
+        { charter: LONG_CHARTER, onScopes: (wanted) => scopes.push(wanted) },
+      ),
+      repoIdFor: async () => "abcd1234",
+    });
+
+    await created.onCreated(
+      { agent: agent({ id: "S1", cwd: "/repo/", title: "Supervisor: fix auth" }) },
+      ctx,
+    );
+
+    expect(scopes[0]).toEqual(["global", "repo:abcd1234", "workspace:/repo"]);
+  });
+
+  it("notes truncation for the room's lead member too", async () => {
+    const fake = fakeStore({
+      rooms: [{ ...room("S1"), leadMemberId: "lead-1" }],
+      seats: [roleSeat("S1", "S1", null, SUPERVISOR)],
+    });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers(
+        { "lead-1": member({ id: "lead-1", name: "Lin", role: "lead" }) },
+        { charter: LONG_CHARTER },
+      ),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "L1", parentAgentId: "S1", title: "Lead: api" }) }, ctx);
+
+    expect(fake.appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "lead-1", label: "member note" }),
+    );
+  });
+
+  it("does not repeat a truncation note the launch already appended", async () => {
+    const fake = fakeStore({
+      rooms: [{ ...room("S1"), supervisorMemberId: "sup-1" }],
+      seats: [roleSeat("S1", "S1", null, SUPERVISOR)],
+    });
+    // room.launch rendered the same section and noted it before this hook ran.
+    fake.feed.push({
+      id: "e0",
+      at: "2026-10-28T09:30:00.000Z",
+      roomId: "S1",
+      kind: "note",
+      from: null,
+      to: "sup-1",
+      label: "member note",
+      text: "member section truncated",
+    });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers({ "sup-1": member() }, { charter: LONG_CHARTER }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    expect(fake.appendFeed).not.toHaveBeenCalled();
+  });
+
+  it("does not note truncation for an unbound room", async () => {
+    const fake = fakeStore();
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers({ "sup-1": member() }, { charter: LONG_CHARTER }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    expect(fake.appendFeed).not.toHaveBeenCalled();
+  });
+
+  it("records the member's model on a member-seated supervisor's seat", async () => {
+    // The catalog supervisor is `claude-opus-5-5`; the member the room bound at
+    // launch runs `claude-opus-5-6`, and the seat must describe what runs.
+    const fake = bindingStore({ supervisorMemberId: "sup-1" });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    expect(fake.addSeat).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: "S1", roleId: "supervisor", model: "claude-opus-5-6" }),
+    );
+  });
+
+  it("keeps the catalog model for a supervisor the room bound to no member", async () => {
+    const { store, addRoom, addSeat } = fakeStore();
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    // No binding: agent.created falls back to the catalog role's seat.
+    expect(addRoom).toHaveBeenCalledWith(expect.objectContaining({ supervisorMemberId: null }));
+    expect(addSeat).toHaveBeenCalledWith(expect.objectContaining({ model: "claude-opus-5-5" }));
+  });
+
+  it("records the bound lead member's model on the lead's seat", async () => {
+    const fake = fakeStore({
+      rooms: [{ ...room("S1"), supervisorMemberId: "sup-1", leadMemberId: "lead-1" }],
+      seats: [roleSeat("S1", "S1", null, SUPERVISOR)],
+    });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers({
+        "sup-1": member(),
+        "lead-1": member({
+          id: "lead-1",
+          name: "Lin",
+          role: "lead",
+          provider: "codex",
+          model: "gpt-5.5-lead",
+        }),
+      }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated(
+      {
+        agent: agent({
+          id: "L1",
+          parentAgentId: "S1",
+          provider: "codex",
+          title: "Lead: api",
+        }),
+      },
+      ctx,
+    );
+
+    expect(fake.addSeat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "L1",
+        roleId: "lead",
+        provider: "codex",
+        model: "gpt-5.5-lead",
+      }),
+    );
+  });
+
+  it("keeps the catalog model for a seat on a provider the bound member does not run", async () => {
+    // The room's lead member runs `codex`; this Lead was created on the catalog
+    // `claude` seat, so the member's model would be a lie.
+    const fake = fakeStore({
+      rooms: [{ ...room("S1"), supervisorMemberId: "sup-1", leadMemberId: "lead-1" }],
+      seats: [roleSeat("S1", "S1", null, SUPERVISOR)],
+    });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers({
+        "sup-1": member(),
+        "lead-1": member({ id: "lead-1", name: "Lin", role: "lead", provider: "codex", model: "gpt-5.5-lead" }),
+      }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "L9", parentAgentId: "S1", title: "Lead: docs" }) }, ctx);
+
+    expect(fake.addSeat).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: "L9", provider: "claude", model: "claude-opus-5-5" }),
+    );
+  });
+
+  it("logs and swallows a member store that throws", async () => {
+    const fake = bindingStore({ supervisorMemberId: "sup-1" });
+    const { paseo } = fakePaseo();
+    const members = fakeMembers({ "sup-1": member() }, { charter: LONG_CHARTER });
+    members.get = () => {
+      throw new Error("members.json is gone");
+    };
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members,
+      repoIdFor: async () => null,
+    });
+
+    await expect(
+      created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx),
+    ).resolves.toBeUndefined();
+    expect(log.error).toHaveBeenCalledWith(
+      "agent.created handling failed",
+      expect.objectContaining({ agentId: "S1" }),
+    );
   });
 });
 

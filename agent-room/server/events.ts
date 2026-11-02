@@ -5,6 +5,7 @@ import type {
   PluginLifecycleEvents,
 } from "@getpaseo/plugin/server";
 
+import type { MemberRecord } from "../shared/member";
 import type { SeatRecord } from "../shared/room";
 import { GUARD_ROW_KIND, GUARD_ROW_VERSION } from "../shared/room";
 import { parseRoleTitle, roleForLegacyMarker, type Role, type RoomSettings } from "../shared/roles";
@@ -12,6 +13,9 @@ import { parseSeatMarker, type SeatMarker } from "../shared/seats";
 import { feedFromTurn } from "./feed";
 import { checkSpawn } from "./guard";
 import type { Logger } from "./logger";
+import type { MemberStore } from "./member-store";
+import { renderMemberSection } from "./render";
+import { scopesFor } from "./scope";
 import type { RoomStore } from "./store";
 
 /** History one `agent.turn_ended` refetches; enough to cover a turn's messages. */
@@ -19,6 +23,9 @@ export const FEED_TAIL_LIMIT = 40;
 
 /** A guard row is also rendered inside the agent timeline (renderer in Task 8). */
 export const GUARD_KIND = GUARD_ROW_KIND;
+
+/** How a member section that had to drop charter or lessons is recorded. */
+export const MEMBER_TRUNCATED_NOTE = "member section truncated";
 
 /**
  * The daemon records an agent's parent as a label on the agent
@@ -34,6 +41,10 @@ export interface RoomEventsDeps {
   readSettings: () => Promise<RoomSettings>;
   lookupTitle: TitleLookup;
   log: Logger;
+  /** The members a room's seats can be bound to; supplies a seat's real model. */
+  members: MemberStore;
+  /** The repository identity of a directory, or null outside a repository. */
+  repoIdFor: (cwd: string) => Promise<string | null>;
 }
 
 export interface RoomEvents {
@@ -171,6 +182,32 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
     return undefined;
   };
 
+  /**
+   * The member whose seat an agent is on, if the room bound one. `agent.created`
+   * carries no model (`PluginHookAgent` has none), so a member-seated Supervisor's
+   * real model can only come from the member `room.launch` bound to the room.
+   *
+   * The provider is the check: a launch that names a member runs that member's
+   * provider and model, so an agent whose provider differs from the bound
+   * member's was created on the catalog role instead, and the member would be a
+   * lie. Workers are never members.
+   */
+  const boundMember = (
+    roomId: string,
+    kind: Role["kind"],
+    provider: string,
+  ): MemberRecord | undefined => {
+    if (kind !== "supervisor" && kind !== "lead") return undefined;
+    const found = store.room(roomId);
+    if (found === undefined) return undefined;
+    const memberId =
+      kind === "supervisor" ? found.room.supervisorMemberId : found.room.leadMemberId;
+    if (memberId === null) return undefined;
+    const candidate = deps.members.get(memberId);
+    if (candidate === undefined || candidate.provider !== provider) return undefined;
+    return candidate;
+  };
+
   /** The seat a new agent is recorded with: its role, plus a legacy marker if any. */
   const seatRecord = (
     agent: PluginHookAgent,
@@ -186,9 +223,49 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
     roleKind: role.kind,
     ...(legacy !== null ? { marker: legacy.marker } : {}),
     provider: agent.provider,
-    model: role.model,
+    // What actually runs: the bound member's seat when there is one, else the
+    // catalog role's.
+    model: boundMember(roomId, role.kind, agent.provider)?.model ?? role.model,
     title: agent.title ?? "",
   });
+
+  /**
+   * Leave one `member note` in the room when the seat's member section had to
+   * drop charter or lesson content. `room.launch` renders the same section for a
+   * Supervisor and notes it itself; the room keeps one row, not two.
+   */
+  const noteMemberTruncation = async (
+    agent: PluginHookAgent,
+    roomId: string,
+    role: Role,
+  ): Promise<void> => {
+    const member = boundMember(roomId, role.kind, agent.provider);
+    if (member === undefined) return;
+    const found = store.room(roomId);
+    if (found === undefined) return;
+
+    const repoId = await deps.repoIdFor(agent.cwd);
+    const section = renderMemberSection({
+      name: member.name,
+      charter: deps.members.charter(member.id),
+      lessons: deps.members.lessonsFor(member.id, scopesFor(agent.cwd, repoId)),
+    });
+    if (!section.truncated) return;
+
+    const noted = found.feed.some(
+      (event) => event.label === "member note" && event.text === MEMBER_TRUNCATED_NOTE,
+    );
+    if (noted) return;
+
+    store.appendFeed({
+      roomId,
+      kind: "note",
+      from: null,
+      to: member.id,
+      label: "member note",
+      text: MEMBER_TRUNCATED_NOTE,
+    });
+  };
 
   /**
    * The parent the daemon holds for an agent the store never recorded. The
@@ -343,6 +420,7 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
         createdAt: new Date().toISOString(),
       });
       store.addSeat(seatRecord(agent, roomId, role, legacy));
+      await noteMemberTruncation(agent, roomId, role);
       return;
     }
 
@@ -356,6 +434,7 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
     }
 
     store.addSeat(seatRecord(agent, roomId, role, legacy));
+    await noteMemberTruncation(agent, roomId, role);
 
     const fallbackFrom = resolved?.fallbackFrom;
     if (fallbackFrom !== undefined) {
