@@ -118,6 +118,9 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
       const role = supervisorRole(settings);
       // The chat keeps its provider, model, mode and effort. The seat record
       // describes what actually runs so the tree and live view are truthful.
+      // The model falls back to the role's: the seat schema requires non-empty
+      // text, and one empty model would make the whole `rooms.json` unloadable
+      // on the next start.
       store.addRoom({
         id: roomId,
         task: title.length > 0 ? title : "Adopted chat",
@@ -135,7 +138,7 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
         roleName: role.name,
         roleKind: role.kind,
         provider: agent.provider,
-        model: agent.model ?? "",
+        model: agent.model ?? role.model,
         title,
       });
       store.appendFeed({

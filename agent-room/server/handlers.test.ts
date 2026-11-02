@@ -338,11 +338,13 @@ describe("list", () => {
 });
 
 describe("adopt", () => {
+  // Deliberately not the Supervisor role's own provider/model: the seat must
+  // record what actually runs, not the catalog defaults it could be copying.
   const chat = {
     id: "S1",
     title: "New chat",
-    provider: "claude",
-    model: "claude-opus-5-5",
+    provider: "codex",
+    model: "gpt-5.6-sol",
     cwd: "/repo",
     workspaceId: "W1",
     createdAt: "2026-10-28T10:00:00.000Z",
@@ -370,8 +372,8 @@ describe("adopt", () => {
         roleId: "supervisor",
         roleName: "Supervisor",
         roleKind: "supervisor",
-        provider: "claude",
-        model: "claude-opus-5-5",
+        provider: "codex",
+        model: "gpt-5.6-sol",
         title: "New chat",
       }),
     );
@@ -384,6 +386,19 @@ describe("adopt", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain(PROMPTS.protocol);
     expect(sent[0]).toContain("Lead: <workstream>");
+  });
+
+  it("falls back to the role's model when the adopted chat has none", async () => {
+    const { paseo } = fakePaseo([], { ...chat, model: undefined });
+    const { handlers, addSeat } = handlersFor();
+
+    await handlers.adopt({ agentId: "S1" }, paseo);
+
+    // An empty `model` fails `nonEmptyText`, which would make the whole rooms
+    // file unloadable on the next start — so the seat takes the role's model.
+    const written = addSeat.mock.calls[0]?.[0] as SeatRecord | undefined;
+    expect(written?.model).toBe(supervisorSeat().model);
+    expect(seatRecordSchema.safeParse(written).success).toBe(true);
   });
 
   it("fails the adopt before recording anything when the catalog has no supervisor", async () => {
