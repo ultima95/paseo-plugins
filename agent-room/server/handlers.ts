@@ -1,15 +1,20 @@
 import type { PaseoAgentConfig, PaseoApi, PaseoWorkspaceAgentCreateOptions } from "@getpaseo/client";
 import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 
+import { workspaceScope, type MemberRecord, type MemberRole } from "../shared/member";
 import { seatTitleForRole, type Role, type RoomSettings } from "../shared/roles";
 import { adoptRoomRpc, getRoomRpc, launchRoomRpc, listRoomsRpc } from "../shared/rpc";
-import { renderSystemPrompt } from "./render";
+import type { MemberStore } from "./member-store";
+import { renderMemberSection, renderSystemPrompt, type MemberRender } from "./render";
 import type { RoomStore } from "./store";
 
 export interface HandlerDeps {
   /** Loaded before any handler runs: `index.server.ts` awaits `store.load()` first. */
   store: RoomStore;
   readSettings: () => Promise<RoomSettings>;
+  members: MemberStore;
+  /** The repository identity of a directory, or null outside a repository. */
+  repoIdFor: (cwd: string) => Promise<string | null>;
 }
 
 export interface RoomHandlers {
@@ -31,17 +36,49 @@ function supervisorRole(settings: RoomSettings): Role {
 }
 
 /**
- * A role's config as the client SDK wants it: one combined `provider/model`
+ * A seat's config as the client SDK wants it: one combined `provider/model`
  * string (the create call has no separate `model` field), plus the controls the
- * role defines. A control the role leaves undefined is omitted, so the provider
- * keeps its own default instead of being handed `undefined`.
+ * seat defines. A control the seat leaves undefined is omitted, so the provider
+ * keeps its own default instead of being handed `undefined`. A role and a member
+ * share this shape.
  */
-function roleConfig(role: Role): PaseoAgentConfig {
-  const config: PaseoAgentConfig = { provider: `${role.provider}/${role.model}` };
-  if (role.modeId !== undefined) config.modeId = role.modeId;
-  if (role.thinkingOptionId !== undefined) config.thinkingOptionId = role.thinkingOptionId;
-  if (role.features !== undefined) config.featureValues = role.features;
+function seatConfig(source: {
+  provider: string;
+  model: string;
+  modeId?: string | undefined;
+  thinkingOptionId?: string | undefined;
+  features?: Record<string, unknown> | undefined;
+}): PaseoAgentConfig {
+  const config: PaseoAgentConfig = { provider: `${source.provider}/${source.model}` };
+  if (source.modeId !== undefined) config.modeId = source.modeId;
+  if (source.thinkingOptionId !== undefined) config.thinkingOptionId = source.thinkingOptionId;
+  if (source.features !== undefined) config.featureValues = source.features;
   return config;
+}
+
+/** Resolve a selected member, or fail before anything is created. */
+function memberFor(
+  deps: HandlerDeps,
+  id: string | undefined,
+  role: MemberRole,
+): MemberRecord | null {
+  if (id === undefined) return null;
+  const member = deps.members.get(id);
+  if (member === undefined) throw new Error(`room.launch: member not found: ${id}`);
+  if (member.role !== role) throw new Error(`room.launch: ${id} is not a ${role} member`);
+  return member;
+}
+
+/** The room's directory: the input's `cwd`, else the workspace's own directory. */
+async function directoryFor(
+  input: RpcInput<typeof launchRoomRpc>,
+  paseo: PaseoApi,
+): Promise<string | null> {
+  if (input.cwd !== undefined) return input.cwd;
+  if (input.workspaceId === undefined) return null;
+  const result = await paseo.workspaces.list({});
+  const entry = result.entries.find((workspace) => workspace.id === input.workspaceId);
+  return entry?.workspaceDirectory ?? entry?.projectRootPath ?? null;
 }
 
 function trimTrailingSlash(path: string): string {
@@ -61,11 +98,35 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
     async launch(input, paseo) {
       const settings = await deps.readSettings();
       const role = supervisorRole(settings);
+      // Resolve both members before any create: a bad id must leave nothing behind.
+      const supervisorMember = memberFor(deps, input.supervisorMemberId, "supervisor");
+      const leadMember = memberFor(deps, input.leadMemberId, "lead");
+
+      let memberSection: MemberRender | null = null;
+      if (supervisorMember !== null) {
+        const cwd = await directoryFor(input, paseo);
+        const repoId = cwd === null ? null : await deps.repoIdFor(cwd);
+        memberSection = renderMemberSection({
+          name: supervisorMember.name,
+          charter: deps.members.charter(supervisorMember.id),
+          lessons: deps.members.lessonsFor(supervisorMember.id, [
+            "global",
+            ...(repoId !== null ? [`repo:${repoId}`] : []),
+            ...(cwd !== null ? [workspaceScope(cwd)] : []),
+          ]),
+        });
+      }
+
       // The Supervisor carries its own prompt: role delivery must not depend on
       // the `agent.create` hook firing for a plugin-originated create. If the
       // hook does run, `applySeat` sees the prompt already there and leaves it.
-      const config = roleConfig(role);
-      config.systemPrompt = renderSystemPrompt(role, settings);
+      const config = seatConfig(supervisorMember ?? role);
+      config.systemPrompt = renderSystemPrompt(role, settings, undefined, {
+        ...(memberSection !== null ? { member: memberSection } : {}),
+        ...(leadMember !== null
+          ? { leadMember: { provider: leadMember.provider, model: leadMember.model } }
+          : {}),
+      });
       // A workspace owns the directory, so `cwd` belongs only on a bare create.
       const options: PaseoWorkspaceAgentCreateOptions = {
         config,
@@ -73,9 +134,27 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
         prompt: input.task,
       };
 
+      const bind = (roomId: string): { roomId: string } => {
+        store.bindRoomMembers(roomId, {
+          supervisorMemberId: supervisorMember?.id ?? null,
+          leadMemberId: leadMember?.id ?? null,
+        });
+        if (memberSection?.truncated === true) {
+          store.appendFeed({
+            roomId,
+            kind: "note",
+            from: null,
+            to: roomId,
+            label: "member note",
+            text: "member section truncated",
+          });
+        }
+        return { roomId };
+      };
+
       if (input.workspaceId !== undefined) {
         const handle = await paseo.workspaces.ref(input.workspaceId).agents.create(options);
-        return { roomId: handle.id };
+        return bind(handle.id);
       }
 
       if (input.cwd !== undefined) {
@@ -91,7 +170,7 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
         const handle = existing
           ? await paseo.workspaces.ref(existing.id).agents.create(options)
           : await paseo.agents.create({ ...options, cwd: input.cwd });
-        return { roomId: handle.id };
+        return bind(handle.id);
       }
 
       // The contract refines this away; a handler is still a boundary.

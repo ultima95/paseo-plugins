@@ -21,6 +21,9 @@ export const launchRoomRpc = defineRpc({
       task: z.string().min(1),
       workspaceId: nonEmptyText.optional(),
       cwd: nonEmptyText.optional(),
+      // Omitted means "use the host seat", so existing callers keep working.
+      supervisorMemberId: nonEmptyText.optional(),
+      leadMemberId: nonEmptyText.optional(),
     })
     .refine((input) => input.workspaceId !== undefined || input.cwd !== undefined, {
       message: "one of workspaceId or cwd is required",

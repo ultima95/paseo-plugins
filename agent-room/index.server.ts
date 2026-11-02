@@ -26,6 +26,8 @@ import {
   type TickResult,
 } from "./server/gc/tick";
 import { createHandlers } from "./server/handlers";
+import { createMemberStore } from "./server/member-store";
+import { createRepoResolver } from "./server/scope";
 import { applySeat } from "./server/inject";
 import { consoleLogger } from "./server/logger";
 import { createSettingsReader } from "./server/settings";
@@ -237,6 +239,19 @@ export default function contribute(
     log.error("room store load failed", { error: reason(error) });
   });
 
+  // Task 10 owns the full wiring (migration, hook index). The launch handler
+  // needs the store and the repo resolver now, so it gets them here.
+  const members = createMemberStore({
+    dir: dataDir,
+    now: () => Date.now(),
+    newId: () => randomUUID(),
+    log,
+  });
+  const membersLoaded = members.load().catch((error: unknown) => {
+    log.error("member store load failed", { error: reason(error) });
+  });
+  const repoIdFor = createRepoResolver({ log });
+
   const events = createRoomEvents({ store, readSettings, lookupTitle, log });
 
   // Two readers over the same settings, deliberately: `agent.create` must never
@@ -248,7 +263,7 @@ export default function contribute(
 
   // The screen's RPCs read the same store the hooks write, so each one waits for
   // the load first.
-  const handlers = createHandlers({ store, readSettings: launchSettings });
+  const handlers = createHandlers({ store, readSettings: launchSettings, members, repoIdFor });
 
   /** Wait for the load, then run the handler; a handler failure is logged, not thrown. */
   const afterLoad = <Name extends keyof PluginLifecycleEvents>(
@@ -298,6 +313,7 @@ export default function contribute(
   // propagate instead of being swallowed the way the lifecycle hooks are.
   server.handle(launchRoomRpc, async (input, { paseo }) => {
     await loaded;
+    await membersLoaded;
     return handlers.launch(input, paseo);
   });
 
