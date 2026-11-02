@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import { Pressable, Text, TextInput, View } from "react-native";
 
+import type { RoleKind } from "../shared/roles";
 import type { SeatDraft, SeatPatch } from "./settings-draft";
 
 /** The host props every piece of this screen needs: theme colours and density. */
@@ -252,14 +253,25 @@ export interface SeatEditorProps extends Surface {
   cwd: string;
   disabled?: boolean;
   onChange(patch: SeatPatch): void;
-  /** Peer tiers carry what they are for; the seats do not. */
+  /** Roles carry what they are for; a bare seat does not. */
   useFor?: string;
   onUseForChange?(text: string): void;
+  /**
+   * The role name a title starts with, and the role's kind. Supplying the
+   * callbacks shows the role fields; leaving them out renders the seat alone.
+   */
+  roleName?: string;
+  roleKind?: RoleKind;
+  brief?: string;
+  onNameChange?(text: string): void;
+  onBriefChange?(text: string): void;
+  onKindChange?(kind: RoleKind): void;
   onRemove?(): void;
 }
 
 /**
- * One seat: provider, model, mode, thinking effort and provider features.
+ * One role: its name and kind, the brief its prompt ends with, and the seat it
+ * runs (provider, model, mode, thinking effort and provider features).
  *
  * The pickers offer every value the daemon reports plus the value already
  * stored, so a seat that references a mode or model the provider no longer
@@ -459,6 +471,47 @@ export function SeatEditor(props: SeatEditorProps) {
         ) : null}
       </View>
 
+      {props.onNameChange ? (
+        <Field surface={surface} label="Role name (used in titles)">
+          <TextEntry
+            surface={surface}
+            value={props.roleName ?? ""}
+            placeholder="e.g. Reviewer"
+            disabled={props.disabled}
+            onChangeText={props.onNameChange}
+          />
+        </Field>
+      ) : null}
+
+      {props.onKindChange ? (
+        <Field surface={surface} label="Kind">
+          <ChoiceRow
+            surface={surface}
+            options={[
+              { id: "supervisor", label: "Supervisor" },
+              { id: "lead", label: "Lead" },
+              { id: "worker", label: "Worker" },
+            ]}
+            value={props.roleKind ?? "worker"}
+            disabled={props.disabled}
+            onSelect={(id) => props.onKindChange?.(id as RoleKind)}
+          />
+        </Field>
+      ) : null}
+
+      {props.onBriefChange ? (
+        <Field surface={surface} label="Brief (appended to the kind prompt)">
+          <TextEntry
+            surface={surface}
+            value={props.brief ?? ""}
+            placeholder="Role-specific instructions"
+            multiline
+            disabled={props.disabled}
+            onChangeText={props.onBriefChange}
+          />
+        </Field>
+      ) : null}
+
       <Field surface={surface} label="Provider">
         <ChoiceRow
           surface={surface}
@@ -506,7 +559,7 @@ export function SeatEditor(props: SeatEditorProps) {
           <TextEntry
             surface={surface}
             value={props.useFor ?? ""}
-            placeholder="What this tier is for"
+            placeholder="What this role is for"
             disabled={props.disabled}
             onChangeText={props.onUseForChange}
           />
