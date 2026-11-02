@@ -5,6 +5,7 @@ import { gcActionSchema, gcStatusSchema } from "./gc";
 import {
   episodeFactSchema,
   lessonSchema,
+  memberIdSchema,
   memberRecordSchema,
   memberRoleSchema,
   memoryPolicySchema,
@@ -80,9 +81,14 @@ export const getRoomRpc = defineRpc({
  * The shape a member is written with. Saving a member is a whole-record write, so
  * the seat fields are required and only the optional provider controls may be
  * omitted; `id` omitted means "create a new one".
+ *
+ * A supplied `id` is the same `memberIdSchema` the record is validated with, so
+ * an id the store would have to sanitise (`a/b`) or one longer than the record's
+ * cap is rejected here, at the boundary, instead of throwing a bare ZodError out
+ * of the handler or aliasing another member's directory.
  */
 export const memberSaveInputSchema = z.object({
-  id: nonEmptyText.optional(),
+  id: memberIdSchema.optional(),
   name: z.string().min(1).max(60),
   role: memberRoleSchema,
   provider: nonEmptyText,

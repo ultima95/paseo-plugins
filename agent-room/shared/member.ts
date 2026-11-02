@@ -58,8 +58,23 @@ export type MemoryPolicy = z.infer<typeof memoryPolicySchema>;
 export const memberRoleSchema = z.enum(["supervisor", "lead"]);
 export type MemberRole = z.infer<typeof memberRoleSchema>;
 
+/**
+ * A member id, constrained where it is written and everywhere it is read.
+ *
+ * The store turns an id into a directory name, and its sanitiser (`safeSegment`)
+ * maps every character outside `[A-Za-z0-9_-]` to `_` — so an unconstrained id
+ * would let `a/b` and `a_b` alias onto one directory and silently share a
+ * charter, lessons and episodes. 80 characters is the record's own cap, and the
+ * seed ids (`default-supervisor`, `default-lead`) are inside it.
+ */
+export const memberIdSchema = z
+  .string()
+  .min(1)
+  .max(80)
+  .regex(/^[A-Za-z0-9_-]+$/, "member id must be letters, digits, hyphen or underscore");
+
 export const memberRecordSchema = seatConfigSchema.extend({
-  id: z.string().min(1).max(80),
+  id: memberIdSchema,
   name: z.string().min(1).max(60),
   role: memberRoleSchema,
   memory: memoryPolicySchema,

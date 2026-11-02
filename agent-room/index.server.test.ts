@@ -281,7 +281,7 @@ describe("agent-room server contribution", () => {
 
   it("binds each member contract to the member store, not to a room handler", async () => {
     await seedMember();
-    const { invoke } = contributeWith(
+    const { invoke, cleanup } = contributeWith(
       readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
     );
 
@@ -302,6 +302,57 @@ describe("agent-room server contribution", () => {
     await expect(invoke("member.get")({ memberId: "mem-2" }, {})).resolves.toEqual({
       missing: true,
     });
+
+    // `member.save` writes the member store: a room handler bound here would
+    // answer with a room, and the member would never appear in a later list.
+    const saved = (await invoke("member.save")(
+      {
+        name: "Bo",
+        role: "lead",
+        provider: "codex",
+        model: "gpt-5.6-sol",
+        memory: { promotion: "human", autoScopes: ["repo", "workspace"] },
+      },
+      {},
+    )) as { member: { id: string; name: string } };
+    expect(saved.member.name).toBe("Bo");
+    const listed = (await invoke("member.list")({}, {})) as { members: Array<{ id: string }> };
+    expect(listed.members.map((member) => member.id)).toContain(saved.member.id);
+
+    // …and `member.charter` writes the charter that `member.get` reads back.
+    await expect(
+      invoke("member.charter")({ memberId: "mem-1", text: "Use pnpm." }, {}),
+    ).resolves.toEqual({ ok: true });
+    await expect(invoke("member.get")({ memberId: "mem-1" }, {})).resolves.toMatchObject({
+      charter: "Use pnpm.",
+    });
+
+    // Flush both writes before the `afterEach` removes the data dir: a write
+    // still in flight would race the teardown instead of the assertions above.
+    await cleanup();
+  });
+
+  it("holds member.list until the member store has loaded", async () => {
+    await seedMember();
+    loadGate.close();
+    const { invoke } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+
+    let answered = false;
+    const pending = invoke("member.list")({}, {}).then((out) => {
+      answered = true;
+      return out;
+    });
+
+    // Same gate as a launch: with the load unresolved the screen's read must be
+    // parked on `await loaded`, not answering from a store that is still empty.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(loadGate.held).toBe(true);
+    expect(answered).toBe(false);
+
+    loadGate.open();
+    await expect(pending).resolves.toEqual({ members: [MEMBER] });
   });
 
   it("holds a launch until the room store has loaded", async () => {

@@ -183,3 +183,41 @@ describe("member handlers", () => {
     ).rejects.toThrow(/candidate not found/);
   });
 });
+
+describe("member.save's id at the RPC boundary", () => {
+  /** A whole-record save that differs only in the id under test. */
+  const saveInput = (id: string) => ({
+    id,
+    name: "Lead",
+    role: "lead",
+    provider: "claude",
+    model: "claude-opus-5-5",
+    memory: { promotion: "human", autoScopes: ["repo", "workspace"] },
+  });
+
+  it("rejects an id longer than the record's cap", () => {
+    // 80 is the record's cap; an 81st character would reach `memberRecordSchema`
+    // inside the handler and throw a bare ZodError at the caller.
+    expect(memberSaveRpc.input.safeParse(saveInput("a".repeat(80))).success).toBe(true);
+    expect(memberSaveRpc.input.safeParse(saveInput("a".repeat(81))).success).toBe(false);
+  });
+
+  it("rejects a path-ish id the store would have to sanitise", () => {
+    // `safeSegment` turns `a/b` into `a_b`, which is also the directory of a
+    // member genuinely named `a_b`: two members silently sharing one memory.
+    expect(memberSaveRpc.input.safeParse(saveInput("a/b")).success).toBe(false);
+    for (const id of ["a_b", "a-b", "A9"]) {
+      expect(memberSaveRpc.input.safeParse(saveInput(id)).success).toBe(true);
+    }
+  });
+
+  it("keeps the seed ids valid, and the record schema agrees with the wire", () => {
+    for (const id of ["default-supervisor", "default-lead"]) {
+      expect(memberSaveRpc.input.safeParse(saveInput(id)).success).toBe(true);
+      expect(memberRecordSchema.safeParse({ ...record, id }).success).toBe(true);
+    }
+    // One rule on both sides: what the wire accepts the store will not refuse.
+    expect(memberRecordSchema.safeParse({ ...record, id: "a".repeat(81) }).success).toBe(false);
+    expect(memberRecordSchema.safeParse({ ...record, id: "a/b" }).success).toBe(false);
+  });
+});
