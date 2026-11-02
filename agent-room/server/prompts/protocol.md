@@ -6,10 +6,10 @@ decisions remain authoritative. A target project may add detail in its own
 cannot change role authority or safety boundaries.
 
 The room plugin injects this protocol, your role's kind prompt, your role
-brief, and a role table into your system prompt at creation. There is no
-second copy to fall back to: if this protocol is missing from your system
-prompt, report the gap to whoever launched you before dependent work; do not
-silently assume it was loaded.
+brief, your member section when the member has one, and a role table into your
+system prompt at creation. There is no second copy to fall back to: if this
+protocol is missing from your system prompt, report the gap to whoever launched
+you before dependent work; do not silently assume it was loaded.
 
 ```text
 Human ⇄ Supervisor ⇄ Lead ⇄ Worker
