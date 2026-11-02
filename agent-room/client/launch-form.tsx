@@ -2,6 +2,7 @@ import { usePaseo } from "@getpaseo/plugin/client";
 import { useEffect, useState } from "react";
 import { Text, View } from "react-native";
 
+import type { MemberRecord } from "../shared/member";
 import type { Choice, Surface } from "./seat-editor";
 import { ActionButton, ChoiceRow, Field, TextEntry, describeError, paddingFor } from "./seat-editor";
 
@@ -101,6 +102,13 @@ export function useLaunchTarget(): LaunchTarget {
 
 export interface LaunchFormProps extends Surface {
   target: LaunchTarget;
+  /** Every member the store knows. Only the matching role is offered per seat. */
+  members: MemberRecord[];
+  /** "" means the host seat, which is what a room launched without one gets. */
+  supervisorMemberId: string;
+  leadMemberId: string;
+  onSupervisorMemberChange(id: string): void;
+  onLeadMemberChange(id: string): void;
   task: string;
   onTaskChange(text: string): void;
   launching: boolean;
@@ -108,7 +116,25 @@ export interface LaunchFormProps extends Surface {
   onLaunch(): void;
 }
 
-/** Task, target and the Launch button. The screen owns the launch itself. */
+/**
+ * One member picker: the host seat, then the members of that role.
+ *
+ * The host seat is first and is the empty-id default, because a room that names
+ * no member still launches — it keeps whatever the saved role's seat is. The
+ * filter is by role: offering a Lead as the Supervisor would bind a member the
+ * room protocol cannot use there.
+ */
+function memberChoices(members: MemberRecord[], role: "supervisor" | "lead"): Choice[] {
+  return [
+    { id: "", label: "host seat" },
+    ...members.filter((member) => member.role === role).map((member) => ({ id: member.id, label: member.name })),
+  ];
+}
+
+/**
+ * Target, the two member pickers, the task and the Launch button. The screen
+ * owns the launch itself.
+ */
 export function LaunchForm(props: LaunchFormProps) {
   const { theme, layout, target } = props;
   const surface: Surface = { theme, layout };
@@ -155,6 +181,33 @@ export function LaunchForm(props: LaunchFormProps) {
           onChangeText={target.setCwd}
         />
       </Field>
+
+      <Field surface={surface} label="Supervisor member">
+        <ChoiceRow
+          surface={surface}
+          options={memberChoices(props.members, "supervisor")}
+          value={props.supervisorMemberId}
+          disabled={props.launching}
+          onSelect={props.onSupervisorMemberChange}
+        />
+      </Field>
+
+      <Field surface={surface} label="Lead member">
+        <ChoiceRow
+          surface={surface}
+          options={memberChoices(props.members, "lead")}
+          value={props.leadMemberId}
+          disabled={props.launching}
+          onSelect={props.onLeadMemberChange}
+        />
+      </Field>
+
+      {props.supervisorMemberId.length > 0 || props.leadMemberId.length > 0 ? (
+        <Text style={muted}>
+          A selected member supplies that seat and its memory; the host seat keeps the saved role's
+          seat.
+        </Text>
+      ) : null}
 
       <Field surface={surface} label="Task">
         <TextEntry

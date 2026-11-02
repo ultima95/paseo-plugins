@@ -4,10 +4,11 @@ import type { ReactNode } from "react";
 import { useCallback, useEffect, useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
 
+import type { MemberRecord } from "../shared/member";
 import type { RoomRecord } from "../shared/room";
 import type { RoleKind } from "../shared/roles";
 import { DEFAULT_SETTINGS, roomSettings } from "../shared/roles";
-import { launchRoomRpc, listRoomsRpc } from "../shared/rpc";
+import { launchRoomRpc, listRoomsRpc, memberListRpc } from "../shared/rpc";
 import { LaunchForm, useLaunchTarget } from "./launch-form";
 import type { RolePatch, RoomDraft } from "./settings-draft";
 import { addRole, removeRole, setRole, validateDraft } from "./settings-draft";
@@ -22,6 +23,7 @@ import {
   paddingFor,
   useProviderCatalog,
 } from "./seat-editor";
+import { memberChip } from "./view-model";
 
 /** Newest first. The RPC already sorts; this keeps the row order pinned here. */
 function newestFirst(rooms: RoomRecord[]): RoomRecord[] {
@@ -45,11 +47,41 @@ function timeOfDay(at: string): string {
   }
 }
 
-function RoomRow(props: { surface: Surface; room: RoomRecord; onOpen(): void }) {
+/** One member chip: which role the member fills, and its name. */
+function MemberChipView(props: { surface: Surface; label: string; name: string }) {
+  const { theme, layout } = props.surface;
+  const pad = paddingFor(layout);
+  return (
+    <View
+      style={{
+        backgroundColor: theme.colors.surface1,
+        borderColor: theme.colors.border,
+        borderWidth: 1,
+        borderRadius: 999,
+        paddingHorizontal: Math.max(6, pad),
+        paddingVertical: 2,
+      }}
+    >
+      <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }} numberOfLines={1}>
+        {`${props.label}: ${props.name}`}
+      </Text>
+    </View>
+  );
+}
+
+function RoomRow(props: {
+  surface: Surface;
+  room: RoomRecord;
+  members: MemberRecord[];
+  onOpen(): void;
+}) {
   const { theme, layout } = props.surface;
   const pad = paddingFor(layout);
   const room = props.room;
   const task = room.task.trim();
+  // A room launched on the host seats binds no member, and a member the store
+  // has since dropped cannot be named: both slots stay empty, so no chip shows.
+  const chips = memberChip(room, props.members);
 
   return (
     <Pressable
@@ -67,6 +99,16 @@ function RoomRow(props: { surface: Surface; room: RoomRecord; onOpen(): void }) 
       <Text style={{ color: theme.colors.foreground, fontSize: 13 }} numberOfLines={2}>
         {task.length > 0 ? task : "(no task)"}
       </Text>
+      {chips.supervisor === null && chips.lead === null ? null : (
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 4 }}>
+          {chips.supervisor === null ? null : (
+            <MemberChipView surface={props.surface} label="Sup" name={chips.supervisor} />
+          )}
+          {chips.lead === null ? null : (
+            <MemberChipView surface={props.surface} label="Lead" name={chips.lead} />
+          )}
+        </View>
+      )}
       <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
         {`${shortId(room.id)} · ${timeOfDay(room.createdAt)}${room.endedAt ? " · ended" : ""}${
           room.cwd.length > 0 ? ` · ${room.cwd}` : ""
@@ -94,6 +136,7 @@ export function RoomsScreen(props: PluginScreenProps) {
   const launchTarget = useLaunchTarget();
   const launchRoom = useRpc(launchRoomRpc);
   const listRooms = useRpc(listRoomsRpc);
+  const listMembers = useRpc(memberListRpc);
 
   /** Local edits. `null` shows whatever the settings store currently holds. */
   const [edited, setEdited] = useState<RoomDraft | null>(null);
@@ -103,6 +146,11 @@ export function RoomsScreen(props: PluginScreenProps) {
   const [task, setTask] = useState("");
   const [launching, setLaunching] = useState(false);
   const [launchError, setLaunchError] = useState("");
+
+  /** "" is the host seat: a room launched with no member named. */
+  const [supervisorMemberId, setSupervisorMemberId] = useState("");
+  const [leadMemberId, setLeadMemberId] = useState("");
+  const [members, setMembers] = useState<MemberRecord[]>([]);
 
   const [rooms, setRooms] = useState<RoomRecord[]>([]);
   const [roomsLoading, setRoomsLoading] = useState(true);
@@ -147,6 +195,24 @@ export function RoomsScreen(props: PluginScreenProps) {
     void refreshRooms();
   }, [refreshRooms]);
 
+  /**
+   * The members the launch pickers offer and the chips name. A failure is not
+   * an error the room list should show: the pickers fall back to "host seat"
+   * and the chips stay off, which is exactly a launch with no member bound.
+   */
+  const refreshMembers = useCallback(async () => {
+    try {
+      const result = await listMembers({});
+      setMembers(result.members);
+    } catch {
+      setMembers([]);
+    }
+  }, [listMembers]);
+
+  useEffect(() => {
+    void refreshMembers();
+  }, [refreshMembers]);
+
   const openAgent = navigation?.openAgent;
 
   async function saveSettings() {
@@ -166,7 +232,20 @@ export function RoomsScreen(props: PluginScreenProps) {
     setLaunching(true);
     setLaunchError("");
     try {
-      const result = await launchRoom({ task: task.trim(), ...request });
+      // A member selected earlier may have been removed since. Only an id the
+      // list still has is sent; anything else means the host seat, which is
+      // exactly what an omitted id asks the daemon for.
+      const known = (id: string): boolean => members.some((member) => member.id === id);
+      const supervisor = known(supervisorMemberId) ? supervisorMemberId : "";
+      const lead = known(leadMemberId) ? leadMemberId : "";
+      const result = await launchRoom({
+        task: task.trim(),
+        ...request,
+        // An unset picker sends nothing at all, so the daemon keeps its own
+        // default rather than being told to bind an empty id.
+        ...(supervisor.length > 0 ? { supervisorMemberId: supervisor } : {}),
+        ...(lead.length > 0 ? { leadMemberId: lead } : {}),
+      });
       setTask("");
       if (openAgent) {
         openAgent({ agentId: result.roomId });
@@ -307,6 +386,11 @@ export function RoomsScreen(props: PluginScreenProps) {
           theme={theme}
           layout={layout}
           target={launchTarget}
+          members={members}
+          supervisorMemberId={supervisorMemberId}
+          leadMemberId={leadMemberId}
+          onSupervisorMemberChange={setSupervisorMemberId}
+          onLeadMemberChange={setLeadMemberId}
           task={task}
           onTaskChange={setTask}
           launching={launching}
@@ -324,6 +408,7 @@ export function RoomsScreen(props: PluginScreenProps) {
             key={room.id}
             surface={surface}
             room={room}
+            members={members}
             onOpen={() => {
               if (openAgent) openAgent({ agentId: room.id });
             }}
@@ -335,7 +420,12 @@ export function RoomsScreen(props: PluginScreenProps) {
             surface={surface}
             label={roomsLoading ? "Refreshing…" : "Refresh"}
             disabled={roomsLoading}
-            onPress={() => void refreshRooms()}
+            // The member list decides the launch pickers and the chips, so a
+            // refresh re-reads it with the rooms.
+            onPress={() => {
+              void refreshMembers();
+              void refreshRooms();
+            }}
           />
         </View>
       </Section>

@@ -100,7 +100,7 @@ export function RoomPopover(props: PluginButtonContentProps & { onManage?: () =>
         Start a room
       </Text>
       <Text style={{ color: theme.colors.foregroundMuted }}>
-        Uses the saved Supervisor, Lead and worker roles, and runs in this workspace.
+        Uses the saved role seats, and runs in this workspace.
       </Text>
       <TextInput
         accessibilityLabel="Room task"

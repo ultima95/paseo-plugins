@@ -1,5 +1,6 @@
+import type { MemberRecord } from "../shared/member";
+import type { FeedEvent, RoomRecord, SeatRecord } from "../shared/room";
 import { parseRoomStatusMessage, roomStatusLine } from "../shared/room-status";
-import type { FeedEvent, SeatRecord } from "../shared/room";
 
 /** One tree row: the seat and how far to indent it from the root. */
 export interface TreeNode {
@@ -63,6 +64,43 @@ export function seatName(seat: SeatRecord): string {
     case "peer":
       return `Peer:${marker.tier}`;
   }
+}
+
+/** The member names a room is bound to, one slot per bindable role. */
+export interface MemberChip {
+  supervisor: string | null;
+  lead: string | null;
+}
+
+/**
+ * The names of the members a room was launched on.
+ *
+ * A room launched on the host seats carries no member ids, and a member the
+ * store no longer has cannot be named: both read as `null`, so a caller can
+ * tell "no member" from a member with an empty name (which the record schema
+ * forbids anyway).
+ */
+export function memberChip(room: RoomRecord, members: readonly MemberRecord[]): MemberChip {
+  const nameOf = (id: string | null): string | null =>
+    id === null ? null : (members.find((member) => member.id === id)?.name ?? null);
+  return { supervisor: nameOf(room.supervisorMemberId), lead: nameOf(room.leadMemberId) };
+}
+
+/**
+ * The member behind one seat of the tree.
+ *
+ * Only the two seats a room binds can have a member: a worker seat is launched
+ * by a Lead and stands for no member of its own. A seat recorded before roles
+ * existed has no `roleKind`, so it resolves to nothing rather than guessing.
+ */
+export function memberNameForSeat(
+  seat: Pick<SeatRecord, "roleKind">,
+  room: RoomRecord,
+  members: readonly MemberRecord[],
+): string | null {
+  if (seat.roleKind === "supervisor") return memberChip(room, members).supervisor;
+  if (seat.roleKind === "lead") return memberChip(room, members).lead;
+  return null;
 }
 
 /**
