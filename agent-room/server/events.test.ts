@@ -2,7 +2,13 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginHookContext } from "@getpaseo/plugin/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { CHARTER_PROMPT_CAP, type Lesson, type MemberRecord } from "../shared/member";
+import {
+  CHARTER_PROMPT_CAP,
+  type EpisodeFact,
+  type Lesson,
+  type MemberRecord,
+  type PendingCandidate,
+} from "../shared/member";
 import type { FeedEvent, RoomRecord, SeatRecord } from "../shared/room";
 import { DEFAULT_SETTINGS } from "../shared/roles";
 import type { SeatMarker } from "../shared/seats";
@@ -116,6 +122,20 @@ const member = (over: Partial<MemberRecord> = {}): MemberRecord => ({
 });
 
 /**
+ * The member-store writes a handler makes, as module-level spies: a test asserts
+ * on them directly (`expect(appendEpisode).toHaveBeenCalledWith(…)`), and every
+ * `fakeMembers` installs these instances. `beforeEach` clears the calls, so each
+ * test starts from none while the implementations stay.
+ */
+const appendEpisode = vi.fn(async (_id: string, _roomId: string, _fact: EpisodeFact) => undefined);
+const appendLesson = vi.fn(async (_id: string, _lesson: Lesson) => true);
+const appendPending = vi.fn(async (_id: string, _candidate: PendingCandidate) => true);
+const episodes = vi.fn(async (_id: string): Promise<Array<EpisodeFact & { roomId: string }>> => []);
+const hasLesson = vi.fn((_id: string, _scope: string, _text: string) => false);
+const hasPending = vi.fn((_id: string, _candidateId: string) => false);
+const pending = vi.fn((_id: string): PendingCandidate[] => []);
+
+/**
  * The events handler reads the member store only: `get` for the bound seat,
  * `charter`/`lessonsFor` for the section it re-renders. The rest is here so the
  * fake is a `MemberStore`, not a cast.
@@ -146,15 +166,15 @@ function fakeMembers(
       options.onScopes?.(scopes);
       return options.lessons ?? [];
     },
-    hasLesson: () => false,
-    pending: () => [],
-    hasPending: () => false,
-    appendLesson: async () => false,
-    appendPending: async () => false,
+    hasLesson,
+    pending,
+    hasPending,
+    appendLesson,
+    appendPending,
     acceptPending: async () => null,
     rejectPending: async () => false,
-    appendEpisode: async () => undefined,
-    episodes: async () => [],
+    appendEpisode,
+    episodes,
     flush: async () => undefined,
   };
 }
@@ -228,7 +248,7 @@ function eventsWith(
   paseo: PaseoApi,
   store: RoomStore,
   titles: (paseo: PaseoApi, agentId: string) => Promise<string | null> = async () => null,
-  overrides: Partial<Pick<RoomEventsDeps, "members" | "repoIdFor">> = {},
+  overrides: Partial<Pick<RoomEventsDeps, "members" | "repoIdFor" | "now">> = {},
 ) {
   const created = createRoomEvents({
     store,
@@ -237,6 +257,7 @@ function eventsWith(
     log,
     members: overrides.members ?? fakeMembers(),
     repoIdFor: overrides.repoIdFor ?? (async () => null),
+    ...(overrides.now !== undefined ? { now: overrides.now } : {}),
   });
   const ctx: PluginHookContext = { paseo, signal: new AbortController().signal };
   return { created, ctx };
@@ -1138,6 +1159,116 @@ describe("onTurnEnded", () => {
       expect.objectContaining({ agentId: "S1" }),
     );
   });
+
+  it("captures a DECISION_NEEDED supervisor turn as an episode fact", async () => {
+    const { store } = storedRoom();
+    const { paseo } = fakePaseo({}, [
+      { item: { type: "user_message", text: "Fix auth" } },
+      { item: { type: "assistant_message", text: "DECISION_NEEDED: use pnpm or npm?" } },
+    ]);
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => "8f3c1a2b",
+    });
+    // The launch bound the room's supervisor member.
+    store.room("S1")!.room.supervisorMemberId = "sup-1";
+
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "S1", title: "Supervisor: fix auth" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+
+    expect(appendEpisode).toHaveBeenCalledWith(
+      "sup-1",
+      "S1",
+      expect.objectContaining({ kind: "decision", signal: "DECISION_NEEDED" }),
+    );
+  });
+
+  it("captures no episode when the room bound no member", async () => {
+    const { store, appendFeed } = storedRoom();
+    const { paseo } = fakePaseo({}, [
+      { item: { type: "assistant_message", text: "DECISION_NEEDED: and?" } },
+    ]);
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => "8f3c1a2b",
+    });
+
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "S1", title: "Supervisor: fix auth" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+
+    // The room still records the turn; only the member's memory is untouched.
+    expect(appendFeed).toHaveBeenCalledTimes(1);
+    expect(appendEpisode).not.toHaveBeenCalled();
+  });
+
+  it("captures nothing from a worker turn", async () => {
+    const seats = [roleSeat("W1", "S1", "L1", { id: "implementer", name: "Implementer", kind: "worker" })];
+    const { store } = fakeStore({ rooms: [room("S1")], seats });
+    const { paseo } = fakePaseo({}, [
+      { type: "user_message", text: "work" },
+      { type: "assistant_message", text: "DONE" },
+    ]);
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "lead-1": member({ id: "lead-1", role: "lead" }) }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "W1", parentAgentId: "L1" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+
+    expect(appendEpisode).not.toHaveBeenCalled();
+  });
+
+  it("redacts an obvious credential before storing the fact", async () => {
+    const { store } = storedRoom();
+    const { paseo } = fakePaseo({}, [
+      { item: { type: "assistant_message", text: "DECISION_NEEDED: rotate sk-live-abcdefgh12345?" } },
+    ]);
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => null,
+    });
+    store.room("S1")!.room.supervisorMemberId = "sup-1";
+
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "S1", title: "Supervisor: rotate the key" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+
+    const fact = appendEpisode.mock.calls[0]?.[2];
+    expect(fact?.text).toContain("[redacted]");
+    expect(fact?.text).not.toContain("sk-live-abcdefgh12345");
+    expect(log.warn).toHaveBeenCalledWith(
+      "redacted secrets in member memory",
+      expect.objectContaining({ memberId: "sup-1", roomId: "S1", redactions: 1 }),
+    );
+  });
 });
 
 describe("onArchived", () => {
@@ -1159,6 +1290,177 @@ describe("onArchived", () => {
     await created.onArchived({ agent: agent({ id: "L1" }), archivedAt: "2026-10-28T11:00:00.000Z" }, ctx);
 
     expect(endRoom).not.toHaveBeenCalled();
+  });
+
+  it("writes the final outcome and promotes repo candidates at archive", async () => {
+    const { store } = storedRoom();
+    store.room("S1")!.room.supervisorMemberId = "sup-1";
+    const { paseo } = fakePaseo();
+    const members = fakeMembers({
+      "sup-1": member({ memory: { promotion: "auto", autoScopes: ["repo", "workspace"] } }),
+    });
+    members.episodes = async () => [
+      { roomId: "S1", at: "2026-11-02T10:00:00.000Z", kind: "decision", text: "use pnpm" },
+    ];
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members,
+      repoIdFor: async () => "8f3c1a2b",
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    expect(appendEpisode).toHaveBeenCalledWith(
+      "sup-1",
+      "S1",
+      expect.objectContaining({ kind: "outcome" }),
+    );
+    expect(appendLesson).toHaveBeenCalledWith(
+      "sup-1",
+      expect.objectContaining({
+        scope: "repo:8f3c1a2b",
+        text: "use pnpm",
+        promotedBy: "auto",
+      }),
+    );
+  });
+
+  it("leaves human-policy candidates pending at archive", async () => {
+    const { store } = storedRoom();
+    store.room("S1")!.room.supervisorMemberId = "sup-1";
+    const { paseo } = fakePaseo();
+    const members = fakeMembers({
+      "sup-1": member({ memory: { promotion: "human", autoScopes: ["repo", "workspace"] } }),
+    });
+    members.episodes = async () => [
+      { roomId: "S1", at: "2026-11-02T10:00:00.000Z", kind: "decision", text: "use pnpm" },
+    ];
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members,
+      repoIdFor: async () => "8f3c1a2b",
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    expect(appendLesson).not.toHaveBeenCalled();
+    expect(appendPending).toHaveBeenCalledWith(
+      "sup-1",
+      expect.objectContaining({ scope: "repo:8f3c1a2b", text: "use pnpm" }),
+    );
+  });
+
+  it("records the room's task as the final outcome fact", async () => {
+    const { store } = storedRoom();
+    store.room("S1")!.room.supervisorMemberId = "sup-1";
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    expect(appendEpisode).toHaveBeenCalledWith("sup-1", "S1", {
+      at: "2026-11-02T12:00:00.000Z",
+      kind: "outcome",
+      text: "room ended: fix auth",
+    });
+  });
+
+  it("stamps a promoted lesson with the injected clock", async () => {
+    const { store } = storedRoom();
+    store.room("S1")!.room.supervisorMemberId = "sup-1";
+    const { paseo } = fakePaseo();
+    const members = fakeMembers({
+      "sup-1": member({ memory: { promotion: "auto", autoScopes: ["repo"] } }),
+    });
+    members.episodes = async () => [
+      { roomId: "S1", at: "2026-11-02T10:00:00.000Z", kind: "decision", text: "use pnpm" },
+    ];
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members,
+      repoIdFor: async () => "8f3c1a2b",
+      now: () => Date.parse("2026-11-02T13:00:00.000Z"),
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    expect(appendLesson).toHaveBeenCalledWith(
+      "sup-1",
+      expect.objectContaining({ at: "2026-11-02T13:00:00.000Z" }),
+    );
+  });
+
+  it("finalizes the room's Lead as well as its Supervisor", async () => {
+    const { store } = storedRoom();
+    store.room("S1")!.room.leadMemberId = "lead-1";
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "lead-1": member({ id: "lead-1", name: "Lena", role: "lead" }) }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    expect(appendEpisode).toHaveBeenCalledWith(
+      "lead-1",
+      "S1",
+      expect.objectContaining({ kind: "outcome" }),
+    );
+  });
+
+  it("writes no memory for a room that bound no member", async () => {
+    const { store } = storedRoom();
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => "8f3c1a2b",
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    expect(appendEpisode).not.toHaveBeenCalled();
+    expect(appendLesson).not.toHaveBeenCalled();
+  });
+
+  it("reports a bound member that no longer exists", async () => {
+    const { store, appendFeed } = storedRoom();
+    store.room("S1")!.room.supervisorMemberId = "gone";
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({}),
+      repoIdFor: async () => null,
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    expect(appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        label: "member missing",
+        text: expect.stringContaining("member missing"),
+      }),
+    );
+    expect(appendEpisode).not.toHaveBeenCalled();
   });
 });
 

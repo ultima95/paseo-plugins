@@ -5,21 +5,29 @@ import type {
   PluginLifecycleEvents,
 } from "@getpaseo/plugin/server";
 
-import type { MemberRecord } from "../shared/member";
+import type { MemberRecord, MemberRole } from "../shared/member";
 import type { SeatRecord } from "../shared/room";
 import { GUARD_ROW_KIND, GUARD_ROW_VERSION } from "../shared/room";
 import { parseRoleTitle, roleForLegacyMarker, type Role, type RoomSettings } from "../shared/roles";
 import { parseSeatMarker, type SeatMarker } from "../shared/seats";
+import { candidatesFromFacts, episodeFactFor } from "./episode";
 import { feedFromTurn } from "./feed";
 import { checkSpawn } from "./guard";
 import type { Logger } from "./logger";
 import type { MemberStore } from "./member-store";
+import { applyPromotion } from "./promotion";
 import { renderMemberSection } from "./render";
-import { scopesFor } from "./scope";
+import { candidateScope, scopesFor } from "./scope";
 import type { RoomStore } from "./store";
 
 /** History one `agent.turn_ended` refetches; enough to cover a turn's messages. */
 export const FEED_TAIL_LIMIT = 40;
+
+/**
+ * How much of the room's task the closing outcome fact keeps. A fact is member
+ * memory that is read back for years, so it stays a summary, not a transcript.
+ */
+export const OUTCOME_TEXT_CAP = 400;
 
 /** A guard row is also rendered inside the agent timeline (renderer in Task 8). */
 export const GUARD_KIND = GUARD_ROW_KIND;
@@ -45,6 +53,8 @@ export interface RoomEventsDeps {
   members: MemberStore;
   /** The repository identity of a directory, or null outside a repository. */
   repoIdFor: (cwd: string) => Promise<string | null>;
+  /** The clock a promoted lesson is stamped with; `Date.now` in production. */
+  now?: () => number;
 }
 
 export interface RoomEvents {
@@ -153,6 +163,7 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
   // The object, not its methods: callers may swap a method out (tests do).
   const store = deps.store;
   const log = deps.log;
+  const now = deps.now ?? (() => Date.now());
 
   const resolveParent = async (
     agent: PluginHookAgent,
@@ -467,15 +478,89 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
     const timeline = (page?.entries ?? []).map((entry) => entry.item);
     const childIds = store.children(agent.id).map((child) => child.agentId);
 
+    // Only a Supervisor and a Lead keep memory, and only into the member their
+    // room bound to that seat. An unbound room (or a worker, which has no slot)
+    // records the turn in the feed and leaves member memory alone.
+    const room = store.room(seat.roomId)?.room;
+    const memberId =
+      room === undefined
+        ? null
+        : seat.roleKind === "supervisor"
+          ? room.supervisorMemberId
+          : seat.roleKind === "lead"
+            ? room.leadMemberId
+            : null;
+
     for (const draft of feedFromTurn({ agent: seat, childIds, timeline })) {
-      store.appendFeed({ roomId: seat.roomId, ...draft });
+      const stored = store.appendFeed({ roomId: seat.roomId, ...draft });
+      if (memberId === null) continue;
+      // The signal decides: only the five the protocol carries become facts.
+      const captured = episodeFactFor(stored, seat.roleKind);
+      if (captured === null) continue;
+      if (captured.redactions > 0) {
+        log.warn("redacted secrets in member memory", {
+          memberId,
+          roomId: seat.roomId,
+          redactions: captured.redactions,
+        });
+      }
+      await deps.members.appendEpisode(memberId, seat.roomId, captured.fact);
     }
   };
 
-  const handleArchived = async (agent: PluginHookAgent): Promise<void> => {
+  /** What a closed room leaves in a member's memory: the task it ended on. */
+  const outcomeText = (task: string, roomId: string): string => {
+    const named = task.trim().length > 0 ? task.trim() : roomId;
+    return `room ended: ${named}`.slice(0, OUTCOME_TEXT_CAP);
+  };
+
+  const handleArchived = async (agent: PluginHookAgent, archivedAt: string): Promise<void> => {
     // Only the room's root closes the room; a Lead or Peer leaving does not.
-    if (store.room(agent.id) === undefined) return;
+    const found = store.room(agent.id);
+    if (found === undefined) return;
     store.endRoom(agent.id);
+
+    // One scope for the whole room, derived once: every member it bound promotes
+    // into the repository (or workspace) their seats share.
+    const repoId = await deps.repoIdFor(found.room.cwd);
+    const scope = candidateScope(found.room.cwd, repoId);
+
+    const bindings: Array<[string | null, MemberRole]> = [
+      [found.room.supervisorMemberId, "supervisor"],
+      [found.room.leadMemberId, "lead"],
+    ];
+
+    for (const [memberId, role] of bindings) {
+      if (memberId === null) continue;
+
+      const member = deps.members.get(memberId);
+      if (member === undefined) {
+        // The binding outlived its member: say so in the room rather than write
+        // memory nothing will ever read.
+        store.appendFeed({
+          roomId: found.room.id,
+          kind: "note",
+          from: null,
+          to: memberId,
+          label: "member missing",
+          text: `member missing: ${memberId} (${role}); memory was not written`,
+        });
+        continue;
+      }
+
+      await deps.members.appendEpisode(memberId, found.room.id, {
+        at: archivedAt,
+        kind: "outcome",
+        text: outcomeText(found.room.task, found.room.id),
+      });
+
+      // Only this room's facts: a member's memory spans every room it sat in.
+      const facts = (await deps.members.episodes(memberId)).filter(
+        (fact) => fact.roomId === found.room.id,
+      );
+      const candidates = candidatesFromFacts(facts, { scope, sourceRoomId: found.room.id });
+      await applyPromotion({ members: deps.members, member, candidates, now, log });
+    }
   };
 
   return {
@@ -503,7 +588,7 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
 
     async onArchived(event, ctx) {
       try {
-        await handleArchived(event.agent);
+        await handleArchived(event.agent, event.archivedAt);
       } catch (error) {
         log.error("agent.archived handling failed", {
           agentId: event.agent.id,
