@@ -1427,7 +1427,7 @@ describe("migrateMembers", () => {
     });
     expect(out.seeded).toBe(false);
     expect(members.records).toEqual([]);
-    expect(log.warn).toHaveBeenCalledWith("member migration skipped: catalog has no lead", {
+    expect(log.warn).toHaveBeenCalledWith("member migration skipped: catalog is missing a required role", {
       error: expect.any(String),
     });
   });
@@ -1489,7 +1489,7 @@ export async function migrateMembers(deps: MigrateMembersDeps): Promise<{ seeded
   const supervisor = settings.roles.find((role) => role.kind === "supervisor");
   const lead = settings.roles.find((role) => role.kind === "lead");
   if (supervisor === undefined || lead === undefined) {
-    deps.log.warn("member migration skipped: catalog has no lead", {
+    deps.log.warn("member migration skipped: catalog is missing a required role", {
       error: supervisor === undefined ? "no supervisor role" : "no lead role",
     });
     return { seeded: false };
@@ -2891,7 +2891,7 @@ Replace the load promise:
     await members.load();
     await migrateMembers({ store, members, readSettings, now: () => Date.now(), log });
   })().catch((error: unknown) => {
-    log.error("room store load failed", { error: reason(error) });
+    log.error("room and member stores load failed", { error: reason(error) });
   });
 ```
 
@@ -4533,7 +4533,7 @@ Implement the bodies in the same style as `rooms-screen.tsx`. Required behaviors
 
 - charter text is local state seeded from `detail.charter`; Save calls `charter({ memberId, text })`.
 - pending rows show `candidate.text`, `candidate.scope`, and Accept/Reject buttons.
-- lessons rows show `lesson.scope`, `lesson.at`, `lesson.promotedBy`, `lesson.text`.
+- lessons rows show `lesson.scope`, `lesson.at`, `lesson.promotedBy`, `lesson.sourceRoomId`, `lesson.text`.
 - episodes rows show `episode.roomId`, `episode.kind`, `episode.signal ?? ""`, `episode.text`.
 - Auto-scope toggles: one chip row per scope type; pressing toggles membership in `draft.autoScopes`.
 

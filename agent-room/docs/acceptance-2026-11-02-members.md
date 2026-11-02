@@ -94,11 +94,11 @@ Every item below is quoted from spec §15, followed by the tests that pin it.
 
 | # | Spec acceptance item | Tests |
 |---|---|---|
-| 1 | Two rooms launched from the same member with different tasks create Supervisors with identical seat config and different prompts | `server/handlers.test.ts` › "launch with members" › `launches the Supervisor on the selected member's seat and renders its memory`, `shows the bound Lead member's seat in the Supervisor's role table`; `server/member-index.test.ts` › `looks members up by id and by seat`; `index.server.test.ts` › `keeps a member-seated Supervisor's seat truthful when agent.created lands first`, `renders the matching member's section on a create that names its seat` |
-| 2 | A room's Supervisor prompt contains the charter and only matching-scope lessons; no lesson from another repo appears | `server/render.test.ts` › `renders name, charter and dated lessons`, `puts the member section after the role brief and before the role table`, `keeps the newest 12 lessons and flags the drop`, `truncates an oversized charter deterministically`; `server/handlers.test.ts` › `scopes the Supervisor's memory to the room's repository and workspace`, `reads the member scope from the workspace directory when only a workspace is given`, `notes a truncated member section in the room feed`; `server/inject.test.ts` › "applySeat with members" (4 tests); `server/scope.test.ts` › "repo identity", `lists global, then the repo, then the exact workspace`, `drops the repo scope when the directory is in no repository` |
-| 3 | After a room ends with `promotion: "human"`, its decisions appear in `pending.jsonl` and not in `lessons.jsonl`; accepting one appends it and the next room's prompt contains it | `server/promotion.test.ts` › `queues a human-policy candidate without promoting it`, `skips a candidate already promoted or already pending`, `skips a candidate whose pending line is a reject tombstone`; `server/events.test.ts` › `leaves human-policy candidates pending at archive`, `records the room's task as the final outcome fact`, `redacts a credential in the room's outcome fact`; `server/member-store.test.ts` › `accepts and rejects pending candidates`, `persists records, charter, lessons and pending across instances`; `server/member-handlers.test.ts` › `accepts and rejects pending candidates`, `fails an accept for an unknown candidate` |
-| 4 | With `promotion: "auto"` and default `autoScopes`, a repo-scoped candidate is promoted and a global-scoped one is not | `server/promotion.test.ts` › `promotes auto candidates in an allowed scope`, `keeps a global candidate pending under the default autoScopes`, `keeps the candidate timestamp on a queued line but stamps a promoted one`; `server/events.test.ts` › `writes the final outcome and promotes repo candidates at archive`, `stamps a promoted lesson with the injected clock` |
-| 5 | A v1 `rooms.json` loads, gains null member ids, seeds two members, and serves a room without data loss; a second load is a no-op | `server/store.test.ts` › `migrates a v1 file to v2 and reports it once`, `binds members whether the room is recorded before or after the binding`, `keeps member ids across a reload`; `shared/room.test.ts` › `accepts v1 and normalizes member ids to null`; `server/migrate-members.test.ts` › `seeds a supervisor and a lead from the catalog`, `is a no-op when v2 rooms are already on disk`, `leaves an existing members file alone`, `does not seed from a catalog without a lead role`; `index.server.test.ts` › `seeds members when a v1 rooms file is migrated on load`, `loads without seeding members for a room store that is already v2` |
+| 1 | Two rooms launched from the same member with different tasks create Supervisors with identical seat config and different prompts | `server/handlers.test.ts` › "launch with members" › `launches the Supervisor on the selected member's seat and renders its memory`, `gives two rooms on the same member an identical Supervisor seat`, `shows the bound Lead member's seat in the Supervisor's role table`; `server/member-index.test.ts` › `looks members up by id and by seat`; `index.server.test.ts` › `keeps a member-seated Supervisor's seat truthful when agent.created lands first`, `renders the matching member's section on a create that names its seat` |
+| 2 | A room's Supervisor prompt contains the charter and only matching-scope lessons; no lesson from another repo appears | `server/render.test.ts` › `renders name, charter and dated lessons`, `puts the member section after the role brief and before the role table`, `keeps the newest 12 lessons and flags the drop`, `truncates an oversized charter deterministically`; `server/member-store.test.ts` › `returns only the lessons in the scopes a room asks for, newest first`; `server/handlers.test.ts` › `scopes the Supervisor's memory to the room's repository and workspace`, `reads the member scope from the workspace directory when only a workspace is given`, `notes a truncated member section in the room feed`; `server/inject.test.ts` › "applySeat with members" (4 tests); `server/scope.test.ts` › "repo identity", `lists global, then the repo, then the exact workspace`, `drops the repo scope when the directory is in no repository` |
+| 3 | After a room ends with `promotion: "human"`, its decisions appear in `pending.jsonl` and not in `lessons.jsonl`; accepting one appends it and the next room's prompt contains it | `index.server.test.ts` › `captures a finished room's decision and outcome in the real member store`; `server/promotion.test.ts` › `queues a human-policy candidate without promoting it`, `skips a candidate already promoted or already pending`, `skips a candidate whose pending line is a reject tombstone`; `server/events.test.ts` › `leaves human-policy candidates pending at archive`, `records the room's task as the final outcome fact`, `redacts a credential in the room's outcome fact`; `server/member-store.test.ts` › `accepts and rejects pending candidates`, `renders an accepted candidate in the next room's member section`, `persists records, charter, lessons and pending across instances`; `server/member-handlers.test.ts` › `accepts and rejects pending candidates`, `fails an accept for an unknown candidate` |
+| 4 | With `promotion: "auto"` and default `autoScopes`, a repo-scoped candidate is promoted and a global-scoped one is not | `index.server.test.ts` › `promotes a repo-scoped candidate at archive under the auto policy`; `server/promotion.test.ts` › `promotes auto candidates in an allowed scope`, `keeps a global candidate pending under the default autoScopes`, `keeps the candidate timestamp on a queued line but stamps a promoted one`; `server/events.test.ts` › `writes the final outcome and promotes repo candidates at archive`, `stamps a promoted lesson with the injected clock` |
+| 5 | A v1 `rooms.json` loads, gains null member ids, seeds two members, and serves a room without data loss; a second load is a no-op | `server/store.test.ts` › `migrates a v1 file to v2 and reports it once`, `binds members whether the room is recorded before or after the binding`, `keeps member ids across a reload`; `shared/room.test.ts` › `accepts v1 and normalizes member ids to null`; `server/migrate-members.test.ts` › `seeds a supervisor and a lead from the catalog`, `is a no-op when v2 rooms are already on disk`, `leaves an existing members file alone`, `does not seed from a catalog without a lead role`, `does not seed from a catalog without a supervisor role`; `index.server.test.ts` › `seeds members when a v1 rooms file is migrated on load`, `loads without seeding members for a room store that is already v2` |
 | 6 | `npm test` and `npm run typecheck` pass in `agent-room`, and the guard tests are unchanged | Sections 1–2 above, and the guard check below |
 
 ### 4a. Guard tests unchanged
@@ -129,36 +129,43 @@ The first command prints nothing, and `server/guard.test.ts` appears nowhere in 
 the hierarchy rules were not relaxed to let members exist, and the member seats ride the existing role
 grammar. `server/guard.ts` is untouched too.
 
-### 4b. Three gaps, reported rather than papered over
+### 4b. The three gaps this record used to report, now closed
 
-Three halves of items 1, 2 and 3 are argued from composition rather than pinned by a single test. All
-three are recorded here as they stand, not rounded up.
+Three halves of items 1, 2 and 3 were once argued from composition rather than pinned by a single
+test. Each is pinned by a test now, named here rather than left to the reader.
 
-- **Item 1** — no test launches a *second* room on the same member and compares the two seat configs.
-  What is pinned is the mechanism: the launch reads the member record and forces its seat
-  (`handlers.test.ts`), the pre-create hook resolves a member by seat when it has no room
-  (`member-index.test.ts`, `index.server.test.ts`), and the binding carries the seat so a late
-  `agent.created` cannot make it a lie. Since a launch reads the member record and writes nothing to
-  it, two launches can only produce the same seat, but that equality is not asserted directly.
-- **Item 2** — the prompt tests assert the *exact* scope list a launch asks the store for
-  (`["global", "repo:abcd1234", "workspace:/repo"]`) and that a lesson in one of those scopes renders,
-  but `MemberStore.lessonsFor`'s own filter — the line that keeps a lesson from another repo out — is
-  not exercised with a non-matching lesson. `handlers.test.ts` and `events.test.ts` both stub
-  `lessonsFor`, so the exclusion is proven by code reading, not by a test. A one-line store test
-  (two lessons, one scope each, expect one back) would close it.
-- **Item 3** — the final clause, "accepting one appends it and the next room's prompt contains it", is
-  composed from two tests and not chained by either. `member-store.test.ts` › `accepts and rejects
-  pending candidates` pins the first half — an accept appends the lesson — and `render.test.ts` plus
-  the `handlers.test.ts` member tests pin that a lesson in a loaded scope renders into the prompt. No
-  test renders a prompt from a store that accepted a candidate: `acceptPending` appears only in
-  `member-store.test.ts` and `member-handlers.test.ts` (plus a never-called stub in `events.test.ts`),
-  and neither file renders a prompt. **Item 3's prompt-rendering clause is therefore not directly
-  covered** — nothing asserts that the *next* room's prompt contains the lesson an accept just wrote,
-  only that the accept stores it and that a stored lesson in scope renders. A test that accepts a
-  candidate on a real store and then renders the next room's prompt from that store would close it.
+- **Item 1 — two launches on one member.** `server/handlers.test.ts` ›
+  `gives two rooms on the same member an identical Supervisor seat` launches twice on `sup-1` with
+  different tasks and asserts both create configs carry the same provider/model string, mode and
+  thinking level, while the titles and prompts differ. The mechanism is still pinned on its own: the
+  launch reads the member record and forces its seat (`handlers.test.ts`), the pre-create hook
+  resolves a member by seat when it has no room (`member-index.test.ts`, `index.server.test.ts`), and
+  the binding carries the seat so a late `agent.created` cannot make it a lie.
+- **Item 2 — the scope filter itself.** `server/member-store.test.ts` ›
+  `returns only the lessons in the scopes a room asks for, newest first` writes three lessons on one
+  member (`global`, `repo:aaaa1111`, `repo:bbbb2222`), reloads the store from disk, and asks
+  `lessonsFor(id, ["global", "repo:aaaa1111", "workspace:/x"])`: exactly the `global` and
+  `repo:aaaa1111` lessons come back, newest first, so a lesson from another repository cannot reach
+  the prompt. `handlers.test.ts` and `events.test.ts` still stub `lessonsFor`, but the filter they
+  stand in for is now exercised with a non-matching lesson.
+- **Item 3 — accept one, and the next room's prompt contains it.** `server/member-store.test.ts` ›
+  `renders an accepted candidate in the next room's member section` accepts a pending candidate on a
+  real store, reloads it, and renders `renderMemberSection` from `lessonsFor` for the next room's
+  scopes: the accepted lesson is in the section. One test chains the accept and the render instead of
+  leaving the reader to compose them.
 
-None of the three is a behaviour defect as far as code reading shows; they are the places where this
-record's evidence stops short of the spec's sentence, stated plainly so a later task can close them.
+The archive → memory path also runs end to end against the real stores now, with no member store
+stubbed: `index.server.test.ts` › `captures a finished room's decision and outcome in the real member
+store` and `promotes a repo-scoped candidate at archive under the auto policy` drive a launch, a
+`DECISION_NEEDED` turn and the Supervisor's archive through `createMemberStore`, then assert the
+files on disk — `members/<id>/episodes/<roomId>.jsonl` (a decision fact and the closing outcome
+fact), `pending.jsonl` (the candidate, under `promotion: "human"`) and `lessons.jsonl` (empty; and
+under `promotion: "auto"` with `autoScopes: ["repo", "workspace"]`, the promoted lesson instead).
+
+Nothing in items 1–3 is left uncovered. Section 1 quotes the 1100-test run this record was written
+on; the merge-prep fix wave that closed the gaps above brings the suite to 1108, and
+`.superpowers/sdd/2026-11-02-agent-room-phase4-members/final-fix-report.md` carries that run and
+this file's changed lines.
 
 ## 5. Migration demonstration
 
@@ -265,7 +272,7 @@ cat ~/.paseo/plugin-data/agent-room/members/default-lead/lessons.jsonl
 
 | File | Change |
 |---|---|
-| `agent-room/OVERVIEW.md` | New **Members**, **Memory scopes**, **Promotion** and **Episodes** sections; the prompt-delivery paragraph now names the member section in order and its budgets; the setup paragraph now describes `rooms.json` (version 2) plus `members.json` (version 1) and the `members/<memberId>/` layout; seven member limits added to **Known limits**, and the forward-only note tied to version 2 |
+| `agent-room/OVERVIEW.md` | New **Members**, **Memory scopes**, **Promotion** and **Episodes** sections; the prompt-delivery paragraph now names the member section in order and its budgets; the setup paragraph now describes `rooms.json` (version 2) plus `members.json` (version 1) and the `members/<memberId>/` layout; five member limits added to **Known limits**, and the existing forward-only limit retied to version 2 (six rows touched in all) |
 | `agent-room/server/prompts/lead.md` | The worker `initialPrompt` template names the member section (Task 9 review follow-up) |
 | `agent-room/server/prompts/generated.ts` | Regenerated by `npm run gen:prompts`; not hand-edited |
 | `agent-room/docs/acceptance-2026-11-02-members.md` | This record |

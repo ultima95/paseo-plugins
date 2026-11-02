@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { memberRecordSchema, type Lesson } from "../shared/member";
 import type { Logger } from "./logger";
 import { createMemberStore, lessonKey } from "./member-store";
+import { renderMemberSection } from "./render";
 
 let dir: string;
 let clock: number;
@@ -184,5 +185,64 @@ describe("createMemberStore", () => {
     expect(s.lessons("lead-1").map((entry) => entry.text)).toEqual(
       Array.from({ length: 20 }, (_, i) => `lesson ${i}`),
     );
+  });
+
+  it("returns only the lessons in the scopes a room asks for, newest first", async () => {
+    // Spec §15 item 2: a room's prompt carries the charter and the lessons whose
+    // scope matches the room — no lesson from another repository appears.
+    const s = make();
+    await s.load();
+    await s.upsert(record("lead-1"));
+    await s.appendLesson("lead-1", { ...lesson("global", "global lesson"), at: "2026-11-01T10:00:00.000Z" });
+    await s.appendLesson("lead-1", {
+      ...lesson("repo:aaaa1111", "this repository's lesson"),
+      at: "2026-11-03T10:00:00.000Z",
+    });
+    await s.appendLesson("lead-1", {
+      ...lesson("repo:bbbb2222", "another repository's lesson"),
+      at: "2026-11-02T10:00:00.000Z",
+    });
+    await s.flush();
+
+    // A fresh store, so the filter is proven on what was written and read back.
+    const b = make();
+    await b.load();
+    expect(b.lessons("lead-1")).toHaveLength(3);
+    expect(
+      b
+        .lessonsFor("lead-1", ["global", "repo:aaaa1111", "workspace:/x"])
+        .map((entry) => entry.text),
+    ).toEqual(["this repository's lesson", "global lesson"]);
+  });
+
+  it("renders an accepted candidate in the next room's member section", async () => {
+    // Spec §15 item 3's final clause, chained: an accept writes the lesson, and
+    // the next room's prompt — rendered from the same store — carries it.
+    const s = make();
+    await s.load();
+    await s.upsert(record("lead-1"));
+    const candidate = {
+      id: lessonKey("repo:aaaa1111", "run the room's own tests first"),
+      at: "2026-11-02T10:00:00.000Z",
+      scope: "repo:aaaa1111",
+      text: "run the room's own tests first",
+      sourceRoomId: "R1",
+    };
+    await s.appendPending("lead-1", candidate);
+    await expect(s.acceptPending("lead-1", candidate.id)).resolves.toMatchObject({
+      text: "run the room's own tests first",
+      promotedBy: "human",
+    });
+    await s.flush();
+
+    const next = make();
+    await next.load();
+    const section = renderMemberSection({
+      name: "Lead",
+      charter: next.charter("lead-1"),
+      lessons: next.lessonsFor("lead-1", ["global", "repo:aaaa1111", "workspace:/x"]),
+    });
+
+    expect(section.text).toContain("[repo:aaaa1111] run the room's own tests first");
   });
 });

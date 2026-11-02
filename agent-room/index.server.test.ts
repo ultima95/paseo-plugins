@@ -187,6 +187,38 @@ async function seedMember(charter = "Ship it."): Promise<string> {
   return dataDir;
 }
 
+/** Write `members.json` with one member, whose policy a test can vary. */
+async function seedMemberRecord(over: Record<string, unknown> = {}): Promise<string> {
+  const dataDir = join(home, "plugin-data", "agent-room");
+  await mkdir(join(dataDir, "members", "mem-1"), { recursive: true });
+  await writeFile(
+    join(dataDir, "members.json"),
+    JSON.stringify({ version: 1, members: [{ ...MEMBER, ...over }] }),
+    "utf8",
+  );
+  return dataDir;
+}
+
+/**
+ * The JSON lines a member file holds, or `[]` when the store never wrote it.
+ *
+ * The archive test reads the files the plugin wrote rather than the store's
+ * in-memory lists: the claim is that a finished room leaves memory *on disk*.
+ */
+async function jsonLines(file: string): Promise<Array<Record<string, unknown>>> {
+  let raw: string;
+  try {
+    raw = await readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  return raw
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
 /** The request a Supervisor launch makes for the seeded member's seat. */
 const memberRequest = (): AgentCreateRequest => ({
   config: { provider: "opencode", cwd: "/repo", title: "Supervisor: fix auth", model: "m1" },
@@ -931,6 +963,123 @@ describe("agent-room server contribution", () => {
     // Flush the store before the `afterEach` removes the data dir: a write still
     // in flight would race the teardown instead of the assertion above.
     await cleanup();
+  });
+
+  /**
+   * One room on the seeded member, from launch to archive, through the real
+   * stores and the hooks `index.server.ts` registered. Nothing about the member
+   * store is stubbed: the episode, pending and lesson files asserted on are what
+   * the plugin itself wrote.
+   */
+  async function archiveMemberRoom(memberOver: Record<string, unknown> = {}): Promise<string> {
+    const dataDir = await seedMemberRecord(memberOver);
+    const { invoke, hooks, cleanup } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+    const context = { paseo: {} as PaseoApi, signal: new AbortController().signal };
+    // A real repository directory, so the room's single candidate scope is a
+    // `repo:<sha8>` scope rather than a workspace scope.
+    const cwd = process.cwd();
+    const timeline = [
+      { item: { type: "user_message", text: "Fix auth" } },
+      { item: { type: "assistant_message", text: "DECISION_NEEDED: use pnpm or npm?" } },
+    ];
+    const created: PaseoAgentCreateOptions[] = [];
+    const paseo = {
+      agents: {
+        create: vi.fn(async (options: PaseoAgentCreateOptions) => {
+          created.push(options);
+          // The daemon fires `agent.created` before the create resolves, so the
+          // room and its seat are recorded before `room.launch` can bind.
+          await hooks["agent.created"](
+            {
+              agent: hookAgent({ id: "A1", provider: "opencode", cwd, title: "Supervisor: fix auth" }),
+            },
+            context,
+          );
+          return { id: "A1" };
+        }),
+        ref: vi.fn((agentId: string) => ({
+          id: agentId,
+          timeline: { refetch: vi.fn(async () => ({ entries: timeline })) },
+        })),
+      },
+      workspaces: { list: vi.fn(async () => ({ entries: [] })) },
+    } as unknown as PaseoApi;
+    // The hooks read the daemon off the context, so the stub arrives that way.
+    context.paseo = paseo;
+
+    await invoke("room.launch")(
+      { task: "Fix auth", cwd, supervisorMemberId: "mem-1" },
+      { paseo },
+    );
+    expect(created).toHaveLength(1);
+
+    await hooks["agent.turn_ended"](
+      {
+        agent: hookAgent({ id: "A1", provider: "opencode", cwd, title: "Supervisor: fix auth" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      context,
+    );
+    await hooks["agent.archived"](
+      {
+        agent: hookAgent({ id: "A1", provider: "opencode", cwd, title: "Supervisor: fix auth" }),
+        archivedAt: "2026-11-02T12:00:00.000Z",
+      },
+      context,
+    );
+
+    // Flush both stores before the `afterEach` removes the data dir: a write still
+    // in flight would race the teardown instead of the assertions.
+    await cleanup();
+    return dataDir;
+  }
+
+  it("captures a finished room's decision and outcome in the real member store", async () => {
+    const dataDir = await archiveMemberRoom();
+    const memberDir = join(dataDir, "members", "mem-1");
+
+    // The turn's DECISION_NEEDED reply and the archive's closing outcome.
+    const facts = await jsonLines(join(memberDir, "episodes", "A1.jsonl"));
+    expect(facts.map((fact) => fact.kind)).toEqual(["decision", "outcome"]);
+    expect(facts[0]).toMatchObject({ kind: "decision", signal: "DECISION_NEEDED" });
+    expect(String(facts[0]?.text)).toContain("use pnpm or npm");
+    expect(String(facts[1]?.text)).toBe("room ended: fix auth");
+
+    // `promotion: "human"`: the decision waits in pending and no lesson is written.
+    const pending = await jsonLines(join(memberDir, "pending.jsonl"));
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      scope: expect.stringMatching(/^repo:/),
+      text: expect.stringContaining("use pnpm or npm"),
+      sourceRoomId: "A1",
+    });
+    expect(await jsonLines(join(memberDir, "lessons.jsonl"))).toEqual([]);
+  });
+
+  it("promotes a repo-scoped candidate at archive under the auto policy", async () => {
+    const dataDir = await archiveMemberRoom({
+      memory: { promotion: "auto", autoScopes: ["repo", "workspace"] },
+    });
+    const memberDir = join(dataDir, "members", "mem-1");
+
+    const lessons = await jsonLines(join(memberDir, "lessons.jsonl"));
+    expect(lessons).toHaveLength(1);
+    expect(lessons[0]).toMatchObject({
+      scope: expect.stringMatching(/^repo:/),
+      text: expect.stringContaining("use pnpm or npm"),
+      sourceRoomId: "A1",
+      promotedBy: "auto",
+    });
+    // Promoted, so the candidate is not also left waiting for review.
+    expect(await jsonLines(join(memberDir, "pending.jsonl"))).toEqual([]);
+    // The episode is still the record of the room, whatever the policy did.
+    expect(
+      (await jsonLines(join(memberDir, "episodes", "A1.jsonl"))).map((fact) => fact.kind),
+    ).toEqual(["decision", "outcome"]);
   });
 
   it("warns about an unknown legacy peer tier", async () => {

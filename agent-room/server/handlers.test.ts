@@ -640,6 +640,43 @@ describe("launch with members", () => {
     );
   });
 
+  it("gives two rooms on the same member an identical Supervisor seat", async () => {
+    // Spec §15 item 1: two launches on one member with different tasks run the
+    // same seat and differ only in what they carry.
+    const { paseo, created } = fakePaseo();
+    const handlers = createHandlers({
+      store: fakeStore().store,
+      readSettings: async () => DEFAULT_SETTINGS,
+      members: fakeMembers(),
+      repoIdFor: async () => null,
+    });
+
+    await handlers.launch({ task: "Fix the room", cwd: "/repo", supervisorMemberId: "sup-1" }, paseo);
+    await handlers.launch(
+      { task: "Ship the migration", cwd: "/repo", supervisorMemberId: "sup-1" },
+      paseo,
+    );
+
+    expect(created).toHaveLength(2);
+    // The create call has no separate model field: the seat is the combined
+    // provider/model string plus the two controls the member sets.
+    const seatOf = (call: CreateCall | undefined) => ({
+      provider: call?.options.config.provider,
+      modeId: call?.options.config.modeId,
+      thinkingOptionId: call?.options.config.thinkingOptionId,
+    });
+    expect(seatOf(created[0])).toEqual({
+      provider: "codex/gpt-5.6-sol",
+      modeId: "full-access",
+      thinkingOptionId: "medium",
+    });
+    expect(seatOf(created[1])).toEqual(seatOf(created[0]));
+    // Different tasks, so the two rooms are told apart by title and prompt.
+    expect(created[0]?.options.title).toBe("Supervisor: Fix the room");
+    expect(created[1]?.options.title).toBe("Supervisor: Ship the migration");
+    expect(created[0]?.options.prompt).not.toBe(created[1]?.options.prompt);
+  });
+
   it("shows the bound Lead member's seat in the Supervisor's role table", async () => {
     const lead = member({
       id: "lead-1",
