@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import {
   FEED_CAP_PER_ROOM,
   FEED_TEXT_CAP,
+  LEGACY_ROOMS_FILE_VERSION,
   ROOMS_FILE_VERSION,
   feedEventSchema,
   roomRecordSchema,
@@ -16,6 +17,29 @@ import {
   type SeatRecord,
 } from "../shared/room";
 import type { Logger } from "./logger";
+
+/**
+ * What a bound member actually runs: the seat the member would be launched on.
+ *
+ * `agent.created` cannot read an agent's model (`PluginHookAgent` has none), so
+ * it records the catalog role's model, and only the launch knows the member's.
+ * Passing it here is what lets the store correct a seat the hook wrote before
+ * the binding landed.
+ */
+export interface RoomMemberSeat {
+  provider: string;
+  model: string;
+}
+
+/** One launch's member bindings: the member ids, plus the seats they run. */
+export interface RoomMemberBinding {
+  supervisorMemberId?: string | null;
+  leadMemberId?: string | null;
+  /** The bound Supervisor member's seat; absent when the launch bound none. */
+  supervisorSeat?: RoomMemberSeat;
+  /** The bound Lead member's seat; absent when the launch bound none. */
+  leadSeat?: RoomMemberSeat;
+}
 
 export interface RoomStore {
   /**
@@ -37,6 +61,16 @@ export interface RoomStore {
    */
   appendFeed(event: Omit<FeedEvent, "id" | "at"> & { at?: string }): FeedEvent;
   endRoom(roomId: string): void;
+  /**
+   * Bind the room's Supervisor and Lead members. Order-independent in both
+   * directions: a call before the room exists is merged by `addRoom`, and a call
+   * after the room also corrects the seat `agent.created` already wrote from the
+   * catalog, using the bound member's own seat, because `room.launch` cannot know
+   * whether the hook has run yet.
+   */
+  bindRoomMembers(roomId: string, binding: RoomMemberBinding): void;
+  /** True when the load migrated a v1 document; drives the one-time member seed. */
+  migratedFromV1(): boolean;
   /** Newest first by `createdAt`. */
   listRooms(): RoomRecord[];
   room(roomId: string): { room: RoomRecord; seats: SeatRecord[]; feed: FeedEvent[] } | undefined;
@@ -84,6 +118,11 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
   let rooms: RoomRecord[] = [];
   let seats: SeatRecord[] = [];
   let feed: FeedEvent[] = [];
+  let migratedFromV1 = false;
+  const pendingBindings = new Map<
+    string,
+    { supervisorMemberId: string | null; leadMemberId: string | null }
+  >();
 
   let writing: Promise<void> = Promise.resolve();
   let dirty = false;
@@ -109,6 +148,8 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
     rooms = [];
     seats = [];
     feed = [];
+    pendingBindings.clear();
+    migratedFromV1 = false;
   };
 
   /** Drop all but the newest `FEED_CAP_PER_ROOM` events for one room. */
@@ -196,6 +237,11 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
     seats = result.data.seats;
     feed = result.data.feed;
     normalise();
+    if (result.data.version === LEGACY_ROOMS_FILE_VERSION) {
+      migratedFromV1 = true;
+      // Write the normalized v2 document through the same atomic path.
+      scheduleWrite();
+    }
   };
 
   const addRoom = (room: RoomRecord): void => {
@@ -205,11 +251,74 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
       return;
     }
     const record = parsed.data;
+    const pending = pendingBindings.get(record.id);
+    if (pending !== undefined) {
+      record.supervisorMemberId = pending.supervisorMemberId;
+      record.leadMemberId = pending.leadMemberId;
+      pendingBindings.delete(record.id);
+    }
     const index = rooms.findIndex((candidate) => candidate.id === record.id);
     if (index === -1) rooms.push(record);
     else rooms[index] = record;
     scheduleWrite();
   };
+
+  /**
+   * Give the room's seat of `kind` the model the bound member actually runs.
+   *
+   * The seat is written by `agent.created`, which has no model for the agent and
+   * therefore records the catalog role's. Whichever of the two lands second must
+   * leave the seat describing what runs, so a binding that arrives after the seat
+   * fixes it here rather than leaving the member's seat claiming the catalog
+   * model forever.
+   *
+   * The provider check is the one `agent.created` applies when it resolves a
+   * seat's model: a launch that names a member runs that member's provider, so a
+   * seat on a different provider was created on the catalog role and keeps the
+   * catalog model. Only a seat from the member's own provider is corrected.
+   */
+  const correctSeat = (
+    roomId: string,
+    kind: "supervisor" | "lead",
+    memberId: string | null,
+    bound: RoomMemberSeat | undefined,
+  ): void => {
+    if (memberId === null || bound === undefined) return;
+    for (const candidate of seats) {
+      if (candidate.roomId !== roomId) continue;
+      if (candidate.roleKind !== kind) continue;
+      if (candidate.provider !== bound.provider) continue;
+      candidate.model = bound.model;
+    }
+  };
+
+  const bindRoomMembers = (roomId: string, binding: RoomMemberBinding): void => {
+    const current = pendingBindings.get(roomId) ?? {
+      supervisorMemberId: null,
+      leadMemberId: null,
+    };
+    const next = {
+      supervisorMemberId:
+        binding.supervisorMemberId !== undefined
+          ? binding.supervisorMemberId
+          : current.supervisorMemberId,
+      leadMemberId:
+        binding.leadMemberId !== undefined ? binding.leadMemberId : current.leadMemberId,
+    };
+    pendingBindings.set(roomId, next);
+
+    const target = rooms.find((candidate) => candidate.id === roomId);
+    if (target !== undefined) {
+      target.supervisorMemberId = next.supervisorMemberId;
+      target.leadMemberId = next.leadMemberId;
+      // The seat may already exist: `agent.created` can run before this binding.
+      correctSeat(roomId, "supervisor", next.supervisorMemberId, binding.supervisorSeat);
+      correctSeat(roomId, "lead", next.leadMemberId, binding.leadSeat);
+      scheduleWrite();
+    }
+  };
+
+  const migrated = (): boolean => migratedFromV1;
 
   const addSeat = (seat: SeatRecord): void => {
     const parsed = seatRecordSchema.safeParse(seat);
@@ -297,6 +406,8 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
     children,
     appendFeed,
     endRoom,
+    bindRoomMembers,
+    migratedFromV1: migrated,
     listRooms,
     room,
     flush,

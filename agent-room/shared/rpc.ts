@@ -2,6 +2,15 @@ import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 
 import { gcActionSchema, gcStatusSchema } from "./gc";
+import {
+  episodeFactSchema,
+  lessonSchema,
+  memberIdSchema,
+  memberRecordSchema,
+  memberRoleSchema,
+  memoryPolicySchema,
+  pendingCandidateSchema,
+} from "./member";
 import { feedEventSchema, roomRecordSchema, seatRecordSchema } from "./room";
 
 const nonEmptyText = z.string().min(1);
@@ -21,6 +30,9 @@ export const launchRoomRpc = defineRpc({
       task: z.string().min(1),
       workspaceId: nonEmptyText.optional(),
       cwd: nonEmptyText.optional(),
+      // Omitted means "use the host seat", so existing callers keep working.
+      supervisorMemberId: nonEmptyText.optional(),
+      leadMemberId: nonEmptyText.optional(),
     })
     .refine((input) => input.workspaceId !== undefined || input.cwd !== undefined, {
       message: "one of workspaceId or cwd is required",
@@ -63,6 +75,86 @@ export const getRoomRpc = defineRpc({
     }),
     z.object({ missing: z.literal(true) }),
   ]),
+});
+
+/**
+ * The shape a member is written with. Saving a member is a whole-record write, so
+ * the seat fields are required and only the optional provider controls may be
+ * omitted; `id` omitted means "create a new one".
+ *
+ * A supplied `id` is the same `memberIdSchema` the record is validated with, so
+ * an id the store would have to sanitise (`a/b`) or one longer than the record's
+ * cap is rejected here, at the boundary, instead of throwing a bare ZodError out
+ * of the handler or aliasing another member's directory.
+ */
+export const memberSaveInputSchema = z.object({
+  id: memberIdSchema.optional(),
+  name: z.string().min(1).max(60),
+  role: memberRoleSchema,
+  provider: nonEmptyText,
+  model: nonEmptyText,
+  modeId: nonEmptyText.optional(),
+  thinkingOptionId: nonEmptyText.optional(),
+  features: z.record(z.string(), z.unknown()).optional(),
+  memory: memoryPolicySchema,
+});
+
+/** Every member the store knows, in the store's own order (by name). */
+export const memberListRpc = defineRpc({
+  name: "member.list",
+  input: z.object({}),
+  output: z.object({ members: z.array(memberRecordSchema) }),
+});
+
+/**
+ * One member with everything that belongs to it: the charter, the promoted
+ * lessons, the candidates still awaiting a human, and the episodes recorded
+ * across rooms. An id the store does not know reads as `missing`, like `room.get`.
+ */
+export const memberGetRpc = defineRpc({
+  name: "member.get",
+  input: z.object({ memberId: nonEmptyText }),
+  output: z.union([
+    z.object({
+      member: memberRecordSchema,
+      charter: z.string(),
+      lessons: z.array(lessonSchema),
+      pending: z.array(pendingCandidateSchema),
+      episodes: z.array(episodeFactSchema.extend({ roomId: nonEmptyText })),
+    }),
+    z.object({ missing: z.literal(true) }),
+  ]),
+});
+
+/**
+ * Create or update a member. An omitted `id` generates one; an existing `id`
+ * keeps its `createdAt` and takes a new `updatedAt`.
+ */
+export const memberSaveRpc = defineRpc({
+  name: "member.save",
+  input: memberSaveInputSchema,
+  output: z.object({ member: memberRecordSchema }),
+});
+
+/** Replace a member's charter. The whole document is written, never patched. */
+export const memberCharterRpc = defineRpc({
+  name: "member.charter",
+  input: z.object({ memberId: nonEmptyText, text: z.string() }),
+  output: z.object({ ok: z.literal(true) }),
+});
+
+/**
+ * Settle one pending candidate: `accept` promotes it to a lesson and returns the
+ * lesson it wrote, `reject` tombstones it and returns nothing.
+ */
+export const memberPendingRpc = defineRpc({
+  name: "member.pending",
+  input: z.object({
+    memberId: nonEmptyText,
+    candidateId: nonEmptyText,
+    action: z.enum(["accept", "reject"]),
+  }),
+  output: z.object({ ok: z.literal(true), lesson: lessonSchema.optional() }),
 });
 
 /**

@@ -82,21 +82,30 @@ function TerminalRow(props: { data: RoomStatusData; theme: Theme; pad: number })
   return (
     <View
       style={{
-        flexDirection: "row",
-        alignItems: "flex-start",
-        gap: 6,
         backgroundColor: theme.colors.surface1,
         borderColor: color,
         borderWidth: 1,
         borderRadius: 8,
         padding: pad,
+        gap: 3,
       }}
     >
-      <Text style={{ fontSize: 12 }}>{done ? "✅" : "❓"}</Text>
-      <Text style={{ color, fontSize: 12, fontWeight: "600" }}>
-        {done ? "Done" : "Waiting on you"}
-      </Text>
-      <Text style={{ color: theme.colors.foreground, fontSize: 12, flex: 1 }}>{terminal.text}</Text>
+      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 6 }}>
+        <Text style={{ fontSize: 12 }}>{done ? "✅" : "❓"}</Text>
+        <Text
+          style={{
+            color,
+            backgroundColor: theme.colors.surface2,
+            fontSize: 11,
+            borderRadius: 4,
+            paddingHorizontal: 6,
+            paddingVertical: 2,
+          }}
+        >
+          {done ? "Done" : "Waiting on you"}
+        </Text>
+      </View>
+      <Text style={{ color: theme.colors.foreground, fontSize: 12 }}>{terminal.text}</Text>
     </View>
   );
 }

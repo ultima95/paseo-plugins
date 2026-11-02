@@ -2,11 +2,19 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginHookContext } from "@getpaseo/plugin/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  CHARTER_PROMPT_CAP,
+  type EpisodeFact,
+  type Lesson,
+  type MemberRecord,
+  type PendingCandidate,
+} from "../shared/member";
 import type { FeedEvent, RoomRecord, SeatRecord } from "../shared/room";
 import { DEFAULT_SETTINGS } from "../shared/roles";
 import type { SeatMarker } from "../shared/seats";
-import { createRoomEvents, lookupTitle } from "./events";
+import { createRoomEvents, lookupTitle, type RoomEventsDeps } from "./events";
 import type { Logger } from "./logger";
+import type { MemberStore } from "./member-store";
 import type { RoomStore } from "./store";
 
 type FakeHandle = {
@@ -81,6 +89,8 @@ function fakeStore(seed: { rooms?: RoomRecord[]; seats?: SeatRecord[] } = {}) {
     children: (agentId) => seats.filter((candidate) => candidate.parentId === agentId),
     appendFeed,
     endRoom,
+    bindRoomMembers: () => undefined,
+    migratedFromV1: () => false,
     listRooms: () =>
       [...rooms].sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0)),
     room: (roomId) => {
@@ -98,11 +108,84 @@ function fakeStore(seed: { rooms?: RoomRecord[]; seats?: SeatRecord[] } = {}) {
   return { store, addRoom, addSeat, appendFeed, endRoom, rooms, seats, feed };
 }
 
+/** A member a room may be bound to; `provider` matches the hook agent's own. */
+const member = (over: Partial<MemberRecord> = {}): MemberRecord => ({
+  id: "sup-1",
+  name: "Ada",
+  role: "supervisor",
+  provider: "claude",
+  model: "claude-opus-5-6",
+  memory: { promotion: "human", autoScopes: ["repo", "workspace"] },
+  createdAt: "2026-11-01T09:00:00.000Z",
+  updatedAt: "2026-11-01T09:00:00.000Z",
+  ...over,
+});
+
+/**
+ * The member-store writes a handler makes, as module-level spies: a test asserts
+ * on them directly (`expect(appendEpisode).toHaveBeenCalledWith(…)`), and every
+ * `fakeMembers` installs these instances. `beforeEach` clears the calls, so each
+ * test starts from none while the implementations stay.
+ */
+const appendEpisode = vi.fn(async (_id: string, _roomId: string, _fact: EpisodeFact) => undefined);
+const appendLesson = vi.fn(async (_id: string, _lesson: Lesson) => true);
+const appendPending = vi.fn(async (_id: string, _candidate: PendingCandidate) => true);
+const episodes = vi.fn(async (_id: string): Promise<Array<EpisodeFact & { roomId: string }>> => []);
+const hasLesson = vi.fn((_id: string, _scope: string, _text: string) => false);
+const hasPending = vi.fn((_id: string, _candidateId: string) => false);
+const pending = vi.fn((_id: string): PendingCandidate[] => []);
+
+/**
+ * The events handler reads the member store only: `get` for the bound seat,
+ * `charter`/`lessonsFor` for the section it re-renders. The rest is here so the
+ * fake is a `MemberStore`, not a cast.
+ */
+function fakeMembers(
+  records: Record<string, MemberRecord> = {},
+  options: {
+    charter?: string;
+    lessons?: Lesson[];
+    /** Observe the scopes the handler asks the store for. */
+    onScopes?: (scopes: readonly string[]) => void;
+  } = {},
+): MemberStore {
+  const all = Object.values(records);
+  const charters = new Map(all.map((record) => [record.id, options.charter ?? ""]));
+  return {
+    load: async () => undefined,
+    missingFile: () => false,
+    list: () => all,
+    get: (id) => records[id],
+    upsert: async () => undefined,
+    charter: (id) => charters.get(id) ?? "",
+    writeCharter: async (id, text) => {
+      charters.set(id, text);
+    },
+    lessons: () => options.lessons ?? [],
+    lessonsFor: (_id, scopes) => {
+      options.onScopes?.(scopes);
+      return options.lessons ?? [];
+    },
+    hasLesson,
+    pending,
+    hasPending,
+    appendLesson,
+    appendPending,
+    acceptPending: async () => null,
+    rejectPending: async () => false,
+    appendEpisode,
+    episodes,
+    flush: async () => undefined,
+  };
+}
+
 const room = (id: string): RoomRecord => ({
   id,
   task: "fix auth",
   cwd: "/repo",
   workspaceId: "W1",
+  supervisorMemberId: null,
+  leadMemberId: null,
   createdAt: "2026-10-28T09:00:00.000Z",
 });
 
@@ -165,12 +248,16 @@ function eventsWith(
   paseo: PaseoApi,
   store: RoomStore,
   titles: (paseo: PaseoApi, agentId: string) => Promise<string | null> = async () => null,
+  overrides: Partial<Pick<RoomEventsDeps, "members" | "repoIdFor" | "now">> = {},
 ) {
   const created = createRoomEvents({
     store,
     readSettings: async () => DEFAULT_SETTINGS,
     lookupTitle: titles,
     log,
+    members: overrides.members ?? fakeMembers(),
+    repoIdFor: overrides.repoIdFor ?? (async () => null),
+    ...(overrides.now !== undefined ? { now: overrides.now } : {}),
   });
   const ctx: PluginHookContext = { paseo, signal: new AbortController().signal };
   return { created, ctx };
@@ -485,6 +572,271 @@ describe("onCreated — membership", () => {
     );
 
     expect(addRoom).toHaveBeenCalledWith(expect.objectContaining({ id: "S2", task: "second room" }));
+  });
+});
+
+describe("onCreated — member bindings", () => {
+  /** A store whose `addRoom` behaves like the real one: it keeps the record. */
+  function bindingStore(binding: { supervisorMemberId?: string | null; leadMemberId?: string | null } = {}) {
+    const fake = fakeStore();
+    fake.addRoom.mockImplementation((record: RoomRecord) => {
+      if (binding.supervisorMemberId !== undefined) {
+        record.supervisorMemberId = binding.supervisorMemberId;
+      }
+      if (binding.leadMemberId !== undefined) record.leadMemberId = binding.leadMemberId;
+      fake.rooms.push(record);
+    });
+    return fake;
+  }
+
+  const LONG_CHARTER = "x".repeat(CHARTER_PROMPT_CAP + 1);
+
+  it("records the launch's member bindings on the room", async () => {
+    const { store, addRoom } = fakeStore();
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store);
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    // agent.created cannot know the launch input; it writes nulls and relies on
+    // RoomStore.bindRoomMembers merging the launch's pending binding.
+    expect(addRoom).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "S1", supervisorMemberId: null, leadMemberId: null }),
+    );
+  });
+
+  it("appends a member note when the supervisor section truncated", async () => {
+    const fake = bindingStore({ supervisorMemberId: "sup-1" });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers({ "sup-1": member() }, { charter: LONG_CHARTER }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    expect(fake.appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        roomId: "S1",
+        kind: "note",
+        from: null,
+        to: "sup-1",
+        label: "member note",
+        text: "member section truncated",
+      }),
+    );
+  });
+
+  it("does not note a member section that fits", async () => {
+    const fake = bindingStore({ supervisorMemberId: "sup-1" });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers({ "sup-1": member() }, { charter: "Use pnpm." }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    expect(fake.appendFeed).not.toHaveBeenCalled();
+  });
+
+  it("scopes the member section with the room's repo and exact workspace", async () => {
+    const scopes: Array<readonly string[]> = [];
+    const fake = bindingStore({ supervisorMemberId: "sup-1" });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers(
+        { "sup-1": member() },
+        { charter: LONG_CHARTER, onScopes: (wanted) => scopes.push(wanted) },
+      ),
+      repoIdFor: async () => "abcd1234",
+    });
+
+    await created.onCreated(
+      { agent: agent({ id: "S1", cwd: "/repo/", title: "Supervisor: fix auth" }) },
+      ctx,
+    );
+
+    expect(scopes[0]).toEqual(["global", "repo:abcd1234", "workspace:/repo"]);
+  });
+
+  it("notes truncation for the room's lead member too", async () => {
+    const fake = fakeStore({
+      rooms: [{ ...room("S1"), leadMemberId: "lead-1" }],
+      seats: [roleSeat("S1", "S1", null, SUPERVISOR)],
+    });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers(
+        { "lead-1": member({ id: "lead-1", name: "Lin", role: "lead" }) },
+        { charter: LONG_CHARTER },
+      ),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "L1", parentAgentId: "S1", title: "Lead: api" }) }, ctx);
+
+    expect(fake.appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "lead-1", label: "member note" }),
+    );
+  });
+
+  it("does not repeat a truncation note the launch already appended", async () => {
+    const fake = fakeStore({
+      rooms: [{ ...room("S1"), supervisorMemberId: "sup-1" }],
+      seats: [roleSeat("S1", "S1", null, SUPERVISOR)],
+    });
+    // room.launch rendered the same section and noted it before this hook ran.
+    fake.feed.push({
+      id: "e0",
+      at: "2026-10-28T09:30:00.000Z",
+      roomId: "S1",
+      kind: "note",
+      from: null,
+      to: "sup-1",
+      label: "member note",
+      text: "member section truncated",
+    });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers({ "sup-1": member() }, { charter: LONG_CHARTER }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    expect(fake.appendFeed).not.toHaveBeenCalled();
+  });
+
+  it("does not note truncation for an unbound room", async () => {
+    const fake = fakeStore();
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers({ "sup-1": member() }, { charter: LONG_CHARTER }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    expect(fake.appendFeed).not.toHaveBeenCalled();
+  });
+
+  it("records the member's model on a member-seated supervisor's seat", async () => {
+    // The catalog supervisor is `claude-opus-5-5`; the member the room bound at
+    // launch runs `claude-opus-5-6`, and the seat must describe what runs.
+    const fake = bindingStore({ supervisorMemberId: "sup-1" });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    expect(fake.addSeat).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: "S1", roleId: "supervisor", model: "claude-opus-5-6" }),
+    );
+  });
+
+  it("keeps the catalog model for a supervisor the room bound to no member", async () => {
+    const { store, addRoom, addSeat } = fakeStore();
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx);
+
+    // No binding: agent.created falls back to the catalog role's seat.
+    expect(addRoom).toHaveBeenCalledWith(expect.objectContaining({ supervisorMemberId: null }));
+    expect(addSeat).toHaveBeenCalledWith(expect.objectContaining({ model: "claude-opus-5-5" }));
+  });
+
+  it("records the bound lead member's model on the lead's seat", async () => {
+    const fake = fakeStore({
+      rooms: [{ ...room("S1"), supervisorMemberId: "sup-1", leadMemberId: "lead-1" }],
+      seats: [roleSeat("S1", "S1", null, SUPERVISOR)],
+    });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers({
+        "sup-1": member(),
+        "lead-1": member({
+          id: "lead-1",
+          name: "Lin",
+          role: "lead",
+          provider: "codex",
+          model: "gpt-5.5-lead",
+        }),
+      }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated(
+      {
+        agent: agent({
+          id: "L1",
+          parentAgentId: "S1",
+          provider: "codex",
+          title: "Lead: api",
+        }),
+      },
+      ctx,
+    );
+
+    expect(fake.addSeat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "L1",
+        roleId: "lead",
+        provider: "codex",
+        model: "gpt-5.5-lead",
+      }),
+    );
+  });
+
+  it("keeps the catalog model for a seat on a provider the bound member does not run", async () => {
+    // The room's lead member runs `codex`; this Lead was created on the catalog
+    // `claude` seat, so the member's model would be a lie.
+    const fake = fakeStore({
+      rooms: [{ ...room("S1"), supervisorMemberId: "sup-1", leadMemberId: "lead-1" }],
+      seats: [roleSeat("S1", "S1", null, SUPERVISOR)],
+    });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members: fakeMembers({
+        "sup-1": member(),
+        "lead-1": member({ id: "lead-1", name: "Lin", role: "lead", provider: "codex", model: "gpt-5.5-lead" }),
+      }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onCreated({ agent: agent({ id: "L9", parentAgentId: "S1", title: "Lead: docs" }) }, ctx);
+
+    expect(fake.addSeat).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: "L9", provider: "claude", model: "claude-opus-5-5" }),
+    );
+  });
+
+  it("logs and swallows a member store that throws", async () => {
+    const fake = bindingStore({ supervisorMemberId: "sup-1" });
+    const { paseo } = fakePaseo();
+    const members = fakeMembers({ "sup-1": member() }, { charter: LONG_CHARTER });
+    members.get = () => {
+      throw new Error("members.json is gone");
+    };
+    const { created, ctx } = eventsWith(paseo, fake.store, undefined, {
+      members,
+      repoIdFor: async () => null,
+    });
+
+    await expect(
+      created.onCreated({ agent: agent({ id: "S1", title: "Supervisor: fix auth" }) }, ctx),
+    ).resolves.toBeUndefined();
+    expect(log.error).toHaveBeenCalledWith(
+      "agent.created handling failed",
+      expect.objectContaining({ agentId: "S1" }),
+    );
   });
 });
 
@@ -807,6 +1159,207 @@ describe("onTurnEnded", () => {
       expect.objectContaining({ agentId: "S1" }),
     );
   });
+
+  it("captures a DECISION_NEEDED supervisor turn as an episode fact", async () => {
+    const { store } = storedRoom();
+    const { paseo } = fakePaseo({}, [
+      { item: { type: "user_message", text: "Fix auth" } },
+      { item: { type: "assistant_message", text: "DECISION_NEEDED: use pnpm or npm?" } },
+    ]);
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => "8f3c1a2b",
+    });
+    // The launch bound the room's supervisor member.
+    store.room("S1")!.room.supervisorMemberId = "sup-1";
+
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "S1", title: "Supervisor: fix auth" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+
+    expect(appendEpisode).toHaveBeenCalledWith(
+      "sup-1",
+      "S1",
+      expect.objectContaining({ kind: "decision", signal: "DECISION_NEEDED" }),
+    );
+  });
+
+  it("captures no episode from a user message that opens with a signal", async () => {
+    // The user's "REJECT: …" is instruction, not the seat's own decision: only
+    // the row the seat itself produced may become a member fact.
+    const { store, appendFeed } = storedRoom();
+    const { paseo } = fakePaseo({}, [
+      { item: { type: "user_message", text: "REJECT: do not touch the lockfile" } },
+      { item: { type: "assistant_message", text: "STATUS acknowledged" } },
+    ]);
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => null,
+    });
+    store.room("S1")!.room.supervisorMemberId = "sup-1";
+
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "S1", title: "Supervisor: fix auth" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+
+    // The turn is still the room's record: the user row lands, labelled REJECT.
+    expect(appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({ roomId: "S1", from: null, to: "S1", label: "REJECT" }),
+    );
+    expect(appendEpisode).not.toHaveBeenCalled();
+  });
+
+  it("captures no episode when the room bound no member", async () => {
+    const { store, appendFeed } = storedRoom();
+    const { paseo } = fakePaseo({}, [
+      { item: { type: "assistant_message", text: "DECISION_NEEDED: and?" } },
+    ]);
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => "8f3c1a2b",
+    });
+
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "S1", title: "Supervisor: fix auth" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+
+    // The room still records the turn; only the member's memory is untouched.
+    expect(appendFeed).toHaveBeenCalledTimes(1);
+    expect(appendEpisode).not.toHaveBeenCalled();
+  });
+
+  it("captures nothing from a worker turn", async () => {
+    // Both room slots are bound, so the *only* reason there is no member to write
+    // to is the worker gate: a worker's signals reach the Lead as feed rows.
+    const seats = [roleSeat("W1", "S1", "L1", { id: "implementer", name: "Implementer", kind: "worker" })];
+    const { store, appendFeed } = fakeStore({
+      rooms: [{ ...room("S1"), supervisorMemberId: "sup-1", leadMemberId: "lead-1" }],
+      seats,
+    });
+    const { paseo } = fakePaseo({}, [
+      { item: { type: "user_message", text: "work" } },
+      { item: { type: "assistant_message", text: "DONE" } },
+    ]);
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({
+        "sup-1": member(),
+        "lead-1": member({ id: "lead-1", name: "Lin", role: "lead" }),
+      }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "W1", parentAgentId: "L1" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+
+    // Without these two the test would pass on a fixture the handler could not
+    // read: the turn must have been processed, and its rows must have landed.
+    expect(log.error).not.toHaveBeenCalled();
+    expect(appendFeed).toHaveBeenCalledTimes(2);
+    expect(appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        roomId: "S1",
+        kind: "message",
+        from: "L1",
+        to: "W1",
+        label: "instruction",
+        text: "work",
+      }),
+    );
+    expect(appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({ roomId: "S1", from: "W1", to: "L1", label: "DONE", text: "DONE" }),
+    );
+    expect(appendEpisode).not.toHaveBeenCalled();
+  });
+
+  it("writes no episode for a bound member the store cannot resolve", async () => {
+    const { store, appendFeed } = storedRoom();
+    store.room("S1")!.room.supervisorMemberId = "gone";
+    const { paseo } = fakePaseo({}, [
+      { item: { type: "assistant_message", text: "DONE: migrated the schema" } },
+    ]);
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({}),
+      repoIdFor: async () => null,
+    });
+
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "S1", title: "Supervisor: fix auth" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+
+    // No orphan episode: the binding outlived its member.
+    expect(appendEpisode).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith(
+      "member missing; captured no episode",
+      expect.objectContaining({ memberId: "gone", roomId: "S1", agentId: "S1" }),
+    );
+    // The turn is still the room's record: one message row and no extra note.
+    expect(appendFeed).toHaveBeenCalledTimes(1);
+    expect(appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({ roomId: "S1", kind: "message", label: "DONE" }),
+    );
+    expect(log.error).not.toHaveBeenCalled();
+  });
+
+  it("redacts an obvious credential before storing the fact", async () => {
+    const { store } = storedRoom();
+    const { paseo } = fakePaseo({}, [
+      { item: { type: "assistant_message", text: "DECISION_NEEDED: rotate sk-live-abcdefgh12345?" } },
+    ]);
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => null,
+    });
+    store.room("S1")!.room.supervisorMemberId = "sup-1";
+
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "S1", title: "Supervisor: rotate the key" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+
+    const fact = appendEpisode.mock.calls[0]?.[2];
+    expect(fact?.text).toContain("[redacted]");
+    expect(fact?.text).not.toContain("sk-live-abcdefgh12345");
+    expect(log.warn).toHaveBeenCalledWith(
+      "redacted secrets in member memory",
+      expect.objectContaining({ memberId: "sup-1", roomId: "S1", redactions: 1 }),
+    );
+  });
 });
 
 describe("onArchived", () => {
@@ -828,6 +1381,206 @@ describe("onArchived", () => {
     await created.onArchived({ agent: agent({ id: "L1" }), archivedAt: "2026-10-28T11:00:00.000Z" }, ctx);
 
     expect(endRoom).not.toHaveBeenCalled();
+  });
+
+  it("writes the final outcome and promotes repo candidates at archive", async () => {
+    const { store } = storedRoom();
+    store.room("S1")!.room.supervisorMemberId = "sup-1";
+    const { paseo } = fakePaseo();
+    const members = fakeMembers({
+      "sup-1": member({ memory: { promotion: "auto", autoScopes: ["repo", "workspace"] } }),
+    });
+    members.episodes = async () => [
+      { roomId: "S1", at: "2026-11-02T10:00:00.000Z", kind: "decision", text: "use pnpm" },
+    ];
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members,
+      repoIdFor: async () => "8f3c1a2b",
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    expect(appendEpisode).toHaveBeenCalledWith(
+      "sup-1",
+      "S1",
+      expect.objectContaining({ kind: "outcome" }),
+    );
+    expect(appendLesson).toHaveBeenCalledWith(
+      "sup-1",
+      expect.objectContaining({
+        scope: "repo:8f3c1a2b",
+        text: "use pnpm",
+        promotedBy: "auto",
+      }),
+    );
+  });
+
+  it("leaves human-policy candidates pending at archive", async () => {
+    const { store } = storedRoom();
+    store.room("S1")!.room.supervisorMemberId = "sup-1";
+    const { paseo } = fakePaseo();
+    const members = fakeMembers({
+      "sup-1": member({ memory: { promotion: "human", autoScopes: ["repo", "workspace"] } }),
+    });
+    members.episodes = async () => [
+      { roomId: "S1", at: "2026-11-02T10:00:00.000Z", kind: "decision", text: "use pnpm" },
+    ];
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members,
+      repoIdFor: async () => "8f3c1a2b",
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    expect(appendLesson).not.toHaveBeenCalled();
+    expect(appendPending).toHaveBeenCalledWith(
+      "sup-1",
+      expect.objectContaining({ scope: "repo:8f3c1a2b", text: "use pnpm" }),
+    );
+  });
+
+  it("records the room's task as the final outcome fact", async () => {
+    const { store } = storedRoom();
+    store.room("S1")!.room.supervisorMemberId = "sup-1";
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    expect(appendEpisode).toHaveBeenCalledWith("sup-1", "S1", {
+      at: "2026-11-02T12:00:00.000Z",
+      kind: "outcome",
+      text: "room ended: fix auth",
+    });
+  });
+
+  it("redacts a credential in the room's outcome fact", async () => {
+    // The task is the user's own words; spec §9 strips obvious secrets before any
+    // memory line is written, and the closing outcome fact is no exception.
+    const { store } = fakeStore({
+      rooms: [
+        { ...room("S1"), task: "rotate the sk-live-abcdefgh12345 key", supervisorMemberId: "sup-1" },
+      ],
+      seats: [roleSeat("S1", "S1", null, SUPERVISOR)],
+    });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    const fact = appendEpisode.mock.calls[0]?.[2];
+    expect(fact?.text).toContain("[redacted]");
+    expect(fact?.text).not.toContain("sk-live-abcdefgh12345");
+    expect(log.warn).toHaveBeenCalledWith(
+      "redacted secrets in member memory",
+      expect.objectContaining({ memberId: "sup-1", roomId: "S1", redactions: 1 }),
+    );
+  });
+
+  it("stamps a promoted lesson with the injected clock", async () => {
+    const { store } = storedRoom();
+    store.room("S1")!.room.supervisorMemberId = "sup-1";
+    const { paseo } = fakePaseo();
+    const members = fakeMembers({
+      "sup-1": member({ memory: { promotion: "auto", autoScopes: ["repo"] } }),
+    });
+    members.episodes = async () => [
+      { roomId: "S1", at: "2026-11-02T10:00:00.000Z", kind: "decision", text: "use pnpm" },
+    ];
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members,
+      repoIdFor: async () => "8f3c1a2b",
+      now: () => Date.parse("2026-11-02T13:00:00.000Z"),
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    expect(appendLesson).toHaveBeenCalledWith(
+      "sup-1",
+      expect.objectContaining({ at: "2026-11-02T13:00:00.000Z" }),
+    );
+  });
+
+  it("finalizes the room's Lead as well as its Supervisor", async () => {
+    const { store } = storedRoom();
+    store.room("S1")!.room.leadMemberId = "lead-1";
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "lead-1": member({ id: "lead-1", name: "Lena", role: "lead" }) }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    expect(appendEpisode).toHaveBeenCalledWith(
+      "lead-1",
+      "S1",
+      expect.objectContaining({ kind: "outcome" }),
+    );
+  });
+
+  it("writes no memory for a room that bound no member", async () => {
+    const { store } = storedRoom();
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => "8f3c1a2b",
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    expect(appendEpisode).not.toHaveBeenCalled();
+    expect(appendLesson).not.toHaveBeenCalled();
+  });
+
+  it("reports a bound member that no longer exists", async () => {
+    const { store, appendFeed } = storedRoom();
+    store.room("S1")!.room.supervisorMemberId = "gone";
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({}),
+      repoIdFor: async () => null,
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    expect(appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        label: "member missing",
+        text: expect.stringContaining("member missing"),
+      }),
+    );
+    expect(appendEpisode).not.toHaveBeenCalled();
   });
 });
 

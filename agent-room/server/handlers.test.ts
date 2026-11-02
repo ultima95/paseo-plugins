@@ -1,6 +1,7 @@
 import type { PaseoAgentCreateOptions, PaseoApi } from "@getpaseo/client";
 import { describe, expect, it, vi } from "vitest";
 
+import { CHARTER_PROMPT_CAP, memberRecordSchema, type Lesson } from "../shared/member";
 import { DEFAULT_SETTINGS, type Role, type RoomSettings } from "../shared/roles";
 import { seatRecordSchema, type FeedEvent, type RoomRecord, type SeatRecord } from "../shared/room";
 import { adoptRoomRpc, getRoomRpc, launchRoomRpc, listRoomsRpc } from "../shared/rpc";
@@ -8,6 +9,7 @@ import { createHandlers } from "./handlers";
 import { PROMPTS } from "./prompts/generated";
 import { renderSystemPrompt } from "./render";
 import { SEAT_SETTINGS_UNLOADED } from "./settings";
+import type { MemberStore } from "./member-store";
 import type { RoomStore } from "./store";
 
 interface CreateCall {
@@ -72,8 +74,9 @@ function fakeStore(deps: { rooms?: RoomRecord[]; found?: RoomDetail; seat?: Seat
   const addSeat = vi.fn();
   const appendFeed = vi.fn();
   const flush = vi.fn(async () => undefined);
+  const bindRoomMembers = vi.fn();
   return {
-    store: { listRooms, room, seat, addRoom, addSeat, appendFeed, flush } as unknown as RoomStore,
+    store: { listRooms, room, seat, addRoom, addSeat, appendFeed, flush, bindRoomMembers } as unknown as RoomStore,
     listRooms,
     room,
     seat,
@@ -81,12 +84,54 @@ function fakeStore(deps: { rooms?: RoomRecord[]; found?: RoomDetail; seat?: Seat
     addSeat,
     appendFeed,
     flush,
+    bindRoomMembers,
   };
+}
+
+const member = (over: Record<string, unknown> = {}) =>
+  memberRecordSchema.parse({
+    id: "sup-1",
+    name: "Supervisor",
+    role: "supervisor",
+    provider: "codex",
+    model: "gpt-5.6-sol",
+    modeId: "full-access",
+    thinkingOptionId: "medium",
+    memory: { promotion: "human" },
+    createdAt: "2026-11-02T00:00:00.000Z",
+    updatedAt: "2026-11-02T00:00:00.000Z",
+    ...over,
+  });
+
+function fakeMembers(
+  records = [member()],
+  options: {
+    charter?: string;
+    lessons?: Lesson[];
+    /** Observe the scopes the handler asks the store for. */
+    onScopes?: (scopes: readonly string[]) => void;
+  } = {},
+) {
+  return {
+    list: () => records,
+    get: (id: string) => records.find((record) => record.id === id),
+    charter: () => options.charter ?? "Use pnpm.",
+    lessonsFor: (_id: string, scopes: readonly string[]) => {
+      options.onScopes?.(scopes);
+      return options.lessons ?? [];
+    },
+    pending: () => [],
+  } as unknown as MemberStore;
 }
 
 function handlersFor(settings: RoomSettings = DEFAULT_SETTINGS, storeDeps: Parameters<typeof fakeStore>[0] = {}) {
   const fake = fakeStore(storeDeps);
-  const handlers = createHandlers({ store: fake.store, readSettings: async () => settings });
+  const handlers = createHandlers({
+    store: fake.store,
+    readSettings: async () => settings,
+    members: fakeMembers(),
+    repoIdFor: async () => null,
+  });
   return { ...fake, handlers };
 }
 
@@ -111,6 +156,8 @@ const roomRecord = (id: string, createdAt: string): RoomRecord => ({
   task: "Fix the room",
   cwd: "/repo",
   workspaceId: null,
+  supervisorMemberId: null,
+  leadMemberId: null,
   createdAt,
 });
 
@@ -275,6 +322,8 @@ describe("launch", () => {
       readSettings: async () => {
         throw new Error(SEAT_SETTINGS_UNLOADED);
       },
+      members: fakeMembers(),
+      repoIdFor: async () => null,
     });
 
     await expect(handlers.launch({ task: "Fix the room", cwd: "/repo" }, paseo)).rejects.toThrow(
@@ -362,6 +411,8 @@ describe("adopt", () => {
       task: "New chat",
       cwd: "/repo",
       workspaceId: "W1",
+      supervisorMemberId: null,
+      leadMemberId: null,
       createdAt: "2026-10-28T10:00:00.000Z",
     });
     expect(addSeat).toHaveBeenCalledWith(
@@ -465,5 +516,244 @@ describe("contracts", () => {
     expect(launchRoomRpc.input.safeParse({ task: "Fix it", workspaceId: "W1" }).success).toBe(true);
     expect(launchRoomRpc.input.safeParse({ task: "Fix it", cwd: "/repo" }).success).toBe(true);
     expect(launchRoomRpc.input.safeParse({ task: "", cwd: "/repo" }).success).toBe(false);
+  });
+});
+
+describe("launch with members", () => {
+  it("launches the Supervisor on the selected member's seat and renders its memory", async () => {
+    const { paseo, created } = fakePaseo();
+    const fake = fakeStore();
+    const handlers = createHandlers({
+      store: fake.store,
+      readSettings: async () => DEFAULT_SETTINGS,
+      members: fakeMembers(),
+      repoIdFor: async () => null,
+    });
+
+    const out = await handlers.launch(
+      { task: "Fix the room", cwd: "/repo", supervisorMemberId: "sup-1" },
+      paseo,
+    );
+
+    expect(out).toEqual({ roomId: "A1" });
+    expect(created[0]?.options.config).toMatchObject({
+      provider: "codex/gpt-5.6-sol",
+      modeId: "full-access",
+      thinkingOptionId: "medium",
+    });
+    expect(created[0]?.options.config.systemPrompt).toContain("## Member\n");
+    expect(created[0]?.options.config.systemPrompt).toContain("Use pnpm.");
+    // The member's own seat travels with the binding: `agent.created` may have
+    // written the Supervisor's seat from the catalog before this bind lands.
+    expect(fake.bindRoomMembers).toHaveBeenCalledWith("A1", {
+      supervisorMemberId: "sup-1",
+      leadMemberId: null,
+      supervisorSeat: { provider: "codex", model: "gpt-5.6-sol" },
+    });
+    // Nothing truncated, so the feed stays clean.
+    expect(fake.appendFeed).not.toHaveBeenCalled();
+  });
+
+  it("scopes the Supervisor's memory to the room's repository and workspace", async () => {
+    const { paseo, created } = fakePaseo();
+    const seen: string[][] = [];
+    const repoIdFor = vi.fn(async () => "abcd1234");
+    const handlers = createHandlers({
+      store: fakeStore().store,
+      readSettings: async () => DEFAULT_SETTINGS,
+      members: fakeMembers(undefined, {
+        onScopes: (scopes) => seen.push([...scopes]),
+        lessons: [
+          {
+            at: "2026-11-02T00:00:00.000Z",
+            scope: "repo:abcd1234",
+            text: "Run the room's own tests first.",
+            sourceRoomId: "R0",
+            promotedBy: "human",
+          },
+        ],
+      }),
+      repoIdFor,
+    });
+
+    await handlers.launch(
+      { task: "Fix the room", cwd: "/repo/", supervisorMemberId: "sup-1" },
+      paseo,
+    );
+
+    expect(repoIdFor).toHaveBeenCalledWith("/repo/");
+    // A trailing slash must not fork the workspace scope.
+    expect(seen).toEqual([["global", "repo:abcd1234", "workspace:/repo"]]);
+    expect(created[0]?.options.config.systemPrompt).toContain("Run the room's own tests first.");
+  });
+
+  it("reads the member scope from the workspace directory when only a workspace is given", async () => {
+    const { paseo, created } = fakePaseo([{ id: "W1", workspaceDirectory: "/repo/" }]);
+    const seen: string[][] = [];
+    const repoIdFor = vi.fn(async () => null);
+    const handlers = createHandlers({
+      store: fakeStore().store,
+      readSettings: async () => DEFAULT_SETTINGS,
+      members: fakeMembers(undefined, { onScopes: (scopes) => seen.push([...scopes]) }),
+      repoIdFor,
+    });
+
+    await handlers.launch(
+      { task: "Fix the room", workspaceId: "W1", supervisorMemberId: "sup-1" },
+      paseo,
+    );
+
+    // A workspace owns the directory, so the scope comes from the workspace.
+    expect(repoIdFor).toHaveBeenCalledWith("/repo/");
+    expect(seen).toEqual([["global", "workspace:/repo"]]);
+    expect(created[0]?.options.config.systemPrompt).toContain("## Member\n");
+  });
+
+  it("notes a truncated member section in the room feed", async () => {
+    const { paseo } = fakePaseo();
+    const fake = fakeStore();
+    const handlers = createHandlers({
+      store: fake.store,
+      readSettings: async () => DEFAULT_SETTINGS,
+      members: fakeMembers(undefined, { charter: "x".repeat(CHARTER_PROMPT_CAP + 1) }),
+      repoIdFor: async () => null,
+    });
+
+    await handlers.launch(
+      { task: "Fix the room", cwd: "/repo", supervisorMemberId: "sup-1" },
+      paseo,
+    );
+
+    expect(fake.bindRoomMembers).toHaveBeenCalledWith("A1", {
+      supervisorMemberId: "sup-1",
+      leadMemberId: null,
+      supervisorSeat: { provider: "codex", model: "gpt-5.6-sol" },
+    });
+    expect(fake.appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        roomId: "A1",
+        kind: "note",
+        from: null,
+        to: "A1",
+        label: "member note",
+      }),
+    );
+  });
+
+  it("gives two rooms on the same member an identical Supervisor seat", async () => {
+    // Spec §15 item 1: two launches on one member with different tasks run the
+    // same seat and differ only in what they carry.
+    const { paseo, created } = fakePaseo();
+    const handlers = createHandlers({
+      store: fakeStore().store,
+      readSettings: async () => DEFAULT_SETTINGS,
+      members: fakeMembers(),
+      repoIdFor: async () => null,
+    });
+
+    await handlers.launch({ task: "Fix the room", cwd: "/repo", supervisorMemberId: "sup-1" }, paseo);
+    await handlers.launch(
+      { task: "Ship the migration", cwd: "/repo", supervisorMemberId: "sup-1" },
+      paseo,
+    );
+
+    expect(created).toHaveLength(2);
+    // The create call has no separate model field: the seat is the combined
+    // provider/model string plus the two controls the member sets.
+    const seatOf = (call: CreateCall | undefined) => ({
+      provider: call?.options.config.provider,
+      modeId: call?.options.config.modeId,
+      thinkingOptionId: call?.options.config.thinkingOptionId,
+    });
+    expect(seatOf(created[0])).toEqual({
+      provider: "codex/gpt-5.6-sol",
+      modeId: "full-access",
+      thinkingOptionId: "medium",
+    });
+    expect(seatOf(created[1])).toEqual(seatOf(created[0]));
+    // Different tasks, so the two rooms are told apart by title and prompt.
+    expect(created[0]?.options.title).toBe("Supervisor: Fix the room");
+    expect(created[1]?.options.title).toBe("Supervisor: Ship the migration");
+    expect(created[0]?.options.prompt).not.toBe(created[1]?.options.prompt);
+  });
+
+  it("shows the bound Lead member's seat in the Supervisor's role table", async () => {
+    const lead = member({
+      id: "lead-1",
+      name: "Lead",
+      role: "lead",
+      provider: "codex",
+      model: "gpt-5.5-lead",
+      modeId: undefined,
+      thinkingOptionId: undefined,
+    });
+    const { paseo, created } = fakePaseo();
+    const fake = fakeStore();
+    const handlers = createHandlers({
+      store: fake.store,
+      readSettings: async () => DEFAULT_SETTINGS,
+      members: fakeMembers([member(), lead]),
+      repoIdFor: async () => null,
+    });
+
+    await handlers.launch(
+      { task: "Fix the room", cwd: "/repo", supervisorMemberId: "sup-1", leadMemberId: "lead-1" },
+      paseo,
+    );
+
+    const prompt = created[0]?.options.config.systemPrompt ?? "";
+    // The Lead row shows the member's seat instead of the Lead role's.
+    expect(prompt).toContain("codex/gpt-5.5-lead");
+    expect(prompt).not.toContain("claude/claude-opus-5-5");
+    // Both slots travel with their own seat, so either order of `agent.created`
+    // and this bind leaves a truthful seat behind.
+    expect(fake.bindRoomMembers).toHaveBeenCalledWith("A1", {
+      supervisorMemberId: "sup-1",
+      leadMemberId: "lead-1",
+      supervisorSeat: { provider: "codex", model: "gpt-5.6-sol" },
+      leadSeat: { provider: "codex", model: "gpt-5.5-lead" },
+    });
+  });
+
+  it("refuses a member whose role does not match the slot", async () => {
+    const { paseo, created } = fakePaseo();
+    const handlers = createHandlers({
+      store: fakeStore().store,
+      readSettings: async () => DEFAULT_SETTINGS,
+      members: fakeMembers([member({ role: "lead" })]),
+      repoIdFor: async () => null,
+    });
+
+    await expect(
+      handlers.launch({ task: "Fix", cwd: "/repo", supervisorMemberId: "sup-1" }, paseo),
+    ).rejects.toThrow(/not a supervisor member/);
+    expect(created).toHaveLength(0);
+  });
+
+  it("refuses an unknown member id before creating anything", async () => {
+    const { paseo, created } = fakePaseo();
+    const handlers = createHandlers({
+      store: fakeStore().store,
+      readSettings: async () => DEFAULT_SETTINGS,
+      members: fakeMembers(),
+      repoIdFor: async () => null,
+    });
+
+    await expect(
+      handlers.launch({ task: "Fix", cwd: "/repo", leadMemberId: "nope" }, paseo),
+    ).rejects.toThrow(/member not found/);
+    expect(created).toHaveLength(0);
+  });
+
+  it("accepts optional member ids on launch", () => {
+    expect(
+      launchRoomRpc.input.safeParse({
+        task: "Fix",
+        cwd: "/repo",
+        supervisorMemberId: "sup-1",
+        leadMemberId: "lead-1",
+      }).success,
+    ).toBe(true);
+    expect(launchRoomRpc.input.safeParse({ task: "Fix", cwd: "/repo", supervisorMemberId: "" }).success).toBe(false);
   });
 });

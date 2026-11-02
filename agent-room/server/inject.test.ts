@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { DEFAULT_SETTINGS, roleByName, type Role, type RoomSettings } from "../shared/roles";
+import { memberRecordSchema } from "../shared/member";
 import { applySeat, type AgentCreateRequest } from "./inject";
+import { indexMembers } from "./member-index";
 import { PROMPTS } from "./prompts/generated";
-import { renderSystemPrompt } from "./render";
+import { renderMemberSection, renderSystemPrompt } from "./render";
 
 const base = (
   title: string | null,
@@ -115,23 +117,25 @@ describe("applySeat", () => {
     expect(r.request.config.systemPrompt).toBe(renderSystemPrompt(lead, DEFAULT_SETTINGS, "BASE"));
   });
 
-  it("does not append the room prompt twice when the protocol is already there", () => {
-    // The launch path renders the whole Supervisor prompt into the create, then
-    // the `agent.create` hook may run `applySeat` on that same request.
+  it("leaves an already-prompted launch request and its seat alone", () => {
     const supervisor = roleByName("Supervisor", DEFAULT_SETTINGS.roles)!;
     const launched = renderSystemPrompt(supervisor, DEFAULT_SETTINGS);
-    const r = applySeat(base("Supervisor: plan", { systemPrompt: launched }), DEFAULT_SETTINGS)!;
+    const r = applySeat(
+      base("Supervisor: plan", {
+        provider: "codex",
+        model: "gpt-5.6-sol",
+        systemPrompt: launched,
+      }),
+      DEFAULT_SETTINGS,
+    )!;
 
+    // room.launch built this seat from the selected member; the hook must not
+    // re-seat it from the role catalog.
+    expect(r.role.id).toBe("supervisor");
+    expect(r.request.config.provider).toBe("codex");
+    expect(r.request.config.model).toBe("gpt-5.6-sol");
     expect(r.request.config.systemPrompt).toBe(launched);
     expect(r.request.config.systemPrompt?.split(PROMPTS.protocol)).toHaveLength(2);
-    // …while the role override still lands.
-    expect(r.role.id).toBe("supervisor");
-    expect(r.request.config).toMatchObject({
-      provider: "claude",
-      model: "claude-opus-5-5",
-      modeId: "bypassPermissions",
-      thinkingOptionId: "xhigh",
-    });
   });
 
   it("is stable across repeated applications", () => {
@@ -184,5 +188,91 @@ describe("applySeat", () => {
     expect(req.config.modeId).toBe("plan");
     expect(req.config.provider).toBe("opencode");
     expect(req.config.model).toBe("x");
+  });
+});
+
+const member = (over: Partial<Parameters<typeof memberRecordSchema.parse>[0]> = {}) =>
+  memberRecordSchema.parse({
+    id: "lead-1",
+    name: "Lead",
+    role: "lead",
+    provider: "claude",
+    model: "claude-opus-5-5",
+    modeId: "bypassPermissions",
+    thinkingOptionId: "medium",
+    memory: { promotion: "human" },
+    createdAt: "2026-11-02T00:00:00.000Z",
+    updatedAt: "2026-11-02T00:00:00.000Z",
+    ...over,
+  });
+
+const promptFor = () => renderMemberSection({ name: "Lead", charter: "Use pnpm.", lessons: [] });
+
+describe("applySeat with members", () => {
+  it("lets a matching member override the role seat", () => {
+    const members = indexMembers([member()]);
+    const r = applySeat(
+      base("Lead: x", { provider: "claude", model: "claude-opus-5-5" }),
+      DEFAULT_SETTINGS,
+      members,
+      promptFor,
+    )!;
+
+    expect(r.member?.id).toBe("lead-1");
+    expect(r.request.config).toMatchObject({
+      provider: "claude",
+      model: "claude-opus-5-5",
+      modeId: "bypassPermissions",
+      thinkingOptionId: "medium",
+    });
+    expect(r.request.config.systemPrompt).toContain("## Member\n");
+    expect(r.request.config.systemPrompt).toContain("Use pnpm.");
+    expect(r.memberTruncated).toBe(false);
+  });
+
+  it("falls back to the role seat when no member matches the request seat", () => {
+    const members = indexMembers([member()]);
+    const r = applySeat(base("Lead: x"), DEFAULT_SETTINGS, members, promptFor)!;
+    // base() asks for opencode/m, which is not the member's seat.
+    expect(r.member).toBeUndefined();
+    expect(r.request.config.provider).toBe("claude");
+    expect(r.request.config.model).toBe("claude-opus-5-5");
+    expect(r.request.config.systemPrompt).not.toContain("## Member\n");
+  });
+
+  it("never looks up a worker member", () => {
+    const members = indexMembers([member()]);
+    const r = applySeat(
+      base("Reviewer: audit", { provider: "claude", model: "claude-opus-5-5" }),
+      DEFAULT_SETTINGS,
+      members,
+      promptFor,
+    )!;
+    expect(r.member).toBeUndefined();
+    expect(r.role.kind).toBe("worker");
+  });
+
+  it("drops member controls the member leaves unset", () => {
+    const bare = member({
+      id: "lead-2",
+      modeId: undefined,
+      thinkingOptionId: undefined,
+      features: undefined,
+    });
+    const r = applySeat(
+      base("Lead: x", {
+        provider: "claude",
+        model: "claude-opus-5-5",
+        modeId: "plan",
+        thinkingOptionId: "high",
+        featureValues: { fast_mode: true },
+      }),
+      DEFAULT_SETTINGS,
+      indexMembers([bare]),
+      promptFor,
+    )!;
+    expect(r.request.config.modeId).toBeUndefined();
+    expect(r.request.config.thinkingOptionId).toBeUndefined();
+    expect(r.request.config.featureValues).toBeUndefined();
   });
 });

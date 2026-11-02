@@ -61,6 +61,11 @@ describe("room prompts", () => {
     expect(PROMPTS.protocol.split("\n")[0]).toMatch(/^# \S/);
   });
 
+  it("tells every seat that member memory may be stale", () => {
+    expect(PROMPTS.protocol).toMatch(/member memory may be stale/i);
+    expect(PROMPTS.protocol).toMatch(/verify .*repository/i);
+  });
+
   it("generated.ts matches the markdown sources", async () => {
     for (const name of PROMPT_NAMES)
       expect(PROMPTS[name]).toBe(await readFile(new URL(`./${name}.md`, import.meta.url), "utf8"));

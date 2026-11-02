@@ -48,6 +48,8 @@ const room = (id: string, createdAt = "2026-10-28T10:00:00.000Z"): RoomRecord =>
   task: `task ${id}`,
   cwd: "/repo",
   workspaceId: null,
+  supervisorMemberId: null,
+  leadMemberId: null,
   createdAt,
 });
 
@@ -235,13 +237,137 @@ describe("createRoomStore", () => {
     expect(s.listRooms().map((r) => r.id)).toEqual(["B", "A"]);
   });
 
+  it("migrates a v1 file to v2 and reports it once", async () => {
+    await writeFile(
+      file,
+      JSON.stringify({ version: 1, rooms: [room("R")], seats: [], feed: [] }),
+      "utf8",
+    );
+    const s = make();
+    await s.load();
+
+    expect(s.migratedFromV1()).toBe(true);
+    expect(s.room("R")!.room).toMatchObject({ supervisorMemberId: null, leadMemberId: null });
+
+    await s.flush();
+    const onDisk = JSON.parse(await readFile(file, "utf8"));
+    expect(onDisk.version).toBe(2);
+    expect(onDisk.rooms[0]).toMatchObject({ supervisorMemberId: null, leadMemberId: null });
+
+    // A second load reads v2 and no longer reports a migration.
+    const again = make();
+    await again.load();
+    expect(again.migratedFromV1()).toBe(false);
+  });
+
+  it("binds members whether the room is recorded before or after the binding", () => {
+    const s = make();
+
+    // Binding first: the pending binding is merged by addRoom.
+    s.bindRoomMembers("R", { supervisorMemberId: "sup-1", leadMemberId: "lead-1" });
+    s.addRoom(room("R"));
+    expect(s.room("R")!.room).toMatchObject({
+      supervisorMemberId: "sup-1",
+      leadMemberId: "lead-1",
+    });
+
+    // Room first: the binding updates it in place.
+    s.addRoom(room("X"));
+    s.bindRoomMembers("X", { supervisorMemberId: "sup-2" });
+    expect(s.room("X")!.room).toMatchObject({
+      supervisorMemberId: "sup-2",
+      leadMemberId: null,
+    });
+  });
+
+  it("corrects the supervisor's seat when the binding lands after the seat", async () => {
+    const s = make();
+    s.addRoom(room("R"));
+    // `agent.created` ran first: it has no model for the agent, so the seat
+    // carries the catalog role's `claude-opus-5-5`, not the member's model.
+    s.addSeat(roleSeat("R", "R", null, SUPERVISOR));
+
+    s.bindRoomMembers("R", {
+      supervisorMemberId: "sup-1",
+      supervisorSeat: { provider: "claude", model: "claude-opus-5-6" },
+    });
+
+    expect(s.seat("R")).toMatchObject({
+      roleId: "supervisor",
+      provider: "claude",
+      model: "claude-opus-5-6",
+    });
+
+    // The correction is durable, not only in memory.
+    await s.flush();
+    const b = make();
+    await b.load();
+    expect(b.seat("R")?.model).toBe("claude-opus-5-6");
+  });
+
+  it("corrects the lead's seat when the binding lands after the seat", () => {
+    const s = make();
+    s.addRoom(room("R"));
+    s.addSeat(roleSeat("R", "R", null, SUPERVISOR));
+    s.addSeat(roleSeat("L", "R", "R", LEAD));
+
+    s.bindRoomMembers("R", {
+      leadMemberId: "lead-1",
+      leadSeat: { provider: "claude", model: "gpt-5.5-lead" },
+    });
+
+    expect(s.seat("L")).toMatchObject({ roleKind: "lead", model: "gpt-5.5-lead" });
+    // Only the slot that was bound moves: the supervisor keeps the catalog model.
+    expect(s.seat("R")?.model).toBe("claude-opus-5-5");
+  });
+
+  it("keeps the catalog model on a seat the bound member does not run", () => {
+    const s = make();
+    s.addRoom(room("R"));
+    // The room's lead member runs `codex`; this Lead seat is a catalog `claude`
+    // one, so the member's model would be a lie on it.
+    s.addSeat(roleSeat("L", "R", "R", LEAD));
+
+    s.bindRoomMembers("R", {
+      leadMemberId: "lead-1",
+      leadSeat: { provider: "codex", model: "gpt-5.5-lead" },
+    });
+
+    expect(s.seat("L")?.model).toBe("claude-opus-5-5");
+  });
+
+  it("leaves a seat the room bound no member to alone", () => {
+    const s = make();
+    s.addRoom(room("R"));
+    s.addSeat(roleSeat("R", "R", null, SUPERVISOR));
+
+    // A launch with no member binds nulls and has no seat to offer.
+    s.bindRoomMembers("R", { supervisorMemberId: null, leadMemberId: null });
+
+    expect(s.seat("R")?.model).toBe("claude-opus-5-5");
+  });
+
+  it("keeps member ids across a reload", async () => {
+    const a = make();
+    a.addRoom(room("R"));
+    a.bindRoomMembers("R", { supervisorMemberId: "sup-1", leadMemberId: "lead-1" });
+    await a.flush();
+
+    const b = make();
+    await b.load();
+    expect(b.room("R")!.room).toMatchObject({
+      supervisorMemberId: "sup-1",
+      leadMemberId: "lead-1",
+    });
+  });
+
   it("writes a versioned file and leaves no temp file behind", async () => {
     const s = make();
     s.addRoom(room("R"));
     await s.flush();
 
     const written = JSON.parse(await readFile(file, "utf8"));
-    expect(written.version).toBe(1);
+    expect(written.version).toBe(2);
     expect(written.rooms.map((r: RoomRecord) => r.id)).toEqual(["R"]);
     await expect(readFile(`${file}.tmp`, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });

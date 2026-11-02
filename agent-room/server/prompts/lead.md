@@ -140,8 +140,8 @@ Every `initialPrompt` is:
 
 ```
 Room role: worker. Your system prompt carries the room protocol, the worker
-role, your role's brief, and your role table; follow them for this whole
-session.
+role, your role's brief, your member section when the member has one, and your
+role table; follow them for this whole session.
 
 Lead: <your agent ID> — message me here with send_agent_prompt
 Project: <absolute path of the target project>

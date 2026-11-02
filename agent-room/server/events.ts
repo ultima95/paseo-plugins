@@ -5,20 +5,35 @@ import type {
   PluginLifecycleEvents,
 } from "@getpaseo/plugin/server";
 
+import type { MemberRecord, MemberRole } from "../shared/member";
 import type { SeatRecord } from "../shared/room";
 import { GUARD_ROW_KIND, GUARD_ROW_VERSION } from "../shared/room";
 import { parseRoleTitle, roleForLegacyMarker, type Role, type RoomSettings } from "../shared/roles";
 import { parseSeatMarker, type SeatMarker } from "../shared/seats";
+import { candidatesFromFacts, episodeFactFor, redactSecrets } from "./episode";
 import { feedFromTurn } from "./feed";
 import { checkSpawn } from "./guard";
 import type { Logger } from "./logger";
+import type { MemberStore } from "./member-store";
+import { applyPromotion } from "./promotion";
+import { renderMemberSection } from "./render";
+import { candidateScope, scopesFor } from "./scope";
 import type { RoomStore } from "./store";
 
 /** History one `agent.turn_ended` refetches; enough to cover a turn's messages. */
 export const FEED_TAIL_LIMIT = 40;
 
+/**
+ * How much of the room's task the closing outcome fact keeps. A fact is member
+ * memory that is read back for years, so it stays a summary, not a transcript.
+ */
+export const OUTCOME_TEXT_CAP = 400;
+
 /** A guard row is also rendered inside the agent timeline (renderer in Task 8). */
 export const GUARD_KIND = GUARD_ROW_KIND;
+
+/** How a member section that had to drop charter or lessons is recorded. */
+export const MEMBER_TRUNCATED_NOTE = "member section truncated";
 
 /**
  * The daemon records an agent's parent as a label on the agent
@@ -34,6 +49,12 @@ export interface RoomEventsDeps {
   readSettings: () => Promise<RoomSettings>;
   lookupTitle: TitleLookup;
   log: Logger;
+  /** The members a room's seats can be bound to; supplies a seat's real model. */
+  members: MemberStore;
+  /** The repository identity of a directory, or null outside a repository. */
+  repoIdFor: (cwd: string) => Promise<string | null>;
+  /** The clock a promoted lesson is stamped with; `Date.now` in production. */
+  now?: () => number;
 }
 
 export interface RoomEvents {
@@ -142,6 +163,7 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
   // The object, not its methods: callers may swap a method out (tests do).
   const store = deps.store;
   const log = deps.log;
+  const now = deps.now ?? (() => Date.now());
 
   const resolveParent = async (
     agent: PluginHookAgent,
@@ -171,6 +193,32 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
     return undefined;
   };
 
+  /**
+   * The member whose seat an agent is on, if the room bound one. `agent.created`
+   * carries no model (`PluginHookAgent` has none), so a member-seated Supervisor's
+   * real model can only come from the member `room.launch` bound to the room.
+   *
+   * The provider is the check: a launch that names a member runs that member's
+   * provider and model, so an agent whose provider differs from the bound
+   * member's was created on the catalog role instead, and the member would be a
+   * lie. Workers are never members.
+   */
+  const boundMember = (
+    roomId: string,
+    kind: Role["kind"],
+    provider: string,
+  ): MemberRecord | undefined => {
+    if (kind !== "supervisor" && kind !== "lead") return undefined;
+    const found = store.room(roomId);
+    if (found === undefined) return undefined;
+    const memberId =
+      kind === "supervisor" ? found.room.supervisorMemberId : found.room.leadMemberId;
+    if (memberId === null) return undefined;
+    const candidate = deps.members.get(memberId);
+    if (candidate === undefined || candidate.provider !== provider) return undefined;
+    return candidate;
+  };
+
   /** The seat a new agent is recorded with: its role, plus a legacy marker if any. */
   const seatRecord = (
     agent: PluginHookAgent,
@@ -186,9 +234,49 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
     roleKind: role.kind,
     ...(legacy !== null ? { marker: legacy.marker } : {}),
     provider: agent.provider,
-    model: role.model,
+    // What actually runs: the bound member's seat when there is one, else the
+    // catalog role's.
+    model: boundMember(roomId, role.kind, agent.provider)?.model ?? role.model,
     title: agent.title ?? "",
   });
+
+  /**
+   * Leave one `member note` in the room when the seat's member section had to
+   * drop charter or lesson content. `room.launch` renders the same section for a
+   * Supervisor and notes it itself; the room keeps one row, not two.
+   */
+  const noteMemberTruncation = async (
+    agent: PluginHookAgent,
+    roomId: string,
+    role: Role,
+  ): Promise<void> => {
+    const member = boundMember(roomId, role.kind, agent.provider);
+    if (member === undefined) return;
+    const found = store.room(roomId);
+    if (found === undefined) return;
+
+    const repoId = await deps.repoIdFor(agent.cwd);
+    const section = renderMemberSection({
+      name: member.name,
+      charter: deps.members.charter(member.id),
+      lessons: deps.members.lessonsFor(member.id, scopesFor(agent.cwd, repoId)),
+    });
+    if (!section.truncated) return;
+
+    const noted = found.feed.some(
+      (event) => event.label === "member note" && event.text === MEMBER_TRUNCATED_NOTE,
+    );
+    if (noted) return;
+
+    store.appendFeed({
+      roomId,
+      kind: "note",
+      from: null,
+      to: member.id,
+      label: "member note",
+      text: MEMBER_TRUNCATED_NOTE,
+    });
+  };
 
   /**
    * The parent the daemon holds for an agent the store never recorded. The
@@ -338,9 +426,12 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
         task,
         cwd: agent.cwd,
         workspaceId: agent.workspaceId,
+        supervisorMemberId: null,
+        leadMemberId: null,
         createdAt: new Date().toISOString(),
       });
       store.addSeat(seatRecord(agent, roomId, role, legacy));
+      await noteMemberTruncation(agent, roomId, role);
       return;
     }
 
@@ -354,6 +445,7 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
     }
 
     store.addSeat(seatRecord(agent, roomId, role, legacy));
+    await noteMemberTruncation(agent, roomId, role);
 
     const fallbackFrom = resolved?.fallbackFrom;
     if (fallbackFrom !== undefined) {
@@ -386,15 +478,133 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
     const timeline = (page?.entries ?? []).map((entry) => entry.item);
     const childIds = store.children(agent.id).map((child) => child.agentId);
 
+    // Only a Supervisor and a Lead keep memory, and only into the member their
+    // room bound to that seat. An unbound room (or a worker, which has no slot)
+    // records the turn in the feed and leaves member memory alone.
+    const room = store.room(seat.roomId)?.room;
+    const memberId =
+      room === undefined
+        ? null
+        : seat.roleKind === "supervisor"
+          ? room.supervisorMemberId
+          : seat.roleKind === "lead"
+            ? room.leadMemberId
+            : null;
+
+    // A binding can outlive its member: the archive path checks, and so must this
+    // one, or the turn leaves an episode in a file nothing will ever read. The
+    // lookup is lazy and memoised, so a turn with no signal pays nothing and a
+    // missing member costs one warning rather than a feed row per turn.
+    let memberPresent: boolean | null = null;
+    const memberExists = (id: string): boolean => {
+      if (memberPresent === null) {
+        memberPresent = deps.members.get(id) !== undefined;
+        if (!memberPresent) {
+          log.warn("member missing; captured no episode", {
+            memberId: id,
+            roomId: seat.roomId,
+            agentId: agent.id,
+          });
+        }
+      }
+      return memberPresent;
+    };
+
     for (const draft of feedFromTurn({ agent: seat, childIds, timeline })) {
-      store.appendFeed({ roomId: seat.roomId, ...draft });
+      const stored = store.appendFeed({ roomId: seat.roomId, ...draft });
+      if (memberId === null) continue;
+      // Only the seat's own reply is member memory. A user, task or instruction
+      // row can open with a signal word (`REJECT: …`) without being the seat's
+      // decision, and a fact taken from it would put the user's words in the
+      // member's mouth.
+      if (stored.from !== agent.id) continue;
+      // The signal decides: only the five the protocol carries become facts.
+      const captured = episodeFactFor(stored, seat.roleKind);
+      if (captured === null) continue;
+      // The room's feed row above is already the record of this turn, so a
+      // missing member only skips the memory write.
+      if (!memberExists(memberId)) continue;
+      if (captured.redactions > 0) {
+        log.warn("redacted secrets in member memory", {
+          memberId,
+          roomId: seat.roomId,
+          redactions: captured.redactions,
+        });
+      }
+      await deps.members.appendEpisode(memberId, seat.roomId, captured.fact);
     }
   };
 
-  const handleArchived = async (agent: PluginHookAgent): Promise<void> => {
+  /**
+   * What a closed room leaves in a member's memory: the task it ended on. The
+   * task is the user's own words and memory is read back for years, so an
+   * obvious credential is stripped here as strictly as on the turn-end path
+   * (spec §9: redaction happens before any memory line is written). Redaction
+   * runs first: capping first could cut a token down to a shape no pattern
+   * matches, which would leave the front half of a key in memory.
+   */
+  const outcomeText = (task: string, roomId: string): { text: string; redactions: number } => {
+    const named = task.trim().length > 0 ? task.trim() : roomId;
+    const redacted = redactSecrets(`room ended: ${named}`);
+    return { text: redacted.text.slice(0, OUTCOME_TEXT_CAP), redactions: redacted.redactions };
+  };
+
+  const handleArchived = async (agent: PluginHookAgent, archivedAt: string): Promise<void> => {
     // Only the room's root closes the room; a Lead or Peer leaving does not.
-    if (store.room(agent.id) === undefined) return;
+    const found = store.room(agent.id);
+    if (found === undefined) return;
     store.endRoom(agent.id);
+
+    // One scope for the whole room, derived once: every member it bound promotes
+    // into the repository (or workspace) their seats share.
+    const repoId = await deps.repoIdFor(found.room.cwd);
+    const scope = candidateScope(found.room.cwd, repoId);
+
+    const bindings: Array<[string | null, MemberRole]> = [
+      [found.room.supervisorMemberId, "supervisor"],
+      [found.room.leadMemberId, "lead"],
+    ];
+
+    for (const [memberId, role] of bindings) {
+      if (memberId === null) continue;
+
+      const member = deps.members.get(memberId);
+      if (member === undefined) {
+        // The binding outlived its member: say so in the room rather than write
+        // memory nothing will ever read.
+        store.appendFeed({
+          roomId: found.room.id,
+          kind: "note",
+          from: null,
+          to: memberId,
+          label: "member missing",
+          text: `member missing: ${memberId} (${role}); memory was not written`,
+        });
+        continue;
+      }
+
+      const outcome = outcomeText(found.room.task, found.room.id);
+      if (outcome.redactions > 0) {
+        log.warn("redacted secrets in member memory", {
+          memberId,
+          roomId: found.room.id,
+          redactions: outcome.redactions,
+        });
+      }
+
+      await deps.members.appendEpisode(memberId, found.room.id, {
+        at: archivedAt,
+        kind: "outcome",
+        text: outcome.text,
+      });
+
+      // Only this room's facts: a member's memory spans every room it sat in.
+      const facts = (await deps.members.episodes(memberId)).filter(
+        (fact) => fact.roomId === found.room.id,
+      );
+      const candidates = candidatesFromFacts(facts, { scope, sourceRoomId: found.room.id });
+      await applyPromotion({ members: deps.members, member, candidates, now, log });
+    }
   };
 
   return {
@@ -422,7 +632,7 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
 
     async onArchived(event, ctx) {
       try {
-        await handleArchived(event.agent);
+        await handleArchived(event.agent, event.archivedAt);
       } catch (error) {
         log.error("agent.archived handling failed", {
           agentId: event.agent.id,

@@ -4,12 +4,14 @@ import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
 
+import type { MemberRecord } from "../shared/member";
 import type { SeatRecord } from "../shared/room";
-import { getRoomRpc } from "../shared/rpc";
+import { getRoomRpc, memberListRpc } from "../shared/rpc";
+import { MEMBERS_QUERY_KEY, MEMBERS_REFETCH_MS } from "./queries";
 import type { Surface, Theme } from "./seat-editor";
 import { ActionButton, Section, describeError, paddingFor } from "./seat-editor";
 import type { FeedRow } from "./view-model";
-import { buildTree, feedRows, seatName } from "./view-model";
+import { buildTree, feedRows, memberNameForSeat, seatName } from "./view-model";
 
 /** A room appears a beat after its Supervisor is created, so the feed polls. */
 const POLL_INTERVAL_MS = 2000;
@@ -41,6 +43,8 @@ interface SeatRowProps {
   surface: Surface;
   seat: SeatRecord;
   depth: number;
+  /** The member this seat was launched on, when the room is bound to one. */
+  memberName: string | null;
   openAgent?: OpenAgent;
 }
 
@@ -79,6 +83,11 @@ function SeatRow(props: SeatRowProps) {
       <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }} numberOfLines={1}>
         {`${seat.provider}/${seat.model}`}
       </Text>
+      {props.memberName === null ? null : (
+        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }} numberOfLines={1}>
+          {`member: ${props.memberName}`}
+        </Text>
+      )}
       <Text style={{ color: statusColor(theme, status), fontSize: 11 }} numberOfLines={1}>
         {`${dot} ${status === null ? "unknown" : status}`}
       </Text>
@@ -152,6 +161,7 @@ export function RoomScreen(props: PluginScreenProps) {
   const pad = paddingFor(layout);
   const roomId = props.params.roomId ?? "";
   const getRoom = useRpc(getRoomRpc);
+  const listMembers = useRpc(memberListRpc);
   const openAgent = navigation?.openAgent;
 
   const query = useQuery({
@@ -160,6 +170,18 @@ export function RoomScreen(props: PluginScreenProps) {
     enabled: roomId.length > 0,
     refetchInterval: POLL_INTERVAL_MS,
   });
+
+  // Which member a seat stands for is a fact about the room, read from the
+  // member store. A failed read is not this screen's error: the seats still
+  // draw, only without the member line. The key is shared with the Members and
+  // Rooms screens, so one read serves every screen that names a member.
+  const membersQuery = useQuery({
+    queryKey: MEMBERS_QUERY_KEY,
+    queryFn: () => listMembers({}),
+    enabled: roomId.length > 0,
+    refetchInterval: MEMBERS_REFETCH_MS,
+  });
+  const members: MemberRecord[] = membersQuery.data?.members ?? [];
 
   // "" is "nothing expanded": feed event ids are non-empty, so it never names a row.
   const [expandedId, setExpandedId] = useState("");
@@ -216,7 +238,7 @@ export function RoomScreen(props: PluginScreenProps) {
             <Section
               surface={surface}
               title="Seats"
-              subtitle="Depth-first from the Supervisor. A tap opens that agent."
+              subtitle="Depth-first from the Supervisor. A bound seat names its member; a tap opens that agent."
             >
               {tree.length === 0 ? <Text style={muted}>No seats recorded yet.</Text> : null}
               {tree.map((node) => (
@@ -225,6 +247,7 @@ export function RoomScreen(props: PluginScreenProps) {
                   surface={surface}
                   seat={node.seat}
                   depth={node.depth}
+                  memberName={loaded === null ? null : memberNameForSeat(node.seat, loaded.room, members)}
                   openAgent={openAgent}
                 />
               ))}

@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import type { FeedEvent, SeatMarkerRecord, SeatRecord } from "../shared/room";
+import type { MemberRecord } from "../shared/member";
+import { memberRecordSchema } from "../shared/member";
+import type { FeedEvent, RoomRecord, SeatMarkerRecord, SeatRecord } from "../shared/room";
 import type { TreeNode } from "./view-model";
-import { buildTree, feedRows, seatName } from "./view-model";
+import { buildTree, feedRows, memberChip, memberNameForSeat, seatName } from "./view-model";
 
 const SUP: SeatMarkerRecord = { seat: "supervisor" };
 const LEAD: SeatMarkerRecord = { seat: "lead" };
@@ -343,5 +345,96 @@ describe("feedRows", () => {
     const rows = feedRows([event({ id: "e1", at: "not a timestamp" })], seats);
 
     expect(rows[0]?.time).toBe("not a timestamp");
+  });
+});
+
+/** A stored member, parsed rather than cast, so the fixture cannot drift. */
+function member(id: string, role: "supervisor" | "lead", name: string): MemberRecord {
+  return memberRecordSchema.parse({
+    id,
+    name,
+    role,
+    provider: "claude",
+    model: "claude-opus-5-5",
+    memory: { promotion: "human" },
+    createdAt: "2026-11-02T00:00:00.000Z",
+    updatedAt: "2026-11-02T00:00:00.000Z",
+  });
+}
+
+/** A room launched on both members. */
+const boundRoom: RoomRecord = {
+  id: "R1",
+  task: "fix",
+  cwd: "/repo",
+  workspaceId: null,
+  supervisorMemberId: "sup-1",
+  leadMemberId: "lead-1",
+  createdAt: "2026-11-02T00:00:00.000Z",
+};
+
+describe("memberChip", () => {
+  it("names the room's bound members", () => {
+    expect(memberChip(boundRoom, [member("sup-1", "supervisor", "Ada"), member("lead-1", "lead", "Grace")]))
+      .toEqual({ supervisor: "Ada", lead: "Grace" });
+  });
+
+  it("returns null for unbound or missing members", () => {
+    expect(memberChip({ ...boundRoom, leadMemberId: null }, [])).toEqual({
+      supervisor: null,
+      lead: null,
+    });
+    expect(memberChip(boundRoom, [])).toEqual({ supervisor: null, lead: null });
+  });
+
+  it("names each slot by its own id, not by role", () => {
+    const members = [member("sup-1", "lead", "Ada"), member("lead-1", "supervisor", "Grace")];
+
+    // The binding is the id the room stored; a role that disagrees does not
+    // redirect the chip to another member.
+    expect(memberChip(boundRoom, members)).toEqual({ supervisor: "Ada", lead: "Grace" });
+  });
+
+  it("keeps one slot unbound when only one member is bound", () => {
+    expect(memberChip({ ...boundRoom, supervisorMemberId: null }, [member("lead-1", "lead", "Grace")])).toEqual({
+      supervisor: null,
+      lead: "Grace",
+    });
+  });
+});
+
+describe("memberNameForSeat", () => {
+  const members = [member("sup-1", "supervisor", "Ada"), member("lead-1", "lead", "Grace")];
+  /** The seat both members above run: provider and model must match theirs. */
+  const seat = { provider: "claude", model: "claude-opus-5-5" };
+
+  it("names the member behind a supervisor or lead seat", () => {
+    expect(memberNameForSeat({ ...seat, roleKind: "supervisor" }, boundRoom, members)).toBe("Ada");
+    expect(memberNameForSeat({ ...seat, roleKind: "lead" }, boundRoom, members)).toBe("Grace");
+  });
+
+  it("has no member for a worker seat", () => {
+    expect(memberNameForSeat({ ...seat, roleKind: "worker" }, boundRoom, members)).toBeNull();
+  });
+
+  it("has no member for a seat recorded before roles existed", () => {
+    expect(memberNameForSeat(seat, boundRoom, members)).toBeNull();
+  });
+
+  it("has no member when the room is unbound", () => {
+    const hostSeats: RoomRecord = { ...boundRoom, supervisorMemberId: null, leadMemberId: null };
+
+    expect(memberNameForSeat({ ...seat, roleKind: "supervisor" }, hostSeats, members)).toBeNull();
+  });
+
+  it("has no member for a seat that does not run the member's seat", () => {
+    // The room bound Ada, but this Supervisor was created on another provider or
+    // model: the seat is the catalog role's, so naming Ada beside it would lie.
+    expect(
+      memberNameForSeat({ roleKind: "supervisor", provider: "codex", model: "claude-opus-5-5" }, boundRoom, members),
+    ).toBeNull();
+    expect(
+      memberNameForSeat({ roleKind: "supervisor", provider: "claude", model: "claude-sonnet-5-5" }, boundRoom, members),
+    ).toBeNull();
   });
 });

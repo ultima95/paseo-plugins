@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,9 +11,11 @@ import type {
 } from "@getpaseo/plugin/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { CHARTER_PROMPT_CAP } from "./shared/member";
 import { DEFAULT_SETTINGS, roomSettingsSchema } from "./shared/roles";
 import contribute, { __resetGcMigrated, type GcOverrides } from "./index.server";
 import type { AgentCreateRequest } from "./server/inject";
+import { PROMPTS } from "./server/prompts/generated";
 import { SEAT_SETTINGS_UNLOADED, SETTINGS_TIMEOUT_MS } from "./server/settings";
 
 type SeatsSettings = PluginSettings<typeof roomSettingsSchema>;
@@ -160,6 +162,68 @@ const hookAgent = (over: Partial<PluginHookAgent> & { id: string }): PluginHookA
   title: over.title ?? null,
 });
 
+/** A member record on disk; its seat matches what a launch would request. */
+const MEMBER = {
+  id: "mem-1",
+  name: "Ada",
+  role: "supervisor",
+  provider: "opencode",
+  model: "m1",
+  memory: { promotion: "human", autoScopes: ["repo", "workspace"] },
+  createdAt: "2026-11-01T09:00:00.000Z",
+  updatedAt: "2026-11-01T09:00:00.000Z",
+};
+
+/** Write `members.json` (and `mem-1`'s charter) into the sandboxed data dir. */
+async function seedMember(charter = "Ship it."): Promise<string> {
+  const dataDir = join(home, "plugin-data", "agent-room");
+  await mkdir(join(dataDir, "members", "mem-1"), { recursive: true });
+  await writeFile(
+    join(dataDir, "members.json"),
+    JSON.stringify({ version: 1, members: [MEMBER] }),
+    "utf8",
+  );
+  await writeFile(join(dataDir, "members", "mem-1", "charter.md"), charter, "utf8");
+  return dataDir;
+}
+
+/** Write `members.json` with one member, whose policy a test can vary. */
+async function seedMemberRecord(over: Record<string, unknown> = {}): Promise<string> {
+  const dataDir = join(home, "plugin-data", "agent-room");
+  await mkdir(join(dataDir, "members", "mem-1"), { recursive: true });
+  await writeFile(
+    join(dataDir, "members.json"),
+    JSON.stringify({ version: 1, members: [{ ...MEMBER, ...over }] }),
+    "utf8",
+  );
+  return dataDir;
+}
+
+/**
+ * The JSON lines a member file holds, or `[]` when the store never wrote it.
+ *
+ * The archive test reads the files the plugin wrote rather than the store's
+ * in-memory lists: the claim is that a finished room leaves memory *on disk*.
+ */
+async function jsonLines(file: string): Promise<Array<Record<string, unknown>>> {
+  let raw: string;
+  try {
+    raw = await readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  return raw
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+/** The request a Supervisor launch makes for the seeded member's seat. */
+const memberRequest = (): AgentCreateRequest => ({
+  config: { provider: "opencode", cwd: "/repo", title: "Supervisor: fix auth", model: "m1" },
+});
+
 /** The store path resolves at contribute time, so the data dir must be sandboxed. */
 let home: string;
 let previousPaseoHome: string | undefined;
@@ -202,7 +266,7 @@ describe("agent-room server contribution", () => {
     await expect(cleanup()).resolves.toBeUndefined();
   });
 
-  it("registers the room and GC RPCs in contract order", () => {
+  it("registers the room, member and GC RPCs in contract order", () => {
     const { handled } = contributeWith(
       readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
     );
@@ -212,11 +276,16 @@ describe("agent-room server contribution", () => {
       "room.adopt",
       "room.list",
       "room.get",
+      "member.list",
+      "member.get",
+      "member.save",
+      "member.charter",
+      "member.pending",
       "gc.status",
       "gc.run",
     ]);
-    // Six contracts, six distinct handlers: none registered twice by mistake.
-    expect(new Set(handled.map((entry) => entry.handler)).size).toBe(6);
+    // Eleven contracts, eleven distinct handlers: none registered twice by mistake.
+    expect(new Set(handled.map((entry) => entry.handler)).size).toBe(11);
   });
 
   it("binds each contract to its matching handler, not merely to some handler", async () => {
@@ -242,6 +311,82 @@ describe("agent-room server contribution", () => {
     expect(created).toHaveLength(1);
   });
 
+  it("binds each member contract to the member store, not to a room handler", async () => {
+    await seedMember();
+    const { invoke, cleanup } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+
+    // `member.list` answers members while `room.list` answers rooms: a swap
+    // between the two stores would fail both shapes.
+    await expect(invoke("member.list")({}, {})).resolves.toEqual({ members: [MEMBER] });
+    await expect(invoke("room.list")({}, {})).resolves.toEqual({ rooms: [] });
+
+    // The whole-member read carries what the seed wrote, and the missing arm is
+    // the `room.get` shape's sibling.
+    await expect(invoke("member.get")({ memberId: "mem-1" }, {})).resolves.toMatchObject({
+      member: MEMBER,
+      charter: "Ship it.",
+      lessons: [],
+      pending: [],
+      episodes: [],
+    });
+    await expect(invoke("member.get")({ memberId: "mem-2" }, {})).resolves.toEqual({
+      missing: true,
+    });
+
+    // `member.save` writes the member store: a room handler bound here would
+    // answer with a room, and the member would never appear in a later list.
+    const saved = (await invoke("member.save")(
+      {
+        name: "Bo",
+        role: "lead",
+        provider: "codex",
+        model: "gpt-5.6-sol",
+        memory: { promotion: "human", autoScopes: ["repo", "workspace"] },
+      },
+      {},
+    )) as { member: { id: string; name: string } };
+    expect(saved.member.name).toBe("Bo");
+    const listed = (await invoke("member.list")({}, {})) as { members: Array<{ id: string }> };
+    expect(listed.members.map((member) => member.id)).toContain(saved.member.id);
+
+    // …and `member.charter` writes the charter that `member.get` reads back.
+    await expect(
+      invoke("member.charter")({ memberId: "mem-1", text: "Use pnpm." }, {}),
+    ).resolves.toEqual({ ok: true });
+    await expect(invoke("member.get")({ memberId: "mem-1" }, {})).resolves.toMatchObject({
+      charter: "Use pnpm.",
+    });
+
+    // Flush both writes before the `afterEach` removes the data dir: a write
+    // still in flight would race the teardown instead of the assertions above.
+    await cleanup();
+  });
+
+  it("holds member.list until the member store has loaded", async () => {
+    await seedMember();
+    loadGate.close();
+    const { invoke } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+
+    let answered = false;
+    const pending = invoke("member.list")({}, {}).then((out) => {
+      answered = true;
+      return out;
+    });
+
+    // Same gate as a launch: with the load unresolved the screen's read must be
+    // parked on `await loaded`, not answering from a store that is still empty.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(loadGate.held).toBe(true);
+    expect(answered).toBe(false);
+
+    loadGate.open();
+    await expect(pending).resolves.toEqual({ members: [MEMBER] });
+  });
+
   it("holds a launch until the room store has loaded", async () => {
     loadGate.close();
     const { invoke } = contributeWith(
@@ -261,6 +406,51 @@ describe("agent-room server contribution", () => {
     loadGate.open();
     await expect(pending).resolves.toEqual({ roomId: "A1" });
     expect(created).toHaveLength(1);
+  });
+
+  it("seeds members when a v1 rooms file is migrated on load", async () => {
+    const dataDir = join(home, "plugin-data", "agent-room");
+    await mkdir(dataDir, { recursive: true });
+    await writeFile(
+      join(dataDir, "rooms.json"),
+      JSON.stringify({ version: 1, rooms: [], seats: [], feed: [] }),
+      "utf8",
+    );
+
+    const { invoke } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+    // The RPC waits for the load, and the load includes the member migration.
+    await invoke("room.list")({}, {});
+
+    const written = JSON.parse(await readFile(join(dataDir, "members.json"), "utf8")) as {
+      version: number;
+      members: Array<{ id: string }>;
+    };
+    expect(written.version).toBe(1);
+    expect(written.members.map((record) => record.id).sort()).toEqual([
+      "default-lead",
+      "default-supervisor",
+    ]);
+  });
+
+  it("loads without seeding members for a room store that is already v2", async () => {
+    const dataDir = join(home, "plugin-data", "agent-room");
+    await mkdir(dataDir, { recursive: true });
+    await writeFile(
+      join(dataDir, "rooms.json"),
+      JSON.stringify({ version: 2, rooms: [], seats: [], feed: [] }),
+      "utf8",
+    );
+
+    const { invoke } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+    await invoke("room.list")({}, {});
+
+    // No migration, so no member file: a fresh install starts with no members
+    // rather than with seats the user never chose.
+    await expect(readFile(join(dataDir, "members.json"), "utf8")).rejects.toThrow(/ENOENT/);
   });
 
   it("fails the launch, and creates nothing, when the seat settings stall", async () => {
@@ -645,6 +835,251 @@ describe("agent-room server contribution", () => {
       const status = (await invoke("gc.status")({}, {})) as { lastTickAt: string | null };
       expect(status.lastTickAt).not.toBeNull();
     });
+  });
+
+  it("renders the matching member's section on a create that names its seat", async () => {
+    await seedMember();
+    const { create } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+
+    const out = await create(memberRequest());
+
+    // The member, not the catalog supervisor, supplies the seat and the section.
+    expect(out?.config).toMatchObject({ provider: "opencode", model: "m1" });
+    expect(out?.config.systemPrompt).toContain("## Member");
+    expect(out?.config.systemPrompt).toContain("Name: Ada.");
+    expect(out?.config.systemPrompt).toContain("Ship it.");
+  });
+
+  it("warns when the member section had to truncate", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await seedMember("x".repeat(CHARTER_PROMPT_CAP + 1));
+    const { create } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+
+    const out = await create(memberRequest());
+
+    expect(out?.config.systemPrompt).toContain("[charter truncated]");
+    expect(warn).toHaveBeenCalledWith("[agent-room]", "member section truncated", {
+      memberId: "mem-1",
+      role: "supervisor",
+    });
+  });
+
+  it("holds a marked create until the member store has loaded", async () => {
+    await seedMember();
+    loadGate.close();
+    const { create } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+
+    let settled = false;
+    const pending = create(memberRequest()).then((out) => {
+      settled = true;
+      return out;
+    });
+
+    // The member index the hook builds is worthless before the load lands: the
+    // create waits rather than passing the seat through unmembered.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+
+    loadGate.open();
+    await expect(pending).resolves.toMatchObject({ config: { model: "m1" } });
+  });
+
+  it("leaves a request that already carries the room prompt untouched", async () => {
+    // This is `room.launch`'s own Supervisor: its seat and member section are
+    // already built, and the hook re-applying the catalog role would undo them.
+    const { create } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+    const launched: AgentCreateRequest = {
+      config: {
+        provider: "opencode",
+        cwd: "/repo",
+        title: "Supervisor: fix auth",
+        model: "m1",
+        systemPrompt: PROMPTS.protocol,
+      },
+    };
+
+    await expect(create(launched)).resolves.toBeUndefined();
+  });
+
+  it("keeps a member-seated Supervisor's seat truthful when agent.created lands first", async () => {
+    await seedMember();
+    const { invoke, hooks, cleanup } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+
+    // No repository here: only the launch's member section asks for one.
+    const dir = home;
+    const context = { paseo: {} as PaseoApi, signal: new AbortController().signal };
+    const created: PaseoAgentCreateOptions[] = [];
+    const paseo = {
+      agents: {
+        // The daemon fires `agent.created` before `create` resolves, so the seat
+        // is written before `room.launch` gets the id it can bind the member to.
+        create: vi.fn(async (options: PaseoAgentCreateOptions) => {
+          created.push(options);
+          await hooks["agent.created"](
+            {
+              agent: hookAgent({
+                id: "A1",
+                // The member's own provider: the launch created the agent on it.
+                provider: "opencode",
+                cwd: dir,
+                title: "Supervisor: fix auth",
+              }),
+            },
+            context,
+          );
+          return { id: "A1" };
+        }),
+      },
+      workspaces: { list: vi.fn(async () => ({ entries: [] })) },
+    } as unknown as PaseoApi;
+
+    await invoke("room.launch")(
+      { task: "Fix the room", cwd: dir, supervisorMemberId: "mem-1" },
+      { paseo },
+    );
+
+    const detail = (await invoke("room.get")({ roomId: "A1" }, {})) as {
+      room: { supervisorMemberId: string | null };
+      seats: Array<{ agentId: string; provider: string; model: string }>;
+    };
+
+    expect(created).toHaveLength(1);
+    expect(detail.room.supervisorMemberId).toBe("mem-1");
+    // The catalog supervisor runs `claude-opus-5-5`; the seat must name the
+    // member's model and provider, whichever of the hook and the bind ran first.
+    expect(detail.seats).toHaveLength(1);
+    expect(detail.seats[0]).toMatchObject({ agentId: "A1", provider: "opencode", model: "m1" });
+
+    // Flush the store before the `afterEach` removes the data dir: a write still
+    // in flight would race the teardown instead of the assertion above.
+    await cleanup();
+  });
+
+  /**
+   * One room on the seeded member, from launch to archive, through the real
+   * stores and the hooks `index.server.ts` registered. Nothing about the member
+   * store is stubbed: the episode, pending and lesson files asserted on are what
+   * the plugin itself wrote.
+   */
+  async function archiveMemberRoom(memberOver: Record<string, unknown> = {}): Promise<string> {
+    const dataDir = await seedMemberRecord(memberOver);
+    const { invoke, hooks, cleanup } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+    const context = { paseo: {} as PaseoApi, signal: new AbortController().signal };
+    // A real repository directory, so the room's single candidate scope is a
+    // `repo:<sha8>` scope rather than a workspace scope.
+    const cwd = process.cwd();
+    const timeline = [
+      { item: { type: "user_message", text: "Fix auth" } },
+      { item: { type: "assistant_message", text: "DECISION_NEEDED: use pnpm or npm?" } },
+    ];
+    const created: PaseoAgentCreateOptions[] = [];
+    const paseo = {
+      agents: {
+        create: vi.fn(async (options: PaseoAgentCreateOptions) => {
+          created.push(options);
+          // The daemon fires `agent.created` before the create resolves, so the
+          // room and its seat are recorded before `room.launch` can bind.
+          await hooks["agent.created"](
+            {
+              agent: hookAgent({ id: "A1", provider: "opencode", cwd, title: "Supervisor: fix auth" }),
+            },
+            context,
+          );
+          return { id: "A1" };
+        }),
+        ref: vi.fn((agentId: string) => ({
+          id: agentId,
+          timeline: { refetch: vi.fn(async () => ({ entries: timeline })) },
+        })),
+      },
+      workspaces: { list: vi.fn(async () => ({ entries: [] })) },
+    } as unknown as PaseoApi;
+    // The hooks read the daemon off the context, so the stub arrives that way.
+    context.paseo = paseo;
+
+    await invoke("room.launch")(
+      { task: "Fix auth", cwd, supervisorMemberId: "mem-1" },
+      { paseo },
+    );
+    expect(created).toHaveLength(1);
+
+    await hooks["agent.turn_ended"](
+      {
+        agent: hookAgent({ id: "A1", provider: "opencode", cwd, title: "Supervisor: fix auth" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      context,
+    );
+    await hooks["agent.archived"](
+      {
+        agent: hookAgent({ id: "A1", provider: "opencode", cwd, title: "Supervisor: fix auth" }),
+        archivedAt: "2026-11-02T12:00:00.000Z",
+      },
+      context,
+    );
+
+    // Flush both stores before the `afterEach` removes the data dir: a write still
+    // in flight would race the teardown instead of the assertions.
+    await cleanup();
+    return dataDir;
+  }
+
+  it("captures a finished room's decision and outcome in the real member store", async () => {
+    const dataDir = await archiveMemberRoom();
+    const memberDir = join(dataDir, "members", "mem-1");
+
+    // The turn's DECISION_NEEDED reply and the archive's closing outcome.
+    const facts = await jsonLines(join(memberDir, "episodes", "A1.jsonl"));
+    expect(facts.map((fact) => fact.kind)).toEqual(["decision", "outcome"]);
+    expect(facts[0]).toMatchObject({ kind: "decision", signal: "DECISION_NEEDED" });
+    expect(String(facts[0]?.text)).toContain("use pnpm or npm");
+    expect(String(facts[1]?.text)).toBe("room ended: fix auth");
+
+    // `promotion: "human"`: the decision waits in pending and no lesson is written.
+    const pending = await jsonLines(join(memberDir, "pending.jsonl"));
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      scope: expect.stringMatching(/^repo:/),
+      text: expect.stringContaining("use pnpm or npm"),
+      sourceRoomId: "A1",
+    });
+    expect(await jsonLines(join(memberDir, "lessons.jsonl"))).toEqual([]);
+  });
+
+  it("promotes a repo-scoped candidate at archive under the auto policy", async () => {
+    const dataDir = await archiveMemberRoom({
+      memory: { promotion: "auto", autoScopes: ["repo", "workspace"] },
+    });
+    const memberDir = join(dataDir, "members", "mem-1");
+
+    const lessons = await jsonLines(join(memberDir, "lessons.jsonl"));
+    expect(lessons).toHaveLength(1);
+    expect(lessons[0]).toMatchObject({
+      scope: expect.stringMatching(/^repo:/),
+      text: expect.stringContaining("use pnpm or npm"),
+      sourceRoomId: "A1",
+      promotedBy: "auto",
+    });
+    // Promoted, so the candidate is not also left waiting for review.
+    expect(await jsonLines(join(memberDir, "pending.jsonl"))).toEqual([]);
+    // The episode is still the record of the room, whatever the policy did.
+    expect(
+      (await jsonLines(join(memberDir, "episodes", "A1.jsonl"))).map((fact) => fact.kind),
+    ).toEqual(["decision", "outcome"]);
   });
 
   it("warns about an unknown legacy peer tier", async () => {
