@@ -1,6 +1,7 @@
 import { z } from "zod";
 
-import { peerTierIdSchema, type SeatMarker } from "./seats";
+import { roleIdSchema, roleKindSchema } from "./roles";
+import type { SeatMarker } from "./seats";
 
 /** Newest N feed events kept per room; older ones are dropped from the store. */
 export const FEED_CAP_PER_ROOM = 500;
@@ -26,11 +27,14 @@ const nonEmptyText = z.string().min(1);
  */
 export const timestampSchema = z.string().min(1);
 
-/** How to start one agent, exactly as `SeatMarker` describes it. */
+/**
+ * The legacy `[room:…]` marker as stored: how to start one agent, exactly as
+ * `SeatMarker` describes it. A peer's tier is a role id.
+ */
 export const seatMarkerSchema = z.discriminatedUnion("seat", [
   z.object({ seat: z.literal("supervisor") }),
   z.object({ seat: z.literal("lead") }),
-  z.object({ seat: z.literal("peer"), tier: peerTierIdSchema }),
+  z.object({ seat: z.literal("peer"), tier: roleIdSchema }),
 ]);
 
 export type SeatMarkerRecord = z.infer<typeof seatMarkerSchema>;
@@ -58,16 +62,35 @@ export type RoomRecord = z.infer<typeof roomRecordSchema>;
 /**
  * One agent's seat in a room. `parentId` is the agent that spawned it, so the
  * seat table doubles as the room's delegation tree; `null` means the Supervisor.
+ *
+ * A seat recorded from a role title stores the role (`roleId` for lookup,
+ * `roleName` and `roleKind` so the guard can still read it if settings drop the
+ * role). A seat recorded from a legacy `[room:…]` title keeps the marker; new
+ * records write the role only, so at least one of the two is required.
  */
-export const seatRecordSchema = z.object({
-  agentId: nonEmptyText,
-  roomId: nonEmptyText,
-  parentId: z.string().nullable(),
-  marker: seatMarkerSchema,
-  provider: nonEmptyText,
-  model: nonEmptyText,
-  title: z.string(),
-});
+export const seatRecordSchema = z
+  .object({
+    agentId: nonEmptyText,
+    roomId: nonEmptyText,
+    parentId: z.string().nullable(),
+    marker: seatMarkerSchema.optional(),
+    roleId: roleIdSchema.optional(),
+    roleName: z.string().min(1).optional(),
+    roleKind: roleKindSchema.optional(),
+    provider: nonEmptyText,
+    model: nonEmptyText,
+    title: z.string(),
+  })
+  .refine((seat) => seat.marker !== undefined || seat.roleId !== undefined, {
+    message: "a seat needs a marker or a role",
+  })
+  // A role id without its name and kind is a half-written record: readers would
+  // have to guess the role, and the guard would treat the seat as unmanaged.
+  .refine(
+    (seat) =>
+      seat.roleId === undefined || (seat.roleName !== undefined && seat.roleKind !== undefined),
+    { message: "a role seat needs roleName and roleKind" },
+  );
 
 export type SeatRecord = z.infer<typeof seatRecordSchema>;
 

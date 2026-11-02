@@ -1,9 +1,9 @@
 import type { PaseoAgentCreateOptions, PaseoApi } from "@getpaseo/client";
 import { describe, expect, it, vi } from "vitest";
 
-import type { FeedEvent, RoomRecord, SeatRecord } from "../shared/room";
+import { DEFAULT_SETTINGS, type Role, type RoomSettings } from "../shared/roles";
+import { seatRecordSchema, type FeedEvent, type RoomRecord, type SeatRecord } from "../shared/room";
 import { adoptRoomRpc, getRoomRpc, launchRoomRpc, listRoomsRpc } from "../shared/rpc";
-import { DEFAULT_SETTINGS, seatTitle, type RoomSettings } from "../shared/seats";
 import { createHandlers } from "./handlers";
 import { PROMPTS } from "./prompts/generated";
 import { renderSystemPrompt } from "./render";
@@ -90,6 +90,22 @@ function handlersFor(settings: RoomSettings = DEFAULT_SETTINGS, storeDeps: Param
   return { ...fake, handlers };
 }
 
+/** The default Supervisor role, so a test can vary one field without inventing a seat. */
+const supervisorSeat = (): Role => {
+  const role = DEFAULT_SETTINGS.roles.find((candidate) => candidate.kind === "supervisor");
+  if (role === undefined) throw new Error("test catalog has no supervisor role");
+  return role;
+};
+
+/** The defaults with one role replaced wholesale, so a test controls every seat field. */
+const withRole = (id: string, role: Role): RoomSettings => ({
+  roles: DEFAULT_SETTINGS.roles.map((candidate) => (candidate.id === id ? role : candidate)),
+});
+
+const withoutSupervisor = (): RoomSettings => ({
+  roles: DEFAULT_SETTINGS.roles.filter((role) => role.kind !== "supervisor"),
+});
+
 const roomRecord = (id: string, createdAt: string): RoomRecord => ({
   id,
   task: "Fix the room",
@@ -109,7 +125,7 @@ describe("launch", () => {
     expect(created).toHaveLength(1);
     expect(created[0]?.via).toBe("workspace");
     expect(created[0]?.options).toMatchObject({
-      title: seatTitle({ seat: "supervisor" }, "Fix the room"),
+      title: "Supervisor: Fix the room",
       prompt: "Fix the room",
       config: {
         provider: "claude/claude-opus-5-5",
@@ -159,23 +175,31 @@ describe("launch", () => {
 
     const options = created[0]!.options;
     expect(options.title).toHaveLength(60);
-    expect(options.title?.startsWith("[room:supervisor] ")).toBe(true);
+    expect(options.title?.startsWith("Supervisor: ")).toBe(true);
     expect(options.prompt).toBe(task);
     expect(options.prompt).toHaveLength(300);
   });
 
+  it("titles the Supervisor with the configured role's name", async () => {
+    const { paseo, created } = fakePaseo();
+    const { handlers } = handlersFor(withRole("supervisor", { ...supervisorSeat(), name: "Foreman" }));
+
+    await handlers.launch({ task: "Fix the room", cwd: "/repo" }, paseo);
+
+    // The role catalog, not a hardcoded word, decides the routing token.
+    expect(created[0]?.options.title).toBe("Foreman: Fix the room");
+  });
+
   it("takes the seat and its feature values from the stored settings", async () => {
     const { paseo, created } = fakePaseo();
-    const settings: RoomSettings = {
-      ...DEFAULT_SETTINGS,
-      supervisor: {
-        provider: "codex",
-        model: "gpt-5.6-sol",
-        modeId: "full-access",
-        thinkingOptionId: "medium",
-        features: { fastMode: true },
-      },
-    };
+    const settings = withRole("supervisor", {
+      ...supervisorSeat(),
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      modeId: "full-access",
+      thinkingOptionId: "medium",
+      features: { fastMode: true },
+    });
     const { handlers } = handlersFor(settings);
 
     await handlers.launch({ task: "Fix the room", cwd: "/repo" }, paseo);
@@ -190,7 +214,15 @@ describe("launch", () => {
 
   it("omits the controls the seat does not define", async () => {
     const { paseo, created } = fakePaseo();
-    const { handlers } = handlersFor({ ...DEFAULT_SETTINGS, supervisor: { provider: "claude", model: "claude-opus-5-5" } });
+    const bare: Role = {
+      id: "supervisor",
+      name: "Supervisor",
+      kind: "supervisor",
+      provider: "claude",
+      model: "claude-opus-5-5",
+      useFor: "Talks to the user",
+    };
+    const { handlers } = handlersFor(withRole("supervisor", bare));
 
     await handlers.launch({ task: "Fix the room", cwd: "/repo" }, paseo);
 
@@ -207,12 +239,24 @@ describe("launch", () => {
 
     await handlers.launch({ task: "Fix the room", cwd: "/repo" }, paseo);
 
-    // The whole supervisor prompt: protocol, then role, then the seat table.
+    // The whole supervisor prompt: protocol, then role, then the role table.
     expect(created[0]?.options.config.systemPrompt).toBe(
-      renderSystemPrompt({ seat: "supervisor" }, DEFAULT_SETTINGS),
+      renderSystemPrompt(supervisorSeat(), DEFAULT_SETTINGS),
     );
     expect(created[0]?.options.config.systemPrompt).toContain(PROMPTS.protocol);
-    expect(created[0]?.options.config.systemPrompt).toContain("## Room seats");
+    expect(created[0]?.options.config.systemPrompt).toContain("## Room roles");
+    // Room prompts route by role name: the Supervisor's table names its Lead.
+    expect(created[0]?.options.config.systemPrompt).toContain("Lead: <workstream>");
+  });
+
+  it("refuses to launch when the catalog has no supervisor role", async () => {
+    const { paseo, created } = fakePaseo();
+    const { handlers } = handlersFor(withoutSupervisor());
+
+    await expect(handlers.launch({ task: "Fix the room", cwd: "/repo" }, paseo)).rejects.toThrow(
+      "no supervisor role configured",
+    );
+    expect(created).toHaveLength(0);
   });
 
   it("refuses to launch without a workspace or a cwd", async () => {
@@ -294,11 +338,13 @@ describe("list", () => {
 });
 
 describe("adopt", () => {
+  // Deliberately not the Supervisor role's own provider/model: the seat must
+  // record what actually runs, not the catalog defaults it could be copying.
   const chat = {
     id: "S1",
     title: "New chat",
-    provider: "claude",
-    model: "claude-opus-5-5",
+    provider: "codex",
+    model: "gpt-5.6-sol",
     cwd: "/repo",
     workspaceId: "W1",
     createdAt: "2026-10-28T10:00:00.000Z",
@@ -323,16 +369,48 @@ describe("adopt", () => {
         agentId: "S1",
         roomId: "S1",
         parentId: null,
-        marker: { seat: "supervisor" },
-        provider: "claude",
-        model: "claude-opus-5-5",
+        roleId: "supervisor",
+        roleName: "Supervisor",
+        roleKind: "supervisor",
+        provider: "codex",
+        model: "gpt-5.6-sol",
+        title: "New chat",
       }),
     );
+    // A complete role seat, not the legacy marker: the seat must survive a reload.
+    const written = addSeat.mock.calls[0]?.[0] as SeatRecord | undefined;
+    expect(written?.marker).toBeUndefined();
+    expect(seatRecordSchema.safeParse(written).success).toBe(true);
     expect(appendFeed).toHaveBeenCalledWith(expect.objectContaining({ kind: "note", label: "adopted" }));
     expect(flush).toHaveBeenCalledTimes(1);
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain(PROMPTS.protocol);
-    expect(sent[0]).toContain("[room:lead]");
+    expect(sent[0]).toContain("Lead: <workstream>");
+  });
+
+  it("falls back to the role's model when the adopted chat has none", async () => {
+    const { paseo } = fakePaseo([], { ...chat, model: undefined });
+    const { handlers, addSeat } = handlersFor();
+
+    await handlers.adopt({ agentId: "S1" }, paseo);
+
+    // An empty `model` fails `nonEmptyText`, which would make the whole rooms
+    // file unloadable on the next start — so the seat takes the role's model.
+    const written = addSeat.mock.calls[0]?.[0] as SeatRecord | undefined;
+    expect(written?.model).toBe(supervisorSeat().model);
+    expect(seatRecordSchema.safeParse(written).success).toBe(true);
+  });
+
+  it("fails the adopt before recording anything when the catalog has no supervisor", async () => {
+    const { paseo, sent } = fakePaseo([], chat);
+    const { handlers, addRoom, addSeat } = handlersFor(withoutSupervisor());
+
+    await expect(handlers.adopt({ agentId: "S1" }, paseo)).rejects.toThrow(
+      "no supervisor role configured",
+    );
+    expect(addRoom).not.toHaveBeenCalled();
+    expect(addSeat).not.toHaveBeenCalled();
+    expect(sent).toEqual([]);
   });
 
   it("returns the recorded room without sending again", async () => {
@@ -351,10 +429,12 @@ describe("adopt", () => {
       agentId: "S1",
       roomId: "R1",
       parentId: "P1",
-      marker: { seat: "peer", tier: "default" },
+      roleId: "implementer",
+      roleName: "Implementer",
+      roleKind: "worker",
       provider: "claude",
       model: "claude-sonnet-5-5",
-      title: "[room:peer:default] work",
+      title: "Implementer: work",
     };
     const { handlers } = handlersFor(DEFAULT_SETTINGS, { seat });
 

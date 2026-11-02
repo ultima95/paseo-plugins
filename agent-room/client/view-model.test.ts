@@ -11,19 +11,37 @@ const peer = (tier: string): SeatMarkerRecord => ({ seat: "peer", tier });
 function seat(
   agentId: string,
   parentId: string | null,
-  marker: SeatMarkerRecord = SUP,
+  marker: SeatMarkerRecord | null = SUP,
   overrides: Partial<SeatRecord> = {},
 ): SeatRecord {
   return {
     agentId,
     roomId: "room-1",
     parentId,
-    marker,
+    ...(marker === null ? {} : { marker }),
     provider: "claude",
     model: "claude-opus-5-5",
     title: "",
     ...overrides,
   };
+}
+
+/** The fields a seat recorded from a role title carries, and no marker. */
+function role(
+  roleName: string,
+  roleKind: SeatRecord["roleKind"],
+): Partial<SeatRecord> {
+  return { roleId: roleName.toLowerCase(), roleName, roleKind };
+}
+
+/** A seat as new rooms record it: a role, and no legacy marker. */
+function roleSeat(
+  agentId: string,
+  parentId: string | null,
+  roleName: string,
+  roleKind: SeatRecord["roleKind"],
+): SeatRecord {
+  return seat(agentId, parentId, null, role(roleName, roleKind));
 }
 
 function event(overrides: Partial<FeedEvent> & Pick<FeedEvent, "id">): FeedEvent {
@@ -178,10 +196,26 @@ describe("buildTree", () => {
 });
 
 describe("seatName", () => {
-  it("names each seat in full, by its marker", () => {
-    expect(seatName(SUP)).toBe("Supervisor");
-    expect(seatName(LEAD)).toBe("Lead");
-    expect(seatName(peer("cheap"))).toBe("Peer:cheap");
+  it("names a legacy seat in full, by its marker", () => {
+    expect(seatName(seat("sup", null, SUP))).toBe("Supervisor");
+    expect(seatName(seat("lead", "sup", LEAD))).toBe("Lead");
+    expect(seatName(seat("peer", "lead", peer("cheap")))).toBe("Peer:cheap");
+  });
+
+  it("names each seat by its role, falling back to the legacy marker", () => {
+    expect(seatName(seat("sup", null, SUP, role("Supervisor", "supervisor")))).toBe("Supervisor");
+    expect(seatName(seat("lead", "sup", LEAD, role("Lead", "lead")))).toBe("Lead");
+    expect(seatName(seat("rev", "lead", peer("review"), role("Reviewer", "worker")))).toBe("Reviewer");
+    expect(seatName(seat("legacy", "lead", peer("cheap")))).toBe("Peer:cheap");
+  });
+
+  it("names a role seat that carries no marker at all", () => {
+    expect(seatName(roleSeat("sup", null, "Supervisor", "supervisor"))).toBe("Supervisor");
+    expect(seatName(roleSeat("imp", "lead", "Implementer", "worker"))).toBe("Implementer");
+  });
+
+  it("falls back to Agent when a seat has neither role nor marker", () => {
+    expect(seatName(seat("bare", "lead", null))).toBe("Agent");
   });
 });
 
@@ -204,6 +238,29 @@ describe("feedRows", () => {
 
     expect(rows.map((row) => row.fromLabel)).toEqual(["Sup", "Lead", "Peer:cheap"]);
     expect(rows.map((row) => row.toLabel)).toEqual(["Lead", "Peer:cheap", "Lead"]);
+  });
+
+  it("labels the feed by role name", () => {
+    const roleSeats = [
+      roleSeat("sup", null, "Supervisor", "supervisor"),
+      roleSeat("rev", "sup", "Reviewer", "worker"),
+    ];
+    const rows = feedRows([event({ id: "e1", from: "sup", to: "rev" })], roleSeats);
+
+    expect(rows[0]?.fromLabel).toBe("Sup");
+    expect(rows[0]?.toLabel).toBe("Reviewer");
+  });
+
+  it("keeps the short Sup label for a supervisor role with any name", () => {
+    const roleSeats = [roleSeat("sup", null, "Room Supervisor", "supervisor")];
+
+    expect(feedRows([event({ id: "e1", from: "sup", to: null })], roleSeats)[0]?.fromLabel).toBe("Sup");
+  });
+
+  it("falls back to Agent for a seat with neither role nor marker", () => {
+    const bare = [seat("bare", null, null)];
+
+    expect(feedRows([event({ id: "e1", from: "bare", to: null })], bare)[0]?.fromLabel).toBe("Agent");
   });
 
   it("maps a null sender to You, and a null recipient to You too", () => {

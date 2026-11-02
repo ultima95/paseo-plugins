@@ -7,7 +7,8 @@ import type {
 
 import type { SeatRecord } from "../shared/room";
 import { GUARD_ROW_KIND, GUARD_ROW_VERSION } from "../shared/room";
-import { parseSeatMarker, seatConfigFor, type RoomSettings, type SeatMarker } from "../shared/seats";
+import { parseRoleTitle, roleForLegacyMarker, type Role, type RoomSettings } from "../shared/roles";
+import { parseSeatMarker, type SeatMarker } from "../shared/seats";
 import { feedFromTurn } from "./feed";
 import { checkSpawn } from "./guard";
 import type { Logger } from "./logger";
@@ -50,18 +51,69 @@ export interface RoomEvents {
   ): Promise<void>;
 }
 
-/** What the parent agent looks like right now: its stored seat, else its title. */
+/** What the parent agent looks like right now: its stored seat and its role. */
 interface ParentContext {
   /** The parent agent id; `null` for a root agent. */
   id: string | null;
   seat?: SeatRecord;
   title: string | null;
-  marker: SeatMarker | null;
+  role: Role | null;
 }
 
 function reason(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+/** The role a stored id names, or `null` when the catalog no longer lists it. */
+function roleById(id: string, roles: readonly Role[]): Role | null {
+  return roles.find((role) => role.id === id) ?? null;
+}
+
+/**
+ * The role a title names: a role title first (`Lead: billing`), then the legacy
+ * `[room:…]` marker an in-flight room was created with. `null` for a title that
+ * names neither, which is an agent the room does not manage.
+ */
+function roleFromTitle(title: string | null, settings: RoomSettings): Role | null {
+  const parsed = parseRoleTitle(title, settings.roles);
+  if (parsed !== null) return parsed.role;
+  const legacy = parseSeatMarker(title);
+  return legacy === null ? null : roleForLegacyMarker(legacy.marker, settings.roles).role;
+}
+
+/**
+ * A role rebuilt from the seat that recorded it. The guard must keep enforcing a
+ * hierarchy even when the settings stopped listing a role: the seat knows what
+ * its agent was, so a parent never silently becomes unmanaged.
+ */
+function roleFromSeat(seat: SeatRecord): Role | null {
+  if (seat.roleId === undefined || seat.roleName === undefined || seat.roleKind === undefined) {
+    return null;
+  }
+  return {
+    id: seat.roleId,
+    name: seat.roleName,
+    kind: seat.roleKind,
+    provider: seat.provider,
+    model: seat.model,
+    useFor: seat.roleName,
+  };
+}
+
+/**
+ * The parent's role: stored role by id, then the role fields the seat recorded,
+ * then — last — the role its title names.
+ *
+ * What the seat recorded outranks its title because the title is what the user
+ * sees, not what the agent was launched as: a seat the user retitles
+ * `Supervisor: …` must not turn a Lead into a Supervisor, or the guard stops
+ * archiving the children a Lead may not have. The title is only the last resort,
+ * for a seat recorded before roles existed (a bare legacy marker).
+ */
+function parentRole(seat: SeatRecord, settings: RoomSettings): Role | null {
+  const stored = seat.roleId === undefined ? null : roleById(seat.roleId, settings.roles);
+  return stored ?? roleFromSeat(seat) ?? roleFromTitle(seat.title, settings);
 }
 
 /**
@@ -79,40 +131,11 @@ export async function lookupTitle(paseo: PaseoApi, agentId: string): Promise<str
   }
 }
 
-/**
- * The marker a violator's children should have carried, or `null` when the
- * violator is a Peer (which creates no agents at all).
- */
-function correctMarker(parent: SeatMarker | null): { label: string; example: string } | null {
-  if (parent === null) return null;
-  if (parent.seat === "supervisor") {
-    return { label: "[room:lead]", example: "[room:lead] <workstream>" };
-  }
-  if (parent.seat === "lead") {
-    return { label: "[room:peer:<tier>]", example: "[room:peer:default] <outcome>" };
-  }
-  return null;
-}
-
-/** One plain-text message: what was archived, the rule, the marker to use next time. */
-function violationMessage(
-  childId: string,
-  childTitle: string,
-  rule: string,
-  parent: SeatMarker | null,
-): string {
+/** One plain-text message: what was archived and the rule it broke. */
+function violationMessage(childId: string, childTitle: string, rule: string): string {
   const name = childTitle.trim() === "" ? "(untitled)" : childTitle;
-  const lines = [
-    `Your child agent "${name}" (${childId}) was archived by the room guard.`,
-    `Rule broken: ${rule}.`,
-  ];
-  const correct = correctMarker(parent);
-  lines.push(
-    correct === null
-      ? "A Peer creates no agents: report to your Lead instead."
-      : `Create children with a title that starts with ${correct.label}, for example "${correct.example}".`,
-  );
-  return lines.join(" ");
+  // The rule itself names the role the child should have been titled with.
+  return `Your child agent "${name}" (${childId}) was archived by the room guard. Rule broken: ${rule}.`;
 }
 
 export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
@@ -120,42 +143,50 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
   const store = deps.store;
   const log = deps.log;
 
-  const resolveParent = async (agent: PluginHookAgent, paseo: PaseoApi): Promise<ParentContext> => {
+  const resolveParent = async (
+    agent: PluginHookAgent,
+    paseo: PaseoApi,
+    settings: RoomSettings,
+  ): Promise<ParentContext> => {
     const id = agent.parentAgentId;
-    if (id === null) return { id: null, title: null, marker: null };
+    if (id === null) return { id: null, title: null, role: null };
 
     const stored = store.seat(id);
     if (stored !== undefined) {
-      return { id, seat: stored, title: stored.title, marker: stored.marker };
+      return { id, seat: stored, title: stored.title, role: parentRole(stored, settings) };
     }
 
     const title = await deps.lookupTitle(paseo, id);
-    return { id, title, marker: parseSeatMarker(title)?.marker ?? null };
+    return { id, title, role: roleFromTitle(title, settings) };
   };
 
   /**
    * The room a child belongs to. A stored parent seat knows it; a parent whose
-   * title says it is a Supervisor roots a room named after itself. A Lead or Peer
+   * role says it is a Supervisor roots a room named after itself. A Lead or worker
    * with no stored room cannot place a child, and the caller skips the record.
    */
   const roomFor = (parent: ParentContext): string | undefined => {
     if (parent.seat !== undefined) return parent.seat.roomId;
-    if (parent.marker?.seat === "supervisor" && parent.id !== null) return parent.id;
+    if (parent.role?.kind === "supervisor" && parent.id !== null) return parent.id;
     return undefined;
   };
 
+  /** The seat a new agent is recorded with: its role, plus a legacy marker if any. */
   const seatRecord = (
     agent: PluginHookAgent,
     roomId: string,
-    marker: SeatMarker,
-    model: string,
+    role: Role,
+    legacy: { marker: SeatMarker } | null,
   ): SeatRecord => ({
     agentId: agent.id,
     roomId,
     parentId: agent.parentAgentId,
-    marker,
+    roleId: role.id,
+    roleName: role.name,
+    roleKind: role.kind,
+    ...(legacy !== null ? { marker: legacy.marker } : {}),
     provider: agent.provider,
-    model,
+    model: role.model,
     title: agent.title ?? "",
   });
 
@@ -183,13 +214,13 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
   };
 
   /**
-   * The agent that should see a guard row for this violation. Only a Peer's
-   * mistake is its Lead's to notice, and a stored Peer names its Lead directly;
-   * a Peer whose seat is missing from the store can still supply its own parent
+   * The agent that should see a guard row for this violation. Only a worker's
+   * mistake is its Lead's to notice, and a stored worker names its Lead directly;
+   * a worker whose seat is missing from the store can still supply its own parent
    * id, which is the Lead. A Lead or Supervisor violator gets no row.
    */
   const leadFor = async (paseo: PaseoApi, parent: ParentContext): Promise<string | null> => {
-    if (parent.marker?.seat !== "peer" || parent.id === null) return null;
+    if (parent.role?.kind !== "worker" || parent.id === null) return null;
     if (parent.seat !== undefined) return parent.seat.parentId;
     return parentIdOf(paseo, parent.id);
   };
@@ -224,7 +255,7 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
       return;
     }
 
-    const message = violationMessage(childId, childTitle, rule, parent.marker);
+    const message = violationMessage(childId, childTitle, rule);
 
     try {
       await paseo.agents.ref(violatorId).send(message);
@@ -273,32 +304,43 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
   };
 
   const handleCreated = async (agent: PluginHookAgent, paseo: PaseoApi): Promise<void> => {
-    const parent = await resolveParent(agent, paseo);
-    const parsed = parseSeatMarker(agent.title);
-    const marker = parsed?.marker ?? null;
+    const settings = await deps.readSettings();
+    const parent = await resolveParent(agent, paseo, settings);
 
-    const verdict = checkSpawn(parent.marker, marker);
+    // A role title is the grammar; a legacy marker is read for one release so an
+    // in-flight room keeps working, and resolves to the role it maps to.
+    const parsed = parseRoleTitle(agent.title, settings.roles);
+    const legacy = parsed === null ? parseSeatMarker(agent.title) : null;
+    const resolved: { role: Role; fallbackFrom?: string } | null =
+      parsed !== null
+        ? { role: parsed.role }
+        : legacy !== null
+          ? roleForLegacyMarker(legacy.marker, settings.roles)
+          : null;
+    const role = resolved?.role ?? null;
+
+    const verdict = checkSpawn(parent.role, role, settings.roles);
     if (!verdict.allowed) {
       await deny(agent, parent, verdict.rule, paseo);
       return;
     }
 
-    // Allowed and unmarked: not a room agent, so it is never recorded.
-    if (parsed === null || marker === null) return;
+    // Allowed with no role: not a room agent, so it is never recorded.
+    if (role === null) return;
 
-    const settings = await deps.readSettings();
+    const task = parsed !== null ? parsed.rest : (legacy?.rest ?? "");
 
-    if (marker.seat === "supervisor") {
+    if (role.kind === "supervisor") {
       // The Supervisor roots the room: it owns the room id.
       const roomId = agent.id;
       store.addRoom({
         id: roomId,
-        task: parsed.rest,
+        task,
         cwd: agent.cwd,
         workspaceId: agent.workspaceId,
         createdAt: new Date().toISOString(),
       });
-      store.addSeat(seatRecord(agent, roomId, marker, seatConfigFor(marker, settings).config.model));
+      store.addSeat(seatRecord(agent, roomId, role, legacy));
       return;
     }
 
@@ -311,22 +353,23 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
       return;
     }
 
-    const { config, fallbackFrom } = seatConfigFor(marker, settings);
-    store.addSeat(seatRecord(agent, roomId, marker, config.model));
+    store.addSeat(seatRecord(agent, roomId, role, legacy));
 
+    const fallbackFrom = resolved?.fallbackFrom;
     if (fallbackFrom !== undefined) {
-      // The marker stays as parsed; only the model came from `default`.
+      // The legacy marker stays as parsed; only the role came from the fallback.
       store.appendFeed({
         roomId,
         kind: "note",
         from: null,
         to: agent.id,
         label: "tier fallback",
-        text: `Tier "${fallbackFrom}" is not configured; using the "default" tier (${config.provider}/${config.model}).`,
+        text: `Legacy tier "${fallbackFrom}" is not a configured role; using the "${role.name}" role (${role.provider}/${role.model}).`,
       });
-      log.warn("unknown peer tier; seated on the default tier", {
+      log.warn("unknown legacy peer tier; using a worker role", {
         agentId: agent.id,
         tier: fallbackFrom,
+        roleId: role.id,
       });
     }
   };

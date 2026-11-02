@@ -1,10 +1,12 @@
-import type { PeerTier, RoomSettings, SeatConfig } from "../shared/seats";
-import { peerTierIdSchema, roomSettingsSchema } from "../shared/seats";
+import type { ZodIssue } from "zod";
+
+import { ROLE_NAME_MAX_LENGTH, roleIdSchema, roomSettingsSchema } from "../shared/roles";
+import type { Role, RoleKind, RoomSettings, SeatConfig } from "../shared/roles";
 
 /**
- * The seats document while it is being edited.
+ * A role's seat while it is being edited.
  *
- * `model` is optional here, unlike `SeatConfig`, because changing a seat's
+ * `model` is optional here, unlike `SeatConfig`, because changing a role's
  * provider clears the model: there is no valid model until the user picks one
  * from the new provider's catalog. A draft is only saved once
  * `roomSettingsSchema` accepts it (see `validateDraft`), so an empty seat can
@@ -14,20 +16,22 @@ export type SeatDraft = Omit<SeatConfig, "model"> & { model?: string };
 
 export type SeatPatch = Partial<SeatConfig>;
 
-export type TierDraft = SeatDraft & { id: string; useFor: string };
-
-export type TierPatch = Partial<PeerTier>;
-
-export type RoomDraft = {
-  supervisor: SeatDraft;
-  lead: SeatDraft;
-  peerTiers: TierDraft[];
+/**
+ * One editable role: the seat, plus what the room reads off a title. Every
+ * field `roleSchema` needs is always written, so a saved role can never become
+ * a half-written seat record.
+ */
+export type RoleDraft = SeatDraft & {
+  id: string;
+  name: string;
+  kind: RoleKind;
+  useFor: string;
+  brief?: string;
 };
 
-export type SeatKey = "supervisor" | "lead";
+export type RolePatch = Partial<Role>;
 
-/** The id `roomSettingsSchema` requires one peer tier to carry. */
-export const DEFAULT_TIER_ID = "default";
+export type RoomDraft = { roles: RoleDraft[] };
 
 /**
  * A new provider knows nothing about the old one's models, modes, thinking
@@ -65,68 +69,97 @@ function providerMoved(seat: SeatDraft, provider: string | undefined): boolean {
   return provider !== undefined && provider !== seat.provider;
 }
 
-/** Patch the Supervisor or the Lead seat. */
-export function setSeat(draft: RoomDraft, key: SeatKey, patch: SeatPatch): RoomDraft {
-  const current = draft[key];
-  const base = providerMoved(current, patch.provider)
-    ? changeProvider(current, patch.provider as string)
-    : current;
-  const next = mergeSeat(base, patch);
-
-  if (key === "supervisor") return { ...draft, supervisor: next };
-  return { ...draft, lead: next };
+/**
+ * The room needs exactly one supervisor, at least one lead and at least one
+ * worker. A kind change is the only edit that can break this, and a broken
+ * draft is unsavable, so the change is refused instead of recorded.
+ */
+function kindsValid(roles: readonly RoleDraft[]): boolean {
+  const count = (kind: RoleKind): number => roles.filter((role) => role.kind === kind).length;
+  return count("supervisor") === 1 && count("lead") >= 1 && count("worker") >= 1;
 }
 
 /**
- * Patch one peer tier. The tier id never changes here: seat markers in agent
- * titles point at it, so renaming a tier is a different operation.
+ * Patch one role: its seat, or the fields a title and a prompt read.
+ *
+ * The id never changes here. Agent titles resolve a role by its name, and the
+ * stored record keys the role by id, so a rename that also moved the id would
+ * orphan every title already out there.
+ *
+ * Two edits are normalized here rather than left to the screen. A kind change
+ * that would leave the room without its one supervisor, or with no lead or no
+ * worker, is refused: such a draft cannot be saved, and `removeRole` would then
+ * happily drop the stranded row. An empty brief is stored as no brief at all,
+ * so clearing the field is how a brief is removed.
  */
-export function setTier(draft: RoomDraft, id: string, patch: TierPatch): RoomDraft {
-  const index = draft.peerTiers.findIndex((tier) => tier.id === id);
+export function setRole(draft: RoomDraft, id: string, patch: RolePatch): RoomDraft {
+  const index = draft.roles.findIndex((role) => role.id === id);
   if (index < 0) return draft;
 
-  const current = draft.peerTiers[index];
+  const current = draft.roles[index]!;
   const base = providerMoved(current, patch.provider)
     ? changeProvider(current, patch.provider as string)
     : current;
   const merged = mergeSeat(base, patch);
-  const next: TierDraft = { ...merged, id: current.id, useFor: patch.useFor ?? current.useFor };
+  // `""` means the user cleared the field, and there is no room for an empty
+  // brief: it would either ride along into a prompt or fail the schema.
+  const brief =
+    patch.brief === "" ? undefined : patch.brief !== undefined ? patch.brief : current.brief;
+  const next: RoleDraft = {
+    ...merged,
+    id: current.id,
+    name: patch.name ?? current.name,
+    kind: patch.kind ?? current.kind,
+    useFor: patch.useFor ?? current.useFor,
+    ...(brief !== undefined ? { brief } : {}),
+  };
 
-  const peerTiers = draft.peerTiers.slice();
-  peerTiers[index] = next;
-  return { ...draft, peerTiers };
+  const roles = draft.roles.slice();
+  roles[index] = next;
+  if (!kindsValid(roles)) return draft;
+  return { ...draft, roles };
 }
 
 /**
- * Append a peer tier copied from `default`'s config. `useFor` starts empty, so
- * the new tier is not savable until the user says what it is for. A taken or
+ * Append a worker role copied from the first worker's seat. `useFor` starts
+ * empty, so the new role is not savable until the user says what it is for, and
+ * its name starts as its id, which is what a title carries. A taken or
  * malformed id leaves the draft unchanged.
  */
-export function addTier(draft: RoomDraft, id: string): RoomDraft {
-  if (!peerTierIdSchema.safeParse(id).success) return draft;
-  if (draft.peerTiers.some((tier) => tier.id === id)) return draft;
+export function addRole(draft: RoomDraft, id: string): RoomDraft {
+  if (!roleIdSchema.safeParse(id).success) return draft;
+  if (draft.roles.some((role) => role.id === id)) return draft;
 
-  const template = draft.peerTiers.find((tier) => tier.id === DEFAULT_TIER_ID);
-  if (!template) return draft;
+  const template = draft.roles.find((role) => role.kind === "worker");
+  if (template === undefined) return draft;
 
-  const added: TierDraft = {
+  const added: RoleDraft = {
     ...mergeSeat(template, {}),
     id,
+    name: id.slice(0, ROLE_NAME_MAX_LENGTH),
+    kind: "worker",
     useFor: "",
   };
-  if (template.features) added.features = { ...template.features };
+  // The seat's feature map is a value on the role, not shared state: editing
+  // the copy must never reach the worker it was copied from.
+  if (template.features !== undefined) added.features = { ...template.features };
 
-  return { ...draft, peerTiers: [...draft.peerTiers, added] };
+  return { ...draft, roles: [...draft.roles, added] };
 }
 
-/** Drop a peer tier. The `default` tier is what an unmarked tier id resolves to. */
-export function removeTier(draft: RoomDraft, id: string): RoomDraft {
-  if (id === DEFAULT_TIER_ID) return draft;
+/**
+ * Drop a worker role. The supervisor and the lead are single, required roles,
+ * and a room with no worker role has nothing for a Lead to launch, so both are
+ * refused rather than left for the schema to report.
+ */
+export function removeRole(draft: RoomDraft, id: string): RoomDraft {
+  const target = draft.roles.find((role) => role.id === id);
+  if (target === undefined || target.kind !== "worker") return draft;
 
-  const peerTiers = draft.peerTiers.filter((tier) => tier.id !== id);
-  if (peerTiers.length === draft.peerTiers.length) return draft;
+  const roles = draft.roles.filter((role) => role.id !== id);
+  if (!roles.some((role) => role.kind === "worker")) return draft;
 
-  return { ...draft, peerTiers };
+  return { ...draft, roles };
 }
 
 export interface DraftValidation {
@@ -140,6 +173,18 @@ export interface DraftValidation {
 const MAX_REPORTED_ISSUES = 3;
 
 /**
+ * `roomSettingsSchema` accepts either the roles document or a legacy seats
+ * document, so anything wrong with a field fails the union as one pathless
+ * "Invalid input". A draft is always the roles document — the first branch — so
+ * that branch's issues are the ones the user can act on.
+ */
+function actionableIssues(issues: readonly ZodIssue[]): ZodIssue[] {
+  return issues.flatMap((issue) =>
+    issue.code === "invalid_union" ? actionableIssues(issue.errors[0] ?? []) : [issue],
+  );
+}
+
+/**
  * The single gate between the editor and the settings store: Save is disabled
  * exactly while this reports `ok: false`.
  */
@@ -147,7 +192,9 @@ export function validateDraft(draft: RoomDraft): DraftValidation {
   const parsed = roomSettingsSchema.safeParse(draft);
   if (parsed.success) return { ok: true, settings: parsed.data, error: "" };
 
-  const issues = parsed.error.issues.slice(0, MAX_REPORTED_ISSUES).map((issue) => {
+  const actionable = actionableIssues(parsed.error.issues);
+  const reported = actionable.length > 0 ? actionable : parsed.error.issues;
+  const issues = reported.slice(0, MAX_REPORTED_ISSUES).map((issue) => {
     const path = issue.path.join(".");
     return path.length > 0 ? `${path}: ${issue.message}` : issue.message;
   });

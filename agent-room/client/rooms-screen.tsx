@@ -5,11 +5,12 @@ import { useCallback, useEffect, useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
 
 import type { RoomRecord } from "../shared/room";
+import type { RoleKind } from "../shared/roles";
+import { DEFAULT_SETTINGS, roomSettings } from "../shared/roles";
 import { launchRoomRpc, listRoomsRpc } from "../shared/rpc";
-import { DEFAULT_SETTINGS, roomSettings } from "../shared/seats";
 import { LaunchForm, useLaunchTarget } from "./launch-form";
-import type { SeatKey, SeatPatch, RoomDraft, TierPatch } from "./settings-draft";
-import { addTier, removeTier, setSeat, setTier, validateDraft } from "./settings-draft";
+import type { RolePatch, RoomDraft } from "./settings-draft";
+import { addRole, removeRole, setRole, validateDraft } from "./settings-draft";
 import type { Surface } from "./seat-editor";
 import {
   ActionButton,
@@ -76,7 +77,7 @@ function RoomRow(props: { surface: Surface; room: RoomRecord; onOpen(): void }) 
 }
 
 /**
- * The Rooms screen: seat settings, the launch form, and the room list.
+ * The Rooms screen: role settings, the launch form, and the room list.
  *
  * A screen cannot navigate on its own, so the only ways out are the host's
  * `navigation.openAgent` (when the host offers one) and staying put: with no
@@ -96,8 +97,8 @@ export function RoomsScreen(props: PluginScreenProps) {
 
   /** Local edits. `null` shows whatever the settings store currently holds. */
   const [edited, setEdited] = useState<RoomDraft | null>(null);
-  const [newTierId, setNewTierId] = useState("");
-  const [tierError, setTierError] = useState("");
+  const [newRoleId, setNewRoleId] = useState("");
+  const [roleError, setRoleError] = useState("");
 
   const [task, setTask] = useState("");
   const [launching, setLaunching] = useState(false);
@@ -116,7 +117,7 @@ export function RoomsScreen(props: PluginScreenProps) {
   const validation = validateDraft(draft);
 
   // A draft is only derived from the document a save would overwrite, so the
-  // seats are editable once the store has a revision to save against and no
+  // roles are editable once the store has a revision to save against and no
   // save is in flight. An invalid document supplies a revision too: its draft is
   // the defaults shown on screen, and saving replaces the broken settings.
   const editable = revision !== null && !settings.saving;
@@ -179,33 +180,28 @@ export function RoomsScreen(props: PluginScreenProps) {
     }
   }
 
-  function changeSeat(key: SeatKey, patch: SeatPatch) {
+  function changeRole(id: string, patch: RolePatch) {
     if (!editable) return;
-    setEdited(setSeat(draft, key, patch));
+    setEdited(setRole(draft, id, patch));
   }
 
-  function changeTier(id: string, patch: TierPatch) {
+  function removeRoleRow(id: string) {
     if (!editable) return;
-    setEdited(setTier(draft, id, patch));
+    setEdited(removeRole(draft, id));
   }
 
-  function removeTierRow(id: string) {
+  function addRoleRow() {
     if (!editable) return;
-    setEdited(removeTier(draft, id));
-  }
-
-  function addTierRow() {
-    if (!editable) return;
-    const id = newTierId.trim();
+    const id = newRoleId.trim();
     if (id.length === 0) return;
-    const next = addTier(draft, id);
+    const next = addRole(draft, id);
     if (next === draft) {
-      setTierError(`"${id}" is already used, or is not lowercase kebab-case.`);
+      setRoleError(`"${id}" is already used, or is not lowercase kebab-case.`);
       return;
     }
     setEdited(next);
-    setNewTierId("");
-    setTierError("");
+    setNewRoleId("");
+    setRoleError("");
   }
 
   // The save gate is unchanged: a revision to write against and a schema-valid
@@ -216,25 +212,33 @@ export function RoomsScreen(props: PluginScreenProps) {
   const warning = { color: theme.colors.statusWarning, fontSize: 12 };
   const danger = { color: theme.colors.statusDanger, fontSize: 12 };
 
-  const seats: ReactNode[] = [];
-  for (const tier of draft.peerTiers) {
-    seats.push(
-      <SeatEditor
-        key={`peer-${tier.id}`}
-        theme={theme}
-        layout={layout}
-        cwd={launchTarget.cwdForFeatures}
-        label={`Peer · ${tier.id}`}
-        seat={tier}
-        providers={catalog.providers}
-        disabled={!editable}
-        onChange={(patch) => changeTier(tier.id, patch)}
-        useFor={tier.useFor}
-        onUseForChange={(text) => changeTier(tier.id, { useFor: text })}
-        onRemove={tier.id === "default" ? undefined : () => removeTierRow(tier.id)}
-      />,
-    );
-  }
+  const roleEditors: ReactNode[] = draft.roles.map((role) => (
+    <SeatEditor
+      key={role.id}
+      theme={theme}
+      layout={layout}
+      cwd={launchTarget.cwdForFeatures}
+      label={role.kind === "supervisor" ? "Supervisor" : role.kind === "lead" ? "Lead" : `Worker · ${role.id}`}
+      seat={role}
+      providers={catalog.providers}
+      disabled={!editable}
+      onChange={(patch) => changeRole(role.id, patch)}
+      useFor={role.useFor}
+      onUseForChange={(text) => changeRole(role.id, { useFor: text })}
+      roleName={role.name}
+      roleKind={role.kind}
+      onNameChange={(text) => changeRole(role.id, { name: text })}
+      // Only a worker can change kind. The supervisor and the lead are single,
+      // required roles, so offering them a Kind control would only let a user
+      // press a chip that `setRole` refuses.
+      {...(role.kind === "worker"
+        ? { onKindChange: (kind: RoleKind) => changeRole(role.id, { kind }) }
+        : {})}
+      brief={role.brief}
+      onBriefChange={(text) => changeRole(role.id, { brief: text })}
+      onRemove={role.kind === "worker" ? () => removeRoleRow(role.id) : undefined}
+    />
+  ));
 
   return (
     <ScrollView
@@ -244,70 +248,52 @@ export function RoomsScreen(props: PluginScreenProps) {
     >
       <Section
         surface={surface}
-        title="Seats"
-        subtitle="Every agent a room starts runs the seat its title is marked with."
+        title="Roles"
+        subtitle="Every room agent is titled with the role it runs."
       >
-        {settings.status === "loading" ? <Text style={muted}>Loading saved seats…</Text> : null}
+        {settings.status === "loading" ? <Text style={muted}>Loading saved roles…</Text> : null}
         {settings.status === "error" ? (
-          <Text style={danger}>{`${settings.error} — seats cannot be edited until they load.`}</Text>
+          <Text style={danger}>{`${settings.error} — roles cannot be edited until they load.`}</Text>
         ) : null}
         {settings.status === "invalid" ? (
           <Text style={warning}>
-            The saved seats do not match the schema; the defaults are shown. Edit them and save, or save
+            The saved roles do not match the schema; the defaults are shown. Edit them and save, or save
             them as they are.
           </Text>
         ) : null}
         {catalog.loading ? <Text style={muted}>Loading providers…</Text> : null}
         {catalog.error ? <Text style={warning}>{catalog.error}</Text> : null}
 
-        <SeatEditor
-          theme={theme}
-          layout={layout}
-          cwd={launchTarget.cwdForFeatures}
-          label="Supervisor"
-          seat={draft.supervisor}
-          providers={catalog.providers}
-          disabled={!editable}
-          onChange={(patch) => changeSeat("supervisor", patch)}
-        />
-        <SeatEditor
-          theme={theme}
-          layout={layout}
-          cwd={launchTarget.cwdForFeatures}
-          label="Lead"
-          seat={draft.lead}
-          providers={catalog.providers}
-          disabled={!editable}
-          onChange={(patch) => changeSeat("lead", patch)}
-        />
-        {seats}
+        {roleEditors}
 
-        <Field surface={surface} label="New peer tier id">
+        <Field surface={surface} label="New worker role id">
           <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: pad }}>
             <View style={{ flex: 1, minWidth: 160 }}>
               <TextEntry
                 surface={surface}
-                value={newTierId}
+                value={newRoleId}
                 placeholder="e.g. triage"
                 disabled={!editable}
-                onChangeText={setNewTierId}
+                onChangeText={setNewRoleId}
               />
             </View>
             <ActionButton
               surface={surface}
-              label="Add tier"
-              disabled={!editable || newTierId.trim().length === 0}
-              onPress={addTierRow}
+              label="Add role"
+              disabled={!editable || newRoleId.trim().length === 0}
+              onPress={addRoleRow}
             />
           </View>
-          <Text style={muted}>A new tier copies the default tier and needs a use-for before it saves.</Text>
-          {tierError ? <Text style={warning}>{tierError}</Text> : null}
+          <Text style={muted}>
+            A new role copies the first worker role and needs a use-for before it saves.
+          </Text>
+          {roleError ? <Text style={warning}>{roleError}</Text> : null}
         </Field>
 
         <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: pad }}>
           <ActionButton
             surface={surface}
-            label={settings.saving ? "Saving…" : "Save seats"}
+            label={settings.saving ? "Saving…" : "Save roles"}
             disabled={!canSave}
             onPress={() => void saveSettings()}
           />

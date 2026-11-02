@@ -74,7 +74,7 @@ function SeatRow(props: SeatRowProps) {
       }}
     >
       <Text style={{ color: theme.colors.foreground, fontSize: 13, fontWeight: "600" }} numberOfLines={1}>
-        {seatName(seat.marker)}
+        {seatName(seat)}
       </Text>
       <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }} numberOfLines={1}>
         {`${seat.provider}/${seat.model}`}

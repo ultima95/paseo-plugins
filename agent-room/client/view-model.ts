@@ -1,5 +1,5 @@
 import { parseRoomStatusMessage, roomStatusLine } from "../shared/room-status";
-import type { FeedEvent, SeatMarkerRecord, SeatRecord } from "../shared/room";
+import type { FeedEvent, SeatRecord } from "../shared/room";
 
 /** One tree row: the seat and how far to indent it from the root. */
 export interface TreeNode {
@@ -22,8 +22,23 @@ export interface FeedRow {
 /** Letters an agent id falls back to when no seat claims it. */
 const UNKNOWN_ID_PREFIX = 8;
 
-/** Feed labels are abbreviated: they sit in a narrow column. */
-function feedLabel(marker: SeatMarkerRecord): string {
+/** A seat that carries neither a role nor a legacy marker still needs a name. */
+const UNNAMED_SEAT = "Agent";
+
+/**
+ * Feed labels are abbreviated: they sit in a narrow column. A role seat is
+ * labelled by its role name, except the supervisor, which is always `Sup`
+ * whatever its role is called; a seat recorded before roles keeps the marker
+ * label it has always had.
+ */
+function feedLabel(seat: SeatRecord): string {
+  const roleName = seat.roleName;
+  if (roleName !== undefined) {
+    return seat.roleKind === "supervisor" ? "Sup" : roleName;
+  }
+
+  const marker = seat.marker;
+  if (marker === undefined) return UNNAMED_SEAT;
   switch (marker.seat) {
     case "supervisor":
       return "Sup";
@@ -34,8 +49,12 @@ function feedLabel(marker: SeatMarkerRecord): string {
   }
 }
 
-/** The tree has room for the full seat name. */
-export function seatName(marker: SeatMarkerRecord): string {
+/** The tree has room for the full seat name: the role name, or the marker. */
+export function seatName(seat: SeatRecord): string {
+  if (seat.roleName !== undefined) return seat.roleName;
+
+  const marker = seat.marker;
+  if (marker === undefined) return UNNAMED_SEAT;
   switch (marker.seat) {
     case "supervisor":
       return "Supervisor";
@@ -152,7 +171,7 @@ function feedText(text: string): string {
 export function feedRows(feed: FeedEvent[], seats: SeatRecord[]): FeedRow[] {
   const labels = new Map<string, string>();
   for (const seat of seats) {
-    labels.set(seat.agentId, feedLabel(seat.marker));
+    labels.set(seat.agentId, feedLabel(seat));
   }
 
   const labelOf = (agentId: string | null): string => {

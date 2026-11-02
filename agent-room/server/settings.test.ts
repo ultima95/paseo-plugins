@@ -1,7 +1,7 @@
 import type { PluginSettings, PluginSettingsState } from "@getpaseo/plugin/server";
 import { describe, expect, it, vi } from "vitest";
 
-import { DEFAULT_SETTINGS, roomSettingsSchema, type RoomSettings } from "../shared/seats";
+import { DEFAULT_SETTINGS, roomSettingsSchema, type RoomSettings } from "../shared/roles";
 import type { Logger } from "./logger";
 import { SEAT_SETTINGS_UNLOADED, SETTINGS_TIMEOUT_MS, createSettingsReader } from "./settings";
 
@@ -35,7 +35,9 @@ function fakeLogger() {
 
 const custom: RoomSettings = {
   ...DEFAULT_SETTINGS,
-  lead: { provider: "codex", model: "gpt-5.6-sol" },
+  roles: DEFAULT_SETTINGS.roles.map((role) =>
+    role.id === "lead" ? { ...role, provider: "codex", model: "gpt-5.6-sol" } : role,
+  ),
 };
 
 describe("createSettingsReader", () => {

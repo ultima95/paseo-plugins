@@ -11,7 +11,7 @@ import type {
 } from "@getpaseo/plugin/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { DEFAULT_SETTINGS, roomSettingsSchema } from "./shared/seats";
+import { DEFAULT_SETTINGS, roomSettingsSchema } from "./shared/roles";
 import contribute, { __resetGcMigrated, type GcOverrides } from "./index.server";
 import type { AgentCreateRequest } from "./server/inject";
 import { SEAT_SETTINGS_UNLOADED, SETTINGS_TIMEOUT_MS } from "./server/settings";
@@ -303,7 +303,7 @@ describe("agent-room server contribution", () => {
       thinkingOptionId: "xhigh",
     });
     // The launch carries the Supervisor's prompt itself (I4), not only the hook.
-    expect(created[0]?.config.systemPrompt).toContain("## Room seats");
+    expect(created[0]?.config.systemPrompt).toContain("## Room roles");
   });
 
   it("swallows lifecycle failures instead of throwing at the daemon", async () => {
@@ -330,16 +330,19 @@ describe("agent-room server contribution", () => {
     await expect(create(request(null))).resolves.toBeUndefined();
   });
 
-  it("does not read the seat settings for an agent with no marker", async () => {
+  it("does not read the role settings for an agent whose title names no role", async () => {
     const read = readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS });
     const { create } = contributeWith(read);
 
+    // The hook's cheap pre-check rejects a title with no colon and no leading
+    // bracket before anything awaits. An agent that names no role is the
+    // daemon's common case, and a settings round-trip there can stall for 2 s
+    // and must never happen. `Implementer audit the diff` is the grammar's own
+    // near-miss: a role word without the separator names no role.
     await create(request("Fix it"));
-    await create(request("[Lead] old room"));
+    await create(request("Implementer audit the diff"));
     await create(request(null));
 
-    // An unmarked create is the daemon's common case; a settings round-trip
-    // there can stall for 2 s and must never happen.
     expect(read).not.toHaveBeenCalled();
   });
 
@@ -366,10 +369,25 @@ describe("agent-room server contribution", () => {
     expect(read).toHaveBeenCalledTimes(1);
   });
 
-  it("returns the seat's request for a marked agent", async () => {
+  it("returns the role's request for a role title, and for a legacy marker", async () => {
     const { create } = contributeWith(readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }));
-    const out = await create(request("[room:peer:default] probe"));
-    expect(out?.config).toMatchObject({
+
+    // The grammar: the role name before the colon decides the seat.
+    const titled = await create(request("Implementer: probe"));
+    expect(titled?.config).toMatchObject({
+      provider: "claude",
+      model: "claude-sonnet-5-5",
+      modeId: "bypassPermissions",
+      thinkingOptionId: "medium",
+      cwd: "/repo",
+      title: "Implementer: probe",
+    });
+    expect(titled?.config.systemPrompt).toContain("## Room roles");
+
+    // Read old, write new: an in-flight room's `[room:peer:default]` title still
+    // resolves, onto the same role, and is left as it is.
+    const legacy = await create(request("[room:peer:default] probe"));
+    expect(legacy?.config).toMatchObject({
       provider: "claude",
       model: "claude-sonnet-5-5",
       modeId: "bypassPermissions",
@@ -377,7 +395,7 @@ describe("agent-room server contribution", () => {
       cwd: "/repo",
       title: "[room:peer:default] probe",
     });
-    expect(out?.config.systemPrompt).toContain("## Room seats");
+    expect(legacy?.config.systemPrompt).toContain("## Room roles");
   });
 
   it("still injects with DEFAULT_SETTINGS when the stored state is invalid", async () => {
@@ -629,11 +647,16 @@ describe("agent-room server contribution", () => {
     });
   });
 
-  it("warns about an unknown peer tier", async () => {
+  it("warns about an unknown legacy peer tier", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const { create } = contributeWith(readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }));
     const out = await create(request("[room:peer:zzz] x"));
+    // A tier the catalog no longer configures falls back to the first worker
+    // role, and the warning names both the tier it came from and the role it got.
     expect(out?.config.model).toBe("claude-sonnet-5-5");
-    expect(warn).toHaveBeenCalledWith("[agent-room]", "unknown peer tier", { tier: "zzz" });
+    expect(warn).toHaveBeenCalledWith("[agent-room]", "unknown legacy peer tier", {
+      tier: "zzz",
+      role: "implementer",
+    });
   });
 });

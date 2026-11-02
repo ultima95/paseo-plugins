@@ -100,7 +100,7 @@ export function RoomPopover(props: PluginButtonContentProps & { onManage?: () =>
         Start a room
       </Text>
       <Text style={{ color: theme.colors.foregroundMuted }}>
-        Uses the saved Supervisor, Lead and peer seats, and runs in this workspace.
+        Uses the saved Supervisor, Lead and worker roles, and runs in this workspace.
       </Text>
       <TextInput
         accessibilityLabel="Room task"
@@ -154,13 +154,13 @@ export function RoomPopover(props: PluginButtonContentProps & { onManage?: () =>
           {adopted !== null ? (
             <Text style={{ color: theme.colors.foreground }}>
               This chat is the room Supervisor now. Give it a task here; it will title Leads with
-              {" "}`[room:lead]`.
+              {` "Lead: <workstream>".`}
             </Text>
           ) : (
             <>
               <Text style={{ color: theme.colors.foregroundMuted }}>
                 Or make this chat the Supervisor. It keeps this chat's provider and model; the saved
-                Supervisor seat is not applied.
+                Supervisor role's seat is not applied.
               </Text>
               <Pressable
                 accessibilityRole="button"

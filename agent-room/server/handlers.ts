@@ -1,8 +1,8 @@
 import type { PaseoAgentConfig, PaseoApi, PaseoWorkspaceAgentCreateOptions } from "@getpaseo/client";
 import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 
+import { seatTitleForRole, type Role, type RoomSettings } from "../shared/roles";
 import { adoptRoomRpc, getRoomRpc, launchRoomRpc, listRoomsRpc } from "../shared/rpc";
-import { seatTitle, type RoomSettings, type SeatConfig } from "../shared/seats";
 import { renderSystemPrompt } from "./render";
 import type { RoomStore } from "./store";
 
@@ -20,16 +20,27 @@ export interface RoomHandlers {
 }
 
 /**
- * A seat's config as the client SDK wants it: one combined `provider/model`
+ * The one role that owns a room. The settings schema already guarantees exactly
+ * one supervisor role; the handler is a boundary, so a catalog without one fails
+ * loudly instead of launching whatever comes first.
+ */
+function supervisorRole(settings: RoomSettings): Role {
+  const role = settings.roles.find((candidate) => candidate.kind === "supervisor");
+  if (role === undefined) throw new Error("no supervisor role configured");
+  return role;
+}
+
+/**
+ * A role's config as the client SDK wants it: one combined `provider/model`
  * string (the create call has no separate `model` field), plus the controls the
- * seat defines. A control the seat leaves undefined is omitted, so the provider
+ * role defines. A control the role leaves undefined is omitted, so the provider
  * keeps its own default instead of being handed `undefined`.
  */
-function seatAgentConfig(seat: SeatConfig): PaseoAgentConfig {
-  const config: PaseoAgentConfig = { provider: `${seat.provider}/${seat.model}` };
-  if (seat.modeId !== undefined) config.modeId = seat.modeId;
-  if (seat.thinkingOptionId !== undefined) config.thinkingOptionId = seat.thinkingOptionId;
-  if (seat.features !== undefined) config.featureValues = seat.features;
+function roleConfig(role: Role): PaseoAgentConfig {
+  const config: PaseoAgentConfig = { provider: `${role.provider}/${role.model}` };
+  if (role.modeId !== undefined) config.modeId = role.modeId;
+  if (role.thinkingOptionId !== undefined) config.thinkingOptionId = role.thinkingOptionId;
+  if (role.features !== undefined) config.featureValues = role.features;
   return config;
 }
 
@@ -49,15 +60,16 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
   return {
     async launch(input, paseo) {
       const settings = await deps.readSettings();
+      const role = supervisorRole(settings);
       // The Supervisor carries its own prompt: role delivery must not depend on
       // the `agent.create` hook firing for a plugin-originated create. If the
       // hook does run, `applySeat` sees the prompt already there and leaves it.
-      const config = seatAgentConfig(settings.supervisor);
-      config.systemPrompt = renderSystemPrompt({ seat: "supervisor" }, settings);
+      const config = roleConfig(role);
+      config.systemPrompt = renderSystemPrompt(role, settings);
       // A workspace owns the directory, so `cwd` belongs only on a bare create.
       const options: PaseoWorkspaceAgentCreateOptions = {
         config,
-        title: seatTitle({ seat: "supervisor" }, input.task),
+        title: seatTitleForRole(role, input.task),
         prompt: input.task,
       };
 
@@ -100,8 +112,15 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
 
       const roomId = agent.id;
       const title = agent.title?.trim() ?? "";
+      // Read the catalog before the first write: an unloadable or supervisor-less
+      // catalog must fail the adopt with the store untouched.
+      const settings = await deps.readSettings();
+      const role = supervisorRole(settings);
       // The chat keeps its provider, model, mode and effort. The seat record
       // describes what actually runs so the tree and live view are truthful.
+      // The model falls back to the role's: the seat schema requires non-empty
+      // text, and one empty model would make the whole `rooms.json` unloadable
+      // on the next start.
       store.addRoom({
         id: roomId,
         task: title.length > 0 ? title : "Adopted chat",
@@ -109,13 +128,17 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
         workspaceId: agent.workspaceId ?? null,
         createdAt: agent.createdAt,
       });
+      // A complete role seat, never the legacy marker: the feed, the guard and
+      // the client all read the role, and a reload must not depend on the title.
       store.addSeat({
         agentId: roomId,
         roomId,
         parentId: null,
-        marker: { seat: "supervisor" },
+        roleId: role.id,
+        roleName: role.name,
+        roleKind: role.kind,
         provider: agent.provider,
-        model: agent.model ?? "",
+        model: agent.model ?? role.model,
         title,
       });
       store.appendFeed({
@@ -128,10 +151,8 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
       });
       await store.flush();
 
-      const settings = await deps.readSettings();
-      const setup = renderSystemPrompt({ seat: "supervisor" }, settings);
       await handle.send(
-        `This chat is the Supervisor seat of an agent room. Follow this protocol and role from here on.\n\n${setup}`,
+        `This chat is the Supervisor seat of an agent room. Follow this protocol and role from here on.\n\n${renderSystemPrompt(role, settings)}`,
       );
       return { roomId };
     },

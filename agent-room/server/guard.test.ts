@@ -1,43 +1,57 @@
 import { describe, expect, it } from "vitest";
 
+import { DEFAULT_SETTINGS, roleByName, type Role } from "../shared/roles";
 import { checkSpawn } from "./guard";
+
+const roles = DEFAULT_SETTINGS.roles;
+const supervisor = roleByName("Supervisor", roles)!;
+const lead = roleByName("Lead", roles)!;
+const reviewer = roleByName("Reviewer", roles)!;
+const implementer = roleByName("Implementer", roles)!;
 
 describe("checkSpawn", () => {
   it.each([
     [null, null, true],
-    [null, { seat: "lead" }, true],
-    [{ seat: "supervisor" }, { seat: "lead" }, true],
-    [{ seat: "supervisor" }, { seat: "peer", tier: "default" }, false],
-    [{ seat: "supervisor" }, null, false],
-    [{ seat: "lead" }, { seat: "peer", tier: "cheap" }, true],
-    [{ seat: "lead" }, { seat: "lead" }, false],
-    [{ seat: "lead" }, { seat: "supervisor" }, false],
-    [{ seat: "lead" }, null, false],
-    [{ seat: "peer", tier: "default" }, { seat: "peer", tier: "default" }, false],
-    [{ seat: "peer", tier: "default" }, null, false],
-  ])("parent %j child %j → %s", (p, c, ok) => {
-    expect(checkSpawn(p as never, c as never).allowed).toBe(ok);
+    [null, supervisor, true],
+    [supervisor, lead, true],
+    [supervisor, reviewer, false],
+    [supervisor, null, false],
+    [lead, implementer, true],
+    [lead, lead, false],
+    [lead, supervisor, false],
+    [lead, null, false],
+    [reviewer, implementer, false],
+    [reviewer, null, false],
+  ])("parent %j child %j → %s", (parent, child, ok) => {
+    expect(checkSpawn(parent as never, child as never, roles).allowed).toBe(ok);
   });
 
-  it("lets any child through when the parent is not a room seat", () => {
-    for (const child of [null, { seat: "supervisor" }, { seat: "lead" }, { seat: "peer", tier: "cheap" }]) {
-      expect(checkSpawn(null, child as never)).toEqual({ allowed: true });
-    }
+  it("names the role the violator should have used", () => {
+    const fromSupervisor = checkSpawn(supervisor, null, roles);
+    const fromLead = checkSpawn(lead, null, roles);
+    const fromWorker = checkSpawn(reviewer, implementer, roles);
+
+    if (fromSupervisor.allowed || fromLead.allowed || fromWorker.allowed) throw new Error("expected denials");
+    expect(fromSupervisor.rule).toContain("Lead:");
+    expect(fromLead.rule).toContain("Implementer:");
+    expect(fromWorker.rule).toContain("creates no agents");
   });
 
-  it("names the correct marker in the broken rule", () => {
-    const supervisor = checkSpawn({ seat: "supervisor" }, null);
-    const lead = checkSpawn({ seat: "lead" }, null);
-    const peer = checkSpawn({ seat: "peer", tier: "cheap" }, { seat: "lead" });
+  it("derives denial text from the catalog, not hardcoded names", () => {
+    const catalog: Role[] = [
+      { ...supervisor, name: "Chief" },
+      { ...lead, name: "Captain" },
+      { ...implementer, name: "Builder" },
+    ];
 
-    expect(supervisor.allowed).toBe(false);
-    expect(lead.allowed).toBe(false);
-    expect(peer.allowed).toBe(false);
-    if (supervisor.allowed || lead.allowed || peer.allowed) return;
+    const fromChief = checkSpawn(catalog[0]!, null, catalog);
+    const fromCaptain = checkSpawn(catalog[1]!, null, catalog);
 
-    expect(supervisor.rule).toContain("[room:lead]");
-    expect(lead.rule).toContain("[room:peer:");
-    expect(peer.rule).toContain("[room:peer");
-    expect(peer.rule).toContain("no agents");
+    if (fromChief.allowed || fromCaptain.allowed) throw new Error("expected denials");
+    expect(fromChief.rule).toContain("Chief");
+    expect(fromChief.rule).toContain("Captain:");
+    expect(fromChief.rule).not.toContain("Lead:");
+    expect(fromCaptain.rule).toContain("Captain");
+    expect(fromCaptain.rule).toContain("Builder:");
   });
 });
