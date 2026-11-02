@@ -60,8 +60,12 @@ export function episodeFactFor(
 ): { fact: EpisodeFact; redactions: number } | null {
   // A worker's signals reach the Lead; they contribute nothing directly.
   if (roleKind !== "supervisor" && roleKind !== "lead") return null;
+  // `label` is an arbitrary string, so a plain lookup would also hit inherited
+  // Object.prototype members (`constructor`, `toString`, ...) and emit a fact
+  // whose `kind` is a function. Require an own property that maps to a string.
+  if (!Object.hasOwn(EPISODE_SIGNAL_KINDS, event.label)) return null;
   const kind = EPISODE_SIGNAL_KINDS[event.label];
-  if (kind === undefined) return null;
+  if (typeof kind !== "string") return null;
   const redacted = redactSecrets(event.text);
   // `episodeFactSchema` requires non-empty text, so a blank signal carries no fact.
   if (redacted.text.trim().length === 0) return null;

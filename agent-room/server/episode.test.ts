@@ -28,6 +28,12 @@ describe("episodeFactFor", () => {
     }
   });
 
+  it("rejects Object.prototype keys, which are not signals", () => {
+    for (const label of ["constructor", "toString", "hasOwnProperty", "__proto__"]) {
+      expect(episodeFactFor(event(label), "lead")).toBeNull();
+    }
+  });
+
   it("ignores worker turns even when the signal matches", () => {
     expect(episodeFactFor(event("DONE"), "worker")).toBeNull();
     expect(episodeFactFor(event("DONE"), undefined)).toBeNull();
