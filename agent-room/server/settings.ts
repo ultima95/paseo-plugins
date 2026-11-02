@@ -1,6 +1,6 @@
 import type { PluginSettings } from "@getpaseo/plugin/server";
 
-import { DEFAULT_SETTINGS, roomSettingsSchema, type RoomSettings } from "../shared/seats";
+import { DEFAULT_SETTINGS, roomSettingsSchema, type RoomSettings } from "../shared/roles";
 import type { Logger } from "./logger";
 
 /**
