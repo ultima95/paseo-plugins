@@ -57,6 +57,21 @@ describe("renderRoleTable", () => {
     expect(rows).toHaveLength(workers.length);
   });
 
+  it("keeps a settings-supplied useFor inside its table cell", () => {
+    const leadRole = roleByName("Lead", DEFAULT_SETTINGS.roles)!;
+    const reviewerRole = roleByName("Reviewer", DEFAULT_SETTINGS.roles)!;
+    const settings = {
+      roles: DEFAULT_SETTINGS.roles.map((role) =>
+        role.id === reviewerRole.id ? { ...role, useFor: "a|b\nc" } : role,
+      ),
+    };
+    const table = renderRoleTable(leadRole, settings);
+    expect(table).toContain("a\\|b c");
+    const workers = settings.roles.filter((role) => role.kind === "worker");
+    const rows = table.split("\n").filter((line) => line.startsWith("| ") && line.includes(":"));
+    expect(rows).toHaveLength(workers.length);
+  });
+
   it("gives a worker its own role and no agents to create", () => {
     const table = renderRoleTable(reviewer, DEFAULT_SETTINGS);
     expect(table).toContain("Reviewer");
