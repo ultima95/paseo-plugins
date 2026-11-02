@@ -83,7 +83,14 @@ export const seatRecordSchema = z
   })
   .refine((seat) => seat.marker !== undefined || seat.roleId !== undefined, {
     message: "a seat needs a marker or a role",
-  });
+  })
+  // A role id without its name and kind is a half-written record: readers would
+  // have to guess the role, and the guard would treat the seat as unmanaged.
+  .refine(
+    (seat) =>
+      seat.roleId === undefined || (seat.roleName !== undefined && seat.roleKind !== undefined),
+    { message: "a role seat needs roleName and roleKind" },
+  );
 
 export type SeatRecord = z.infer<typeof seatRecordSchema>;
 

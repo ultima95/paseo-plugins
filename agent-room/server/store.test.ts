@@ -161,6 +161,26 @@ describe("createRoomStore", () => {
     expect(log.error).toHaveBeenCalledWith("rejected invalid seat", { error: expect.any(String) });
   });
 
+  it("rejects a seat that carries a roleId without its roleName and roleKind", () => {
+    // A hand-edited or half-written record: the readers would have to guess the
+    // role, and the guard would treat the parent as unmanaged and stop archiving.
+    const s = make();
+    s.addSeat({
+      agentId: "A3",
+      roomId: "R1",
+      parentId: null,
+      roleId: "supervisor",
+      provider: "claude",
+      model: "claude-opus-5-5",
+      title: "Supervisor: x",
+    } as never);
+
+    expect(s.seat("A3")).toBeUndefined();
+    expect(log.error).toHaveBeenCalledWith("rejected invalid seat", {
+      error: expect.stringContaining("a role seat needs roleName and roleKind"),
+    });
+  });
+
   it("caps feed per room, dropping the oldest", () => {
     const s = make();
     s.addRoom(room("R"));

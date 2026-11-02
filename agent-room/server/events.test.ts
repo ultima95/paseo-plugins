@@ -312,6 +312,42 @@ describe("onCreated — membership", () => {
     expect(handleFor("I1").archive).not.toHaveBeenCalled();
   });
 
+  it("keeps a stored Lead a Lead when its title names the Supervisor", async () => {
+    // The seat recorded a lead-kind role the settings no longer list, and the
+    // parent has since been retitled `Supervisor: …`. The recorded role wins: a
+    // title may not turn a Lead into a Supervisor and stop the guard enforcing
+    // "a Lead creates workers only".
+    const retitled: SeatRecord = {
+      ...roleSeat("P1", "S1", "S1", { id: "producer", name: "Producer", kind: "lead" }),
+      title: "Supervisor: ship the migration",
+    };
+    const fake = fakeStore({ rooms: [room("S1")], seats: [retitled] });
+    const { paseo, handleFor } = fakePaseo({ P1: retitled.title });
+    const { created, ctx } = eventsWith(paseo, fake.store);
+
+    // A worker child is what a Lead may create: seated, not archived.
+    await created.onCreated(
+      { agent: agent({ id: "W1", parentAgentId: "P1", title: "Implementer: port the schema" }) },
+      ctx,
+    );
+
+    expect(fake.addSeat).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: "W1", roomId: "S1", roleId: "implementer" }),
+    );
+    expect(handleFor("W1").archive).not.toHaveBeenCalled();
+
+    // A supervisor-kind child is not: it is archived and the Lead is told why.
+    await created.onCreated(
+      { agent: agent({ id: "S2", parentAgentId: "P1", title: "Supervisor: take over" }) },
+      ctx,
+    );
+
+    expect(handleFor("S2").archive).toHaveBeenCalledTimes(1);
+    expect(handleFor("P1").send.mock.calls[0][0]).toContain(
+      "Producer may only create worker-role agents",
+    );
+  });
+
   it("places a peer the lead created in the same room", async () => {
     const { store, addSeat } = storedRoom();
     const { paseo, handleFor } = fakePaseo();

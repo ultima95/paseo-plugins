@@ -102,15 +102,18 @@ function roleFromSeat(seat: SeatRecord): Role | null {
 }
 
 /**
- * The parent's role. The catalog entry the seat recorded wins, then the role the
- * seat's title names, and last the role data the seat itself kept. A stored seat
- * outranks its title because the title is what the user sees, not what the agent
- * was launched as; the seat's own record is the fallback that keeps a role which
- * later left the settings from turning its agent unmanaged.
+ * The parent's role: stored role by id, then the role fields the seat recorded,
+ * then — last — the role its title names.
+ *
+ * What the seat recorded outranks its title because the title is what the user
+ * sees, not what the agent was launched as: a seat the user retitles
+ * `Supervisor: …` must not turn a Lead into a Supervisor, or the guard stops
+ * archiving the children a Lead may not have. The title is only the last resort,
+ * for a seat recorded before roles existed (a bare legacy marker).
  */
 function parentRole(seat: SeatRecord, settings: RoomSettings): Role | null {
   const stored = seat.roleId === undefined ? null : roleById(seat.roleId, settings.roles);
-  return stored ?? roleFromTitle(seat.title, settings) ?? roleFromSeat(seat);
+  return stored ?? roleFromSeat(seat) ?? roleFromTitle(seat.title, settings);
 }
 
 /**
