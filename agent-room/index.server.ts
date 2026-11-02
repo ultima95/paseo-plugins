@@ -10,7 +10,8 @@ import type {
 
 import { gcSettingsDefinition, type GcSettings } from "./shared/gc";
 import { adoptRoomRpc, gcRunRpc, gcStatusRpc, getRoomRpc, launchRoomRpc, listRoomsRpc } from "./shared/rpc";
-import { parseSeatMarker, roomSettings } from "./shared/seats";
+import { parseRoleTitle, roomSettings } from "./shared/roles";
+import { parseSeatMarker } from "./shared/seats";
 import { createRoomEvents, lookupTitle } from "./server/events";
 import type { ActionResult } from "./server/gc/apply";
 import { createGcSettingsReader } from "./server/gc/settings";
@@ -128,10 +129,11 @@ function tickBusyRefusal(): ActionResult[] {
  * Seat injection and room lifecycle, plus the GC.
  *
  * Every agent creation passes through `applySeat`, which only touches agents
- * whose title carries a `[room:…]` marker; everything else is returned unchanged
- * by returning `undefined`. The lifecycle hooks record room membership, enforce
- * the guard and keep the feed, and every one of them swallows its own errors:
- * a broken room must never break an agent.
+ * whose title names a configured role (`Lead: <workstream>`, or a legacy
+ * `[room:…]` marker); everything else is returned unchanged by returning
+ * `undefined`. The lifecycle hooks record room membership, enforce the guard
+ * and keep the feed, and every one of them swallows its own errors: a broken
+ * room must never break an agent.
  *
  * The GC is a second, independent contribution to the same plugin: a 60 s
  * scheduler, two RPCs and its own settings document. Nothing about it may block
@@ -268,15 +270,21 @@ export default function contribute(
   server.on("agent.archived", afterLoad("agent.archived", events.onArchived));
 
   server.before("agent.create", async ({ request }) => {
-    // Parse the seat off the title before anything awaits: an unmarked agent —
-    // which is most agents on the daemon — must not pay a settings round-trip
-    // that can stall for up to 2 s.
-    if (!parseSeatMarker(request.config.title)) return;
+    // Cheap pre-check before anything awaits: an unmarked agent — which is most
+    // agents on the daemon — must not pay a settings round-trip that can stall
+    // for up to 2 s. A role title has a colon, a legacy title has a bracket.
+    const title = request.config.title;
+    if (title === null || title === undefined) return;
+    if (!title.includes(":") && !title.trimStart().startsWith("[")) return;
     try {
-      const applied = applySeat(request, await readSettings());
+      const settings = await readSettings();
+      const known =
+        parseRoleTitle(title, settings.roles) !== null || parseSeatMarker(title) !== null;
+      if (!known) return;
+      const applied = applySeat(request, settings);
       if (!applied) return;
       if (applied.fallbackFrom !== undefined) {
-        log.warn("unknown peer tier", { tier: applied.fallbackFrom });
+        log.warn("unknown legacy peer tier", { tier: applied.fallbackFrom, role: applied.role.id });
       }
       return applied.request;
     } catch (error) {
