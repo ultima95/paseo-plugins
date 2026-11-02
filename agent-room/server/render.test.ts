@@ -106,8 +106,8 @@ describe("renderMemberSection", () => {
     const member = renderMemberSection({ name: "Lead", charter: "x", lessons: [] });
     const p = renderSystemPrompt(lead, DEFAULT_SETTINGS, "BASE", { member });
     expect(p.startsWith("BASE\n\n")).toBe(true);
-    expect(p.indexOf(PROMPTS.lead)).toBeLessThan(p.indexOf("## Member"));
-    expect(p.indexOf("## Member")).toBeLessThan(p.indexOf("## Room roles"));
+    expect(p.indexOf(PROMPTS.lead)).toBeLessThan(p.indexOf("## Member\n"));
+    expect(p.indexOf("## Member\n")).toBeLessThan(p.indexOf("## Room roles"));
   });
 
   it("keeps the newest 12 lessons and flags the drop", () => {

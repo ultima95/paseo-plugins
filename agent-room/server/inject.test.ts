@@ -225,7 +225,7 @@ describe("applySeat with members", () => {
       modeId: "bypassPermissions",
       thinkingOptionId: "medium",
     });
-    expect(r.request.config.systemPrompt).toContain("## Member");
+    expect(r.request.config.systemPrompt).toContain("## Member\n");
     expect(r.request.config.systemPrompt).toContain("Use pnpm.");
     expect(r.memberTruncated).toBe(false);
   });
@@ -237,7 +237,7 @@ describe("applySeat with members", () => {
     expect(r.member).toBeUndefined();
     expect(r.request.config.provider).toBe("claude");
     expect(r.request.config.model).toBe("claude-opus-5-5");
-    expect(r.request.config.systemPrompt).not.toContain("## Member");
+    expect(r.request.config.systemPrompt).not.toContain("## Member\n");
   });
 
   it("never looks up a worker member", () => {

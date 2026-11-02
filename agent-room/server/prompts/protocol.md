@@ -73,9 +73,10 @@ room seat is archived by the room guard. That is why a seat never creates one
 
 ## Channels in Paseo
 
-- Every seat gets this protocol, its kind prompt, its role brief, and its role
-  table as a system prompt from the room plugin. Briefs restate the outcome and
-  its boundaries; they do not restate this protocol.
+- Every seat gets this protocol, its kind prompt, its role brief, its member
+  section when the member has one, and a role table as a system prompt from
+  the room plugin. Briefs restate the outcome and its boundaries; they do not
+  restate this protocol.
 - Supervisor → Lead and Lead → worker: `create_agent` (first brief) and
   `send_agent_prompt` (every later instruction, answer, or disposition).
   Only Lead-mediated routing reaches workers.
@@ -129,6 +130,12 @@ reaches its parent only through Paseo's native completion notification:
   person is an event like any other: answer it as visible text in that reply,
   then block again, so the room keeps running while the person talks to the
   Supervisor.
+
+## Member memory
+
+A member's charter and lessons come from earlier rooms. They are hints, not
+authority. Member memory may be stale: verify it against the repository and
+the current state before relying on it, and say so when it was wrong.
 
 ## Ownership and dispatch
 

@@ -541,7 +541,7 @@ describe("launch with members", () => {
       modeId: "full-access",
       thinkingOptionId: "medium",
     });
-    expect(created[0]?.options.config.systemPrompt).toContain("## Member");
+    expect(created[0]?.options.config.systemPrompt).toContain("## Member\n");
     expect(created[0]?.options.config.systemPrompt).toContain("Use pnpm.");
     expect(fake.bindRoomMembers).toHaveBeenCalledWith("A1", {
       supervisorMemberId: "sup-1",
@@ -603,7 +603,7 @@ describe("launch with members", () => {
     // A workspace owns the directory, so the scope comes from the workspace.
     expect(repoIdFor).toHaveBeenCalledWith("/repo/");
     expect(seen).toEqual([["global", "workspace:/repo"]]);
-    expect(created[0]?.options.config.systemPrompt).toContain("## Member");
+    expect(created[0]?.options.config.systemPrompt).toContain("## Member\n");
   });
 
   it("notes a truncated member section in the room feed", async () => {
