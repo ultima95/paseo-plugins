@@ -1216,14 +1216,22 @@ describe("onTurnEnded", () => {
   });
 
   it("captures nothing from a worker turn", async () => {
+    // Both room slots are bound, so the *only* reason there is no member to write
+    // to is the worker gate: a worker's signals reach the Lead as feed rows.
     const seats = [roleSeat("W1", "S1", "L1", { id: "implementer", name: "Implementer", kind: "worker" })];
-    const { store } = fakeStore({ rooms: [room("S1")], seats });
+    const { store, appendFeed } = fakeStore({
+      rooms: [{ ...room("S1"), supervisorMemberId: "sup-1", leadMemberId: "lead-1" }],
+      seats,
+    });
     const { paseo } = fakePaseo({}, [
-      { type: "user_message", text: "work" },
-      { type: "assistant_message", text: "DONE" },
+      { item: { type: "user_message", text: "work" } },
+      { item: { type: "assistant_message", text: "DONE" } },
     ]);
     const { created, ctx } = eventsWith(paseo, store, undefined, {
-      members: fakeMembers({ "lead-1": member({ id: "lead-1", role: "lead" }) }),
+      members: fakeMembers({
+        "sup-1": member(),
+        "lead-1": member({ id: "lead-1", name: "Lin", role: "lead" }),
+      }),
       repoIdFor: async () => null,
     });
 
@@ -1237,7 +1245,59 @@ describe("onTurnEnded", () => {
       ctx,
     );
 
+    // Without these two the test would pass on a fixture the handler could not
+    // read: the turn must have been processed, and its rows must have landed.
+    expect(log.error).not.toHaveBeenCalled();
+    expect(appendFeed).toHaveBeenCalledTimes(2);
+    expect(appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        roomId: "S1",
+        kind: "message",
+        from: "L1",
+        to: "W1",
+        label: "instruction",
+        text: "work",
+      }),
+    );
+    expect(appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({ roomId: "S1", from: "W1", to: "L1", label: "DONE", text: "DONE" }),
+    );
     expect(appendEpisode).not.toHaveBeenCalled();
+  });
+
+  it("writes no episode for a bound member the store cannot resolve", async () => {
+    const { store, appendFeed } = storedRoom();
+    store.room("S1")!.room.supervisorMemberId = "gone";
+    const { paseo } = fakePaseo({}, [
+      { item: { type: "assistant_message", text: "DONE: migrated the schema" } },
+    ]);
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({}),
+      repoIdFor: async () => null,
+    });
+
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "S1", title: "Supervisor: fix auth" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+
+    // No orphan episode: the binding outlived its member.
+    expect(appendEpisode).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith(
+      "member missing; captured no episode",
+      expect.objectContaining({ memberId: "gone", roomId: "S1", agentId: "S1" }),
+    );
+    // The turn is still the room's record: one message row and no extra note.
+    expect(appendFeed).toHaveBeenCalledTimes(1);
+    expect(appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({ roomId: "S1", kind: "message", label: "DONE" }),
+    );
+    expect(log.error).not.toHaveBeenCalled();
   });
 
   it("redacts an obvious credential before storing the fact", async () => {
@@ -1373,6 +1433,35 @@ describe("onArchived", () => {
       kind: "outcome",
       text: "room ended: fix auth",
     });
+  });
+
+  it("redacts a credential in the room's outcome fact", async () => {
+    // The task is the user's own words; spec §9 strips obvious secrets before any
+    // memory line is written, and the closing outcome fact is no exception.
+    const { store } = fakeStore({
+      rooms: [
+        { ...room("S1"), task: "rotate the sk-live-abcdefgh12345 key", supervisorMemberId: "sup-1" },
+      ],
+      seats: [roleSeat("S1", "S1", null, SUPERVISOR)],
+    });
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => null,
+    });
+
+    await created.onArchived(
+      { agent: agent({ id: "S1" }), archivedAt: "2026-11-02T12:00:00.000Z" },
+      ctx,
+    );
+
+    const fact = appendEpisode.mock.calls[0]?.[2];
+    expect(fact?.text).toContain("[redacted]");
+    expect(fact?.text).not.toContain("sk-live-abcdefgh12345");
+    expect(log.warn).toHaveBeenCalledWith(
+      "redacted secrets in member memory",
+      expect.objectContaining({ memberId: "sup-1", roomId: "S1", redactions: 1 }),
+    );
   });
 
   it("stamps a promoted lesson with the injected clock", async () => {

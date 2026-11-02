@@ -10,7 +10,7 @@ import type { SeatRecord } from "../shared/room";
 import { GUARD_ROW_KIND, GUARD_ROW_VERSION } from "../shared/room";
 import { parseRoleTitle, roleForLegacyMarker, type Role, type RoomSettings } from "../shared/roles";
 import { parseSeatMarker, type SeatMarker } from "../shared/seats";
-import { candidatesFromFacts, episodeFactFor } from "./episode";
+import { candidatesFromFacts, episodeFactFor, redactSecrets } from "./episode";
 import { feedFromTurn } from "./feed";
 import { checkSpawn } from "./guard";
 import type { Logger } from "./logger";
@@ -491,12 +491,34 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
             ? room.leadMemberId
             : null;
 
+    // A binding can outlive its member: the archive path checks, and so must this
+    // one, or the turn leaves an episode in a file nothing will ever read. The
+    // lookup is lazy and memoised, so a turn with no signal pays nothing and a
+    // missing member costs one warning rather than a feed row per turn.
+    let memberPresent: boolean | null = null;
+    const memberExists = (id: string): boolean => {
+      if (memberPresent === null) {
+        memberPresent = deps.members.get(id) !== undefined;
+        if (!memberPresent) {
+          log.warn("member missing; captured no episode", {
+            memberId: id,
+            roomId: seat.roomId,
+            agentId: agent.id,
+          });
+        }
+      }
+      return memberPresent;
+    };
+
     for (const draft of feedFromTurn({ agent: seat, childIds, timeline })) {
       const stored = store.appendFeed({ roomId: seat.roomId, ...draft });
       if (memberId === null) continue;
       // The signal decides: only the five the protocol carries become facts.
       const captured = episodeFactFor(stored, seat.roleKind);
       if (captured === null) continue;
+      // The room's feed row above is already the record of this turn, so a
+      // missing member only skips the memory write.
+      if (!memberExists(memberId)) continue;
       if (captured.redactions > 0) {
         log.warn("redacted secrets in member memory", {
           memberId,
@@ -508,10 +530,18 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
     }
   };
 
-  /** What a closed room leaves in a member's memory: the task it ended on. */
-  const outcomeText = (task: string, roomId: string): string => {
+  /**
+   * What a closed room leaves in a member's memory: the task it ended on. The
+   * task is the user's own words and memory is read back for years, so an
+   * obvious credential is stripped here as strictly as on the turn-end path
+   * (spec §9: redaction happens before any memory line is written). Redaction
+   * runs first: capping first could cut a token down to a shape no pattern
+   * matches, which would leave the front half of a key in memory.
+   */
+  const outcomeText = (task: string, roomId: string): { text: string; redactions: number } => {
     const named = task.trim().length > 0 ? task.trim() : roomId;
-    return `room ended: ${named}`.slice(0, OUTCOME_TEXT_CAP);
+    const redacted = redactSecrets(`room ended: ${named}`);
+    return { text: redacted.text.slice(0, OUTCOME_TEXT_CAP), redactions: redacted.redactions };
   };
 
   const handleArchived = async (agent: PluginHookAgent, archivedAt: string): Promise<void> => {
@@ -548,10 +578,19 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
         continue;
       }
 
+      const outcome = outcomeText(found.room.task, found.room.id);
+      if (outcome.redactions > 0) {
+        log.warn("redacted secrets in member memory", {
+          memberId,
+          roomId: found.room.id,
+          redactions: outcome.redactions,
+        });
+      }
+
       await deps.members.appendEpisode(memberId, found.room.id, {
         at: archivedAt,
         kind: "outcome",
-        text: outcomeText(found.room.task, found.room.id),
+        text: outcome.text,
       });
 
       // Only this room's facts: a member's memory spans every room it sat in.
