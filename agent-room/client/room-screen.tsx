@@ -7,6 +7,7 @@ import { Pressable, ScrollView, Text, View } from "react-native";
 import type { MemberRecord } from "../shared/member";
 import type { SeatRecord } from "../shared/room";
 import { getRoomRpc, memberListRpc } from "../shared/rpc";
+import { MEMBERS_QUERY_KEY, MEMBERS_REFETCH_MS } from "./queries";
 import type { Surface, Theme } from "./seat-editor";
 import { ActionButton, Section, describeError, paddingFor } from "./seat-editor";
 import type { FeedRow } from "./view-model";
@@ -19,9 +20,6 @@ const POLL_INTERVAL_MS = 2000;
 function roomQueryKey(roomId: string): string[] {
   return ["agent-room", "room", roomId];
 }
-
-/** The member list is one entry for every room: a seat names its member from it. */
-const MEMBERS_QUERY_KEY = ["agent-room", "members"];
 
 /** Whatever the host calls to show an agent. Absent on hosts without navigation. */
 type OpenAgent = (input: { agentId: string }) => void;
@@ -175,12 +173,13 @@ export function RoomScreen(props: PluginScreenProps) {
 
   // Which member a seat stands for is a fact about the room, read from the
   // member store. A failed read is not this screen's error: the seats still
-  // draw, only without the member line.
+  // draw, only without the member line. The key is shared with the Members and
+  // Rooms screens, so one read serves every screen that names a member.
   const membersQuery = useQuery({
     queryKey: MEMBERS_QUERY_KEY,
     queryFn: () => listMembers({}),
     enabled: roomId.length > 0,
-    refetchInterval: POLL_INTERVAL_MS,
+    refetchInterval: MEMBERS_REFETCH_MS,
   });
   const members: MemberRecord[] = membersQuery.data?.members ?? [];
 

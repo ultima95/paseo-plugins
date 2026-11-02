@@ -1,5 +1,6 @@
 import { useRpc } from "@getpaseo/plugin/client";
 import type { PluginScreenProps } from "@getpaseo/plugin/client";
+import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
 
@@ -20,6 +21,7 @@ import {
   memberPendingRpc,
   memberSaveRpc,
 } from "../shared/rpc";
+import { MEMBERS_QUERY_KEY } from "./queries";
 import type { SeatDraft, SeatPatch } from "./settings-draft";
 import type { Surface } from "./seat-editor";
 import {
@@ -71,9 +73,12 @@ function stockRole(role: MemberRole): Role {
   return role === "supervisor" ? SUPERVISOR_ROLE : LEAD_ROLE;
 }
 
-/** The stock seat, copied: the draft's features must never be the stock ones. */
+/**
+ * The stock seat, as a fresh object: `roleSeat` builds one, so a draft never
+ * shares the stock role's seat (or its features) and cannot mutate it.
+ */
 function stockSeat(role: MemberRole): SeatDraft {
-  return { ...roleSeat(stockRole(role)) };
+  return roleSeat(stockRole(role));
 }
 
 function draftFrom(member: MemberRecord): Draft {
@@ -304,17 +309,27 @@ export function MemberScreen(props: PluginScreenProps) {
   /** Orders overlapping reads of a member: the newest answer is the one applied. */
   const latestRead = useRef(0);
 
+  /** The shared `["agent-room", "members"]` entry the Rooms and Room screens read. */
+  const queryClient = useQueryClient();
+
   const refreshList = useCallback(async (): Promise<void> => {
+    // The button's busy label hangs off this, so it is set for every read, not
+    // only the first one.
+    setListLoading(true);
     try {
       const result = await listMembers({});
       setMembers(result.members);
       setListError("");
+      // A screen that reads the same list through the query cache (the Rooms
+      // launch pickers, a room tree) would otherwise keep the list it mounted
+      // with; a read that succeeded here is the fresher answer.
+      await queryClient.invalidateQueries({ queryKey: MEMBERS_QUERY_KEY });
     } catch (caught) {
       setListError(describeError(caught));
     } finally {
       setListLoading(false);
     }
-  }, [listMembers]);
+  }, [listMembers, queryClient]);
 
   /** Seed the editor from one answer. A missing member has nothing to edit. */
   const applyDetail = useCallback((result: Membership): void => {
@@ -358,6 +373,10 @@ export function MemberScreen(props: PluginScreenProps) {
 
   useEffect(() => {
     if (selectedId.length === 0) {
+      // An empty selection owns the editor — no member, or a new-member draft.
+      // A read for the member selected before it is superseded here, so its
+      // answer can never land in the draft (and give it that member's id).
+      latestRead.current += 1;
       setDetail(null);
       setDetailError("");
       setDetailLoading(false);
@@ -384,11 +403,18 @@ export function MemberScreen(props: PluginScreenProps) {
     clearMessages();
   }
 
-  function startNewMember(role: MemberRole = "supervisor"): void {
+  /**
+   * Start a draft of a new member. Any read of the member selected before it is
+   * superseded: its answer must not replace this draft, which would hand the
+   * draft that member's id and make a later save overwrite it.
+   */
+  function startNewMember(): void {
+    latestRead.current += 1;
     setSelectedId("");
     setDetail(null);
     setDetailError("");
-    setDraft(emptyDraft(role));
+    setDetailLoading(false);
+    setDraft(emptyDraft("supervisor"));
     setCharterText("");
     clearMessages();
   }
@@ -657,6 +683,10 @@ export function MemberScreen(props: PluginScreenProps) {
               setDraft((current) => (current === null ? current : { ...current, seat: patchSeat(current.seat, patch) }))
             }
           />
+          <Text style={muted}>
+            Stored feature values are kept unless the model changes. A member has no launch directory to
+            ask about, so its features are not listed here.
+          </Text>
 
           {catalog.loading ? <Text style={muted}>Loading providers…</Text> : null}
           {catalog.error ? <Text style={warning}>{catalog.error}</Text> : null}
