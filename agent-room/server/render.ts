@@ -1,16 +1,16 @@
-import { formatMarker, seatConfigFor, type RoomSettings, type SeatMarker } from "../shared/seats";
+import { roleSeat, type Role, type RoomSettings } from "../shared/roles";
 
 import { PROMPTS } from "./prompts/generated";
 
-/** The seat rules are the last thing a seat reads, so they stay in view. */
-const SEAT_TABLE_HEADING = "## Room seats";
+/** The role rules are the last thing a seat reads, so they stay in view. */
+const ROLE_TABLE_HEADING = "## Room roles";
 
 function code(value: string): string {
   return `\`${value}\``;
 }
 
-function providerModel(provider: string, model: string): string {
-  return code(`${provider}/${model}`);
+function providerModel(role: Role): string {
+  return code(`${role.provider}/${role.model}`);
 }
 
 /** Keep a settings-supplied `useFor` inside its table cell. */
@@ -18,77 +18,76 @@ function tableCell(text: string): string {
   return text.replace(/\r?\n/g, " ").replace(/\|/g, "\\|");
 }
 
-const ROLE_PROMPTS = {
+const KIND_PROMPTS = {
   supervisor: PROMPTS.supervisor,
   lead: PROMPTS.lead,
-  peer: PROMPTS.peer,
+  worker: PROMPTS.peer,
 } as const;
 
 /**
- * What this seat may create, and on which seat. The plugin forces the seat's
- * provider, model, mode and thinking level from the title marker, so the table
- * is the whole routing rule a seat needs.
+ * What this role may create, and on which seat. The plugin resolves the role
+ * named in the child's title and forces its provider, model, mode and thinking
+ * level, so the table is the whole routing rule a seat needs.
  */
-export function renderSeatTable(marker: SeatMarker, settings: RoomSettings): string {
-  switch (marker.seat) {
-    case "supervisor": {
-      const lead = settings.lead;
-      return [
-        SEAT_TABLE_HEADING,
-        "",
-        "You create Leads, and nothing else. Every Lead is titled `[room:lead] <workstream>`; the marker selects the Lead seat, so never title a Lead without it.",
-        "",
-        "| Seat you create | Title marker | Provider / model |",
-        "|---|---|---|",
-        `| Lead | ${code(formatMarker({ seat: "lead" }))} | ${providerModel(lead.provider, lead.model)} |`,
-        "",
-        "Never launch a Peer directly, and never launch an agent whose title carries no marker: an unmarked child of a room seat is archived by the room guard.",
-      ].join("\n");
-    }
-    case "lead": {
-      const rows = settings.peerTiers.map(
-        (tier) =>
-          `| ${tier.id} | ${code(formatMarker({ seat: "peer", tier: tier.id }))} | ${providerModel(tier.provider, tier.model)} | ${tableCell(tier.useFor)} |`,
-      );
-      return [
-        SEAT_TABLE_HEADING,
-        "",
-        "You create Peers, and nothing else. Every Peer is titled `[room:peer:<tier>] <bounded outcome>` with a tier from this table; the marker selects the seat, so never title a Peer without it.",
-        "",
-        "| Tier | Title marker | Provider / model | Use for |",
-        "|---|---|---|---|",
-        ...rows,
-        "",
-        "A tier that is not in this table does not exist. Leave `settings` off the `create_agent` call: the seat sets mode and thinking level itself.",
-      ].join("\n");
-    }
-    case "peer": {
-      const { config, fallbackFrom } = seatConfigFor(marker, settings);
-      const seat = providerModel(config.provider, config.model);
-      const tierLine =
-        fallbackFrom === undefined
-          ? `- your tier: ${code(marker.tier)} (${seat})`
-          : `- your tier: ${code(marker.tier)} — not a configured tier; the room runs this seat on the ${code("default")} tier (${seat})`;
-      return [SEAT_TABLE_HEADING, "", tierLine, "- you create no agents"].join("\n");
-    }
+export function renderRoleTable(role: Role, settings: RoomSettings): string {
+  if (role.kind === "supervisor") {
+    const leads = settings.roles.filter((candidate) => candidate.kind === "lead");
+    return [
+      ROLE_TABLE_HEADING,
+      "",
+      `You create Lead agents, and nothing else. A child is titled \`${leads[0]?.name ?? "Lead"}: <workstream>\`.`,
+      "",
+      "| Role you create | Title | Provider / model |",
+      "|---|---|---|",
+      ...leads.map((lead) => `| ${lead.name} | ${code(`${lead.name}: <workstream>`)} | ${providerModel(lead)} |`),
+      "",
+      "Never launch a worker role directly, and never launch an agent whose title carries no role: an unmarked child of a room seat is archived by the room guard.",
+    ].join("\n");
   }
+
+  if (role.kind === "lead") {
+    const workers = settings.roles.filter((candidate) => candidate.kind === "worker");
+    return [
+      ROLE_TABLE_HEADING,
+      "",
+      `You create worker-role agents, and nothing else. A child is titled \`${workers[0]?.name ?? "Implementer"}: <bounded outcome>\`.`,
+      "",
+      "| Role | Title | Provider / model | Use for |",
+      "|---|---|---|---|",
+      ...workers.map(
+        (worker) =>
+          `| ${worker.name} | ${code(`${worker.name}: <outcome>`)} | ${providerModel(worker)} | ${tableCell(worker.useFor)} |`,
+      ),
+      "",
+      "A role that is not in this table does not exist. Leave `settings` off the `create_agent` call: the role sets mode and thinking level itself.",
+    ].join("\n");
+  }
+
+  const seat = roleSeat(role);
+  return [
+    ROLE_TABLE_HEADING,
+    "",
+    `- your role: ${code(role.name)} (${code(`${seat.provider}/${seat.model}`)})`,
+    "- you create no agents",
+  ].join("\n");
 }
 
 /**
- * The seat's system prompt: the shared protocol, its own role, then the seat
- * table. An existing system prompt is kept in front of all of it rather than
- * replaced.
+ * The seat's system prompt: the shared protocol, its kind's role, the role
+ * brief, then the role table. An existing system prompt is kept in front of
+ * all of it rather than replaced.
  */
 export function renderSystemPrompt(
-  marker: SeatMarker,
+  role: Role,
   settings: RoomSettings,
   existing?: string,
 ): string {
   const parts = [
     existing ?? "",
     PROMPTS.protocol,
-    ROLE_PROMPTS[marker.seat],
-    renderSeatTable(marker, settings),
+    KIND_PROMPTS[role.kind],
+    role.brief ?? "",
+    renderRoleTable(role, settings),
   ];
   return parts
     .map((part) => part.trim())

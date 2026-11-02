@@ -51,9 +51,10 @@ describe("room prompts", () => {
       expect(PROMPTS.protocol).toContain(s);
   });
 
-  it("roles name the room markers", () => {
-    expect(PROMPTS.supervisor).toContain("[room:lead]");
-    expect(PROMPTS.lead).toContain("[room:peer:");
+  it("roles use the role-title grammar, never the old markers", () => {
+    expect(PROMPTS.supervisor).toContain("`Lead: <workstream>`");
+    expect(PROMPTS.lead).toContain("`<WorkerRole>: <outcome>`");
+    for (const text of Object.values(PROMPTS)) expect(text).not.toContain("[room:");
   });
 
   it("protocol opens with a markdown heading", () => {
