@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
 
 import type { RoomRecord } from "../shared/room";
+import type { RoleKind } from "../shared/roles";
 import { DEFAULT_SETTINGS, roomSettings } from "../shared/roles";
 import { launchRoomRpc, listRoomsRpc } from "../shared/rpc";
 import { LaunchForm, useLaunchTarget } from "./launch-form";
@@ -227,7 +228,12 @@ export function RoomsScreen(props: PluginScreenProps) {
       roleName={role.name}
       roleKind={role.kind}
       onNameChange={(text) => changeRole(role.id, { name: text })}
-      onKindChange={(kind) => changeRole(role.id, { kind })}
+      // Only a worker can change kind. The supervisor and the lead are single,
+      // required roles, so offering them a Kind control would only let a user
+      // press a chip that `setRole` refuses.
+      {...(role.kind === "worker"
+        ? { onKindChange: (kind: RoleKind) => changeRole(role.id, { kind }) }
+        : {})}
       brief={role.brief}
       onBriefChange={(text) => changeRole(role.id, { brief: text })}
       onRemove={role.kind === "worker" ? () => removeRoleRow(role.id) : undefined}

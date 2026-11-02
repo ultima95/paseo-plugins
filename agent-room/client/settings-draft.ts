@@ -70,11 +70,27 @@ function providerMoved(seat: SeatDraft, provider: string | undefined): boolean {
 }
 
 /**
+ * The room needs exactly one supervisor, at least one lead and at least one
+ * worker. A kind change is the only edit that can break this, and a broken
+ * draft is unsavable, so the change is refused instead of recorded.
+ */
+function kindsValid(roles: readonly RoleDraft[]): boolean {
+  const count = (kind: RoleKind): number => roles.filter((role) => role.kind === kind).length;
+  return count("supervisor") === 1 && count("lead") >= 1 && count("worker") >= 1;
+}
+
+/**
  * Patch one role: its seat, or the fields a title and a prompt read.
  *
  * The id never changes here. Agent titles resolve a role by its name, and the
  * stored record keys the role by id, so a rename that also moved the id would
  * orphan every title already out there.
+ *
+ * Two edits are normalized here rather than left to the screen. A kind change
+ * that would leave the room without its one supervisor, or with no lead or no
+ * worker, is refused: such a draft cannot be saved, and `removeRole` would then
+ * happily drop the stranded row. An empty brief is stored as no brief at all,
+ * so clearing the field is how a brief is removed.
  */
 export function setRole(draft: RoomDraft, id: string, patch: RolePatch): RoomDraft {
   const index = draft.roles.findIndex((role) => role.id === id);
@@ -85,21 +101,22 @@ export function setRole(draft: RoomDraft, id: string, patch: RolePatch): RoomDra
     ? changeProvider(current, patch.provider as string)
     : current;
   const merged = mergeSeat(base, patch);
+  // `""` means the user cleared the field, and there is no room for an empty
+  // brief: it would either ride along into a prompt or fail the schema.
+  const brief =
+    patch.brief === "" ? undefined : patch.brief !== undefined ? patch.brief : current.brief;
   const next: RoleDraft = {
     ...merged,
     id: current.id,
     name: patch.name ?? current.name,
     kind: patch.kind ?? current.kind,
     useFor: patch.useFor ?? current.useFor,
-    ...(patch.brief !== undefined
-      ? { brief: patch.brief }
-      : current.brief !== undefined
-        ? { brief: current.brief }
-        : {}),
+    ...(brief !== undefined ? { brief } : {}),
   };
 
   const roles = draft.roles.slice();
   roles[index] = next;
+  if (!kindsValid(roles)) return draft;
   return { ...draft, roles };
 }
 

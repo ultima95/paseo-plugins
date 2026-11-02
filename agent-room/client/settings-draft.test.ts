@@ -129,6 +129,34 @@ describe("setRole", () => {
     expect("brief" in roleById(next, "implementer")).toBe(false);
   });
 
+  it("drops the brief when the field is cleared", () => {
+    const next = setRole(draft, "reviewer", { brief: "" });
+
+    expect("brief" in roleById(next, "reviewer")).toBe(false);
+    expect(parses(next)).toBe(true);
+  });
+
+  it("refuses to demote the only supervisor", () => {
+    expect(setRole(draft, "supervisor", { kind: "worker" })).toBe(draft);
+    expect(setRole(draft, "supervisor", { kind: "lead" })).toBe(draft);
+  });
+
+  it("refuses to demote the only lead", () => {
+    expect(setRole(draft, "lead", { kind: "worker" })).toBe(draft);
+    expect(setRole(draft, "lead", { kind: "supervisor" })).toBe(draft);
+  });
+
+  it("allows promoting a worker to lead", () => {
+    const next = setRole(draft, "reviewer", { kind: "lead" });
+
+    expect(roleById(next, "reviewer").kind).toBe("lead");
+    expect(parses(next)).toBe(true);
+  });
+
+  it("refuses to demote the last worker", () => {
+    expect(setRole(oneWorkerDraft, "implementer", { kind: "lead" })).toBe(oneWorkerDraft);
+  });
+
   it("returns the draft unchanged for an unknown role", () => {
     expect(setRole(draft, "missing", { useFor: "x" })).toBe(draft);
   });
