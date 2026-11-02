@@ -139,6 +139,21 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
         store.bindRoomMembers(roomId, {
           supervisorMemberId: supervisorMember?.id ?? null,
           leadMemberId: leadMember?.id ?? null,
+          // What each bound member runs. `agent.created` has no model for the
+          // agent it records and falls back to the catalog role's, so if the hook
+          // runs before this bind the seat is corrected here; if it runs after,
+          // it reads the binding and records the member's model itself.
+          ...(supervisorMember !== null
+            ? {
+                supervisorSeat: {
+                  provider: supervisorMember.provider,
+                  model: supervisorMember.model,
+                },
+              }
+            : {}),
+          ...(leadMember !== null
+            ? { leadSeat: { provider: leadMember.provider, model: leadMember.model } }
+            : {}),
         });
         if (memberSection?.truncated === true) {
           store.appendFeed({

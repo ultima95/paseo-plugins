@@ -543,9 +543,12 @@ describe("launch with members", () => {
     });
     expect(created[0]?.options.config.systemPrompt).toContain("## Member\n");
     expect(created[0]?.options.config.systemPrompt).toContain("Use pnpm.");
+    // The member's own seat travels with the binding: `agent.created` may have
+    // written the Supervisor's seat from the catalog before this bind lands.
     expect(fake.bindRoomMembers).toHaveBeenCalledWith("A1", {
       supervisorMemberId: "sup-1",
       leadMemberId: null,
+      supervisorSeat: { provider: "codex", model: "gpt-5.6-sol" },
     });
     // Nothing truncated, so the feed stays clean.
     expect(fake.appendFeed).not.toHaveBeenCalled();
@@ -624,6 +627,7 @@ describe("launch with members", () => {
     expect(fake.bindRoomMembers).toHaveBeenCalledWith("A1", {
       supervisorMemberId: "sup-1",
       leadMemberId: null,
+      supervisorSeat: { provider: "codex", model: "gpt-5.6-sol" },
     });
     expect(fake.appendFeed).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -647,8 +651,9 @@ describe("launch with members", () => {
       thinkingOptionId: undefined,
     });
     const { paseo, created } = fakePaseo();
+    const fake = fakeStore();
     const handlers = createHandlers({
-      store: fakeStore().store,
+      store: fake.store,
       readSettings: async () => DEFAULT_SETTINGS,
       members: fakeMembers([member(), lead]),
       repoIdFor: async () => null,
@@ -663,6 +668,14 @@ describe("launch with members", () => {
     // The Lead row shows the member's seat instead of the Lead role's.
     expect(prompt).toContain("codex/gpt-5.5-lead");
     expect(prompt).not.toContain("claude/claude-opus-5-5");
+    // Both slots travel with their own seat, so either order of `agent.created`
+    // and this bind leaves a truthful seat behind.
+    expect(fake.bindRoomMembers).toHaveBeenCalledWith("A1", {
+      supervisorMemberId: "sup-1",
+      leadMemberId: "lead-1",
+      supervisorSeat: { provider: "codex", model: "gpt-5.6-sol" },
+      leadSeat: { provider: "codex", model: "gpt-5.5-lead" },
+    });
   });
 
   it("refuses a member whose role does not match the slot", async () => {

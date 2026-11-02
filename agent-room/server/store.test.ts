@@ -280,6 +280,73 @@ describe("createRoomStore", () => {
     });
   });
 
+  it("corrects the supervisor's seat when the binding lands after the seat", async () => {
+    const s = make();
+    s.addRoom(room("R"));
+    // `agent.created` ran first: it has no model for the agent, so the seat
+    // carries the catalog role's `claude-opus-5-5`, not the member's model.
+    s.addSeat(roleSeat("R", "R", null, SUPERVISOR));
+
+    s.bindRoomMembers("R", {
+      supervisorMemberId: "sup-1",
+      supervisorSeat: { provider: "claude", model: "claude-opus-5-6" },
+    });
+
+    expect(s.seat("R")).toMatchObject({
+      roleId: "supervisor",
+      provider: "claude",
+      model: "claude-opus-5-6",
+    });
+
+    // The correction is durable, not only in memory.
+    await s.flush();
+    const b = make();
+    await b.load();
+    expect(b.seat("R")?.model).toBe("claude-opus-5-6");
+  });
+
+  it("corrects the lead's seat when the binding lands after the seat", () => {
+    const s = make();
+    s.addRoom(room("R"));
+    s.addSeat(roleSeat("R", "R", null, SUPERVISOR));
+    s.addSeat(roleSeat("L", "R", "R", LEAD));
+
+    s.bindRoomMembers("R", {
+      leadMemberId: "lead-1",
+      leadSeat: { provider: "claude", model: "gpt-5.5-lead" },
+    });
+
+    expect(s.seat("L")).toMatchObject({ roleKind: "lead", model: "gpt-5.5-lead" });
+    // Only the slot that was bound moves: the supervisor keeps the catalog model.
+    expect(s.seat("R")?.model).toBe("claude-opus-5-5");
+  });
+
+  it("keeps the catalog model on a seat the bound member does not run", () => {
+    const s = make();
+    s.addRoom(room("R"));
+    // The room's lead member runs `codex`; this Lead seat is a catalog `claude`
+    // one, so the member's model would be a lie on it.
+    s.addSeat(roleSeat("L", "R", "R", LEAD));
+
+    s.bindRoomMembers("R", {
+      leadMemberId: "lead-1",
+      leadSeat: { provider: "codex", model: "gpt-5.5-lead" },
+    });
+
+    expect(s.seat("L")?.model).toBe("claude-opus-5-5");
+  });
+
+  it("leaves a seat the room bound no member to alone", () => {
+    const s = make();
+    s.addRoom(room("R"));
+    s.addSeat(roleSeat("R", "R", null, SUPERVISOR));
+
+    // A launch with no member binds nulls and has no seat to offer.
+    s.bindRoomMembers("R", { supervisorMemberId: null, leadMemberId: null });
+
+    expect(s.seat("R")?.model).toBe("claude-opus-5-5");
+  });
+
   it("keeps member ids across a reload", async () => {
     const a = make();
     a.addRoom(room("R"));

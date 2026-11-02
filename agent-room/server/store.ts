@@ -18,6 +18,29 @@ import {
 } from "../shared/room";
 import type { Logger } from "./logger";
 
+/**
+ * What a bound member actually runs: the seat the member would be launched on.
+ *
+ * `agent.created` cannot read an agent's model (`PluginHookAgent` has none), so
+ * it records the catalog role's model, and only the launch knows the member's.
+ * Passing it here is what lets the store correct a seat the hook wrote before
+ * the binding landed.
+ */
+export interface RoomMemberSeat {
+  provider: string;
+  model: string;
+}
+
+/** One launch's member bindings: the member ids, plus the seats they run. */
+export interface RoomMemberBinding {
+  supervisorMemberId?: string | null;
+  leadMemberId?: string | null;
+  /** The bound Supervisor member's seat; absent when the launch bound none. */
+  supervisorSeat?: RoomMemberSeat;
+  /** The bound Lead member's seat; absent when the launch bound none. */
+  leadSeat?: RoomMemberSeat;
+}
+
 export interface RoomStore {
   /**
    * Read `rooms.json`; a missing file is empty, a corrupt one is empty plus one
@@ -39,14 +62,13 @@ export interface RoomStore {
   appendFeed(event: Omit<FeedEvent, "id" | "at"> & { at?: string }): FeedEvent;
   endRoom(roomId: string): void;
   /**
-   * Bind the room's Supervisor and Lead members. Order-independent: a call
-   * before the room exists is merged by `addRoom`, because `room.launch`
-   * cannot know whether `agent.created` has run yet.
+   * Bind the room's Supervisor and Lead members. Order-independent in both
+   * directions: a call before the room exists is merged by `addRoom`, and a call
+   * after the room also corrects the seat `agent.created` already wrote from the
+   * catalog, using the bound member's own seat, because `room.launch` cannot know
+   * whether the hook has run yet.
    */
-  bindRoomMembers(
-    roomId: string,
-    binding: { supervisorMemberId?: string | null; leadMemberId?: string | null },
-  ): void;
+  bindRoomMembers(roomId: string, binding: RoomMemberBinding): void;
   /** True when the load migrated a v1 document; drives the one-time member seed. */
   migratedFromV1(): boolean;
   /** Newest first by `createdAt`. */
@@ -241,10 +263,36 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
     scheduleWrite();
   };
 
-  const bindRoomMembers = (
+  /**
+   * Give the room's seat of `kind` the model the bound member actually runs.
+   *
+   * The seat is written by `agent.created`, which has no model for the agent and
+   * therefore records the catalog role's. Whichever of the two lands second must
+   * leave the seat describing what runs, so a binding that arrives after the seat
+   * fixes it here rather than leaving the member's seat claiming the catalog
+   * model forever.
+   *
+   * The provider check is the one `agent.created` applies when it resolves a
+   * seat's model: a launch that names a member runs that member's provider, so a
+   * seat on a different provider was created on the catalog role and keeps the
+   * catalog model. Only a seat from the member's own provider is corrected.
+   */
+  const correctSeat = (
     roomId: string,
-    binding: { supervisorMemberId?: string | null; leadMemberId?: string | null },
+    kind: "supervisor" | "lead",
+    memberId: string | null,
+    bound: RoomMemberSeat | undefined,
   ): void => {
+    if (memberId === null || bound === undefined) return;
+    for (const candidate of seats) {
+      if (candidate.roomId !== roomId) continue;
+      if (candidate.roleKind !== kind) continue;
+      if (candidate.provider !== bound.provider) continue;
+      candidate.model = bound.model;
+    }
+  };
+
+  const bindRoomMembers = (roomId: string, binding: RoomMemberBinding): void => {
     const current = pendingBindings.get(roomId) ?? {
       supervisorMemberId: null,
       leadMemberId: null,
@@ -263,6 +311,9 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
     if (target !== undefined) {
       target.supervisorMemberId = next.supervisorMemberId;
       target.leadMemberId = next.leadMemberId;
+      // The seat may already exist: `agent.created` can run before this binding.
+      correctSeat(roomId, "supervisor", next.supervisorMemberId, binding.supervisorSeat);
+      correctSeat(roomId, "lead", next.leadMemberId, binding.leadSeat);
       scheduleWrite();
     }
   };

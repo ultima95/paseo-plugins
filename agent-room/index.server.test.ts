@@ -796,6 +796,62 @@ describe("agent-room server contribution", () => {
     await expect(create(launched)).resolves.toBeUndefined();
   });
 
+  it("keeps a member-seated Supervisor's seat truthful when agent.created lands first", async () => {
+    await seedMember();
+    const { invoke, hooks, cleanup } = contributeWith(
+      readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
+    );
+
+    // No repository here: only the launch's member section asks for one.
+    const dir = home;
+    const context = { paseo: {} as PaseoApi, signal: new AbortController().signal };
+    const created: PaseoAgentCreateOptions[] = [];
+    const paseo = {
+      agents: {
+        // The daemon fires `agent.created` before `create` resolves, so the seat
+        // is written before `room.launch` gets the id it can bind the member to.
+        create: vi.fn(async (options: PaseoAgentCreateOptions) => {
+          created.push(options);
+          await hooks["agent.created"](
+            {
+              agent: hookAgent({
+                id: "A1",
+                // The member's own provider: the launch created the agent on it.
+                provider: "opencode",
+                cwd: dir,
+                title: "Supervisor: fix auth",
+              }),
+            },
+            context,
+          );
+          return { id: "A1" };
+        }),
+      },
+      workspaces: { list: vi.fn(async () => ({ entries: [] })) },
+    } as unknown as PaseoApi;
+
+    await invoke("room.launch")(
+      { task: "Fix the room", cwd: dir, supervisorMemberId: "mem-1" },
+      { paseo },
+    );
+
+    const detail = (await invoke("room.get")({ roomId: "A1" }, {})) as {
+      room: { supervisorMemberId: string | null };
+      seats: Array<{ agentId: string; provider: string; model: string }>;
+    };
+
+    expect(created).toHaveLength(1);
+    expect(detail.room.supervisorMemberId).toBe("mem-1");
+    // The catalog supervisor runs `claude-opus-5-5`; the seat must name the
+    // member's model and provider, whichever of the hook and the bind ran first.
+    expect(detail.seats).toHaveLength(1);
+    expect(detail.seats[0]).toMatchObject({ agentId: "A1", provider: "opencode", model: "m1" });
+
+    // Flush the store before the `afterEach` removes the data dir: a write still
+    // in flight would race the teardown instead of the assertion above.
+    await cleanup();
+  });
+
   it("warns about an unknown legacy peer tier", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const { create } = contributeWith(readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }));
