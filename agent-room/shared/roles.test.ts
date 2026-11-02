@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  type Role,
   AGENT_TITLE_MAX_LENGTH,
   DEFAULT_SETTINGS,
   ROLE_NAME_MAX_LENGTH,
@@ -72,6 +73,13 @@ describe("roleForLegacyMarker", () => {
     expect(mapped.role.kind).toBe("worker");
     expect(mapped.fallbackFrom).toBe("gone");
   });
+
+  it("throws when the catalog has no worker role", () => {
+    const emptyCatalog = [] as Role[];
+    expect(() => roleForLegacyMarker({ seat: "peer", tier: "default" }, emptyCatalog)).toThrow(
+      "role catalog has no worker role",
+    );
+  });
 });
 
 describe("roleSeat", () => {
@@ -120,6 +128,26 @@ describe("roomSettingsSchema", () => {
         roles: [...roles.filter((role) => role.id !== lead.id), { ...lead, name: "a".repeat(ROLE_NAME_MAX_LENGTH + 1) }],
       }).success,
     ).toBe(false);
+  });
+
+  it("rejects a role name containing a colon", () => {
+    const lead = roles.find((role) => role.kind === "lead")!;
+    expect(
+      roomSettingsSchema.safeParse({
+        roles: [...roles.filter((role) => role.id !== lead.id), { ...lead, name: "Data: Migration" }],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a role name with surrounding whitespace", () => {
+    const lead = roles.find((role) => role.kind === "lead")!;
+    for (const name of [" Lead", "Lead ", " Lead "]) {
+      expect(
+        roomSettingsSchema.safeParse({
+          roles: [...roles.filter((role) => role.id !== lead.id), { ...lead, name }],
+        }).success,
+      ).toBe(false);
+    }
   });
 
   it("transforms a legacy seats document into roles", () => {

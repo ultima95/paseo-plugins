@@ -30,7 +30,12 @@ export const roleIdSchema = z
 
 export const roleSchema = seatConfigSchema.extend({
   id: roleIdSchema,
-  name: z.string().min(1).max(ROLE_NAME_MAX_LENGTH),
+  name: z
+    .string()
+    .min(1)
+    .max(ROLE_NAME_MAX_LENGTH)
+    .regex(/^[^:]+$/, "role name may not contain ':'")
+    .refine((name) => name === name.trim(), "role name may not have surrounding whitespace"),
   kind: roleKindSchema,
   useFor: nonEmptyText,
   brief: z.string().optional(),
@@ -232,13 +237,23 @@ export function roleForLegacyMarker(
   const leads = roles.filter((role) => role.kind === "lead");
   const workers = roles.filter((role) => role.kind === "worker");
 
-  if (marker.seat === "supervisor") return { role: supervisors[0]! };
-  if (marker.seat === "lead") return { role: leads[0]! };
+  if (marker.seat === "supervisor") {
+    const supervisor = supervisors[0];
+    if (supervisor === undefined) throw new Error("role catalog has no supervisor role");
+    return { role: supervisor };
+  }
+  if (marker.seat === "lead") {
+    const lead = leads[0];
+    if (lead === undefined) throw new Error("role catalog has no lead role");
+    return { role: lead };
+  }
 
   const mapped = LEGACY_TIER_ROLE[marker.tier];
   const direct =
     (mapped !== undefined ? workers.find((role) => role.id === mapped) : undefined) ??
     workers.find((role) => role.id === marker.tier);
   if (direct !== undefined) return { role: direct };
-  return { role: workers[0]!, fallbackFrom: marker.tier };
+  const worker = workers[0];
+  if (worker === undefined) throw new Error("role catalog has no worker role");
+  return { role: worker, fallbackFrom: marker.tier };
 }
