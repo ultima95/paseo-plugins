@@ -10,7 +10,7 @@ import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import type { FeedEvent, RoomRecord, SeatRecord } from "../shared/room";
 import { getRoomRpc, launchRoomRpc, listRoomsRpc } from "../shared/rpc";
 import { describeError } from "./seat-editor";
-import { buildTree, feedRows } from "./view-model";
+import { buildTree, feedRows, seatName } from "./view-model";
 
 type WorkspaceAgent = {
   id: string;
@@ -282,7 +282,7 @@ export function RoomManagerPanel(props: PluginWorkspacePanelProps) {
               style={{ marginLeft: depth * 14, flexDirection: "row", gap: pad, alignItems: "center" }}
             >
               <Text style={{ color: theme.colors.foreground, flex: 1 }} numberOfLines={1}>
-                {seat.marker.seat === "peer" ? `Peer:${seat.marker.tier}` : seat.marker.seat}
+                {seatName(seat)}
                 {"  "}
                 {seat.provider}/{seat.model}
               </Text>
