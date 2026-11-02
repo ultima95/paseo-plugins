@@ -270,7 +270,7 @@ export default function contribute(
     await members.load();
     await migrateMembers({ store, members, readSettings, now: () => Date.now(), log });
   })().catch((error: unknown) => {
-    log.error("room store load failed", { error: reason(error) });
+    log.error("room and member stores load failed", { error: reason(error) });
   });
 
   const events = createRoomEvents({

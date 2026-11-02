@@ -405,23 +405,36 @@ describe("memberChip", () => {
 
 describe("memberNameForSeat", () => {
   const members = [member("sup-1", "supervisor", "Ada"), member("lead-1", "lead", "Grace")];
+  /** The seat both members above run: provider and model must match theirs. */
+  const seat = { provider: "claude", model: "claude-opus-5-5" };
 
   it("names the member behind a supervisor or lead seat", () => {
-    expect(memberNameForSeat({ roleKind: "supervisor" }, boundRoom, members)).toBe("Ada");
-    expect(memberNameForSeat({ roleKind: "lead" }, boundRoom, members)).toBe("Grace");
+    expect(memberNameForSeat({ ...seat, roleKind: "supervisor" }, boundRoom, members)).toBe("Ada");
+    expect(memberNameForSeat({ ...seat, roleKind: "lead" }, boundRoom, members)).toBe("Grace");
   });
 
   it("has no member for a worker seat", () => {
-    expect(memberNameForSeat({ roleKind: "worker" }, boundRoom, members)).toBeNull();
+    expect(memberNameForSeat({ ...seat, roleKind: "worker" }, boundRoom, members)).toBeNull();
   });
 
   it("has no member for a seat recorded before roles existed", () => {
-    expect(memberNameForSeat({}, boundRoom, members)).toBeNull();
+    expect(memberNameForSeat(seat, boundRoom, members)).toBeNull();
   });
 
   it("has no member when the room is unbound", () => {
     const hostSeats: RoomRecord = { ...boundRoom, supervisorMemberId: null, leadMemberId: null };
 
-    expect(memberNameForSeat({ roleKind: "supervisor" }, hostSeats, members)).toBeNull();
+    expect(memberNameForSeat({ ...seat, roleKind: "supervisor" }, hostSeats, members)).toBeNull();
+  });
+
+  it("has no member for a seat that does not run the member's seat", () => {
+    // The room bound Ada, but this Supervisor was created on another provider or
+    // model: the seat is the catalog role's, so naming Ada beside it would lie.
+    expect(
+      memberNameForSeat({ roleKind: "supervisor", provider: "codex", model: "claude-opus-5-5" }, boundRoom, members),
+    ).toBeNull();
+    expect(
+      memberNameForSeat({ roleKind: "supervisor", provider: "claude", model: "claude-sonnet-5-5" }, boundRoom, members),
+    ).toBeNull();
   });
 });

@@ -42,7 +42,7 @@ export async function migrateMembers(deps: MigrateMembersDeps): Promise<{ seeded
   const supervisor = settings.roles.find((role) => role.kind === "supervisor");
   const lead = settings.roles.find((role) => role.kind === "lead");
   if (supervisor === undefined || lead === undefined) {
-    deps.log.warn("member migration skipped: catalog has no lead", {
+    deps.log.warn("member migration skipped: catalog is missing a required role", {
       error: supervisor === undefined ? "no supervisor role" : "no lead role",
     });
     return { seeded: false };

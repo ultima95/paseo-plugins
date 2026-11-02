@@ -513,6 +513,11 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
     for (const draft of feedFromTurn({ agent: seat, childIds, timeline })) {
       const stored = store.appendFeed({ roomId: seat.roomId, ...draft });
       if (memberId === null) continue;
+      // Only the seat's own reply is member memory. A user, task or instruction
+      // row can open with a signal word (`REJECT: …`) without being the seat's
+      // decision, and a fact taken from it would put the user's words in the
+      // member's mouth.
+      if (stored.from !== agent.id) continue;
       // The signal decides: only the five the protocol carries become facts.
       const captured = episodeFactFor(stored, seat.roleKind);
       if (captured === null) continue;

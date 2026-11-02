@@ -92,15 +92,30 @@ export function memberChip(room: RoomRecord, members: readonly MemberRecord[]): 
  * Only the two seats a room binds can have a member: a worker seat is launched
  * by a Lead and stands for no member of its own. A seat recorded before roles
  * existed has no `roleKind`, so it resolves to nothing rather than guessing.
+ *
+ * The seat must also still run the member's own provider and model. The server
+ * makes the same check before it records a member's model on a seat
+ * (`server/events.ts`): a seat launched on another provider is the catalog
+ * role's, and naming the bound member beside it would label a seat as something
+ * it is not.
  */
 export function memberNameForSeat(
-  seat: Pick<SeatRecord, "roleKind">,
+  seat: Pick<SeatRecord, "provider" | "model"> & { roleKind?: SeatRecord["roleKind"] },
   room: RoomRecord,
   members: readonly MemberRecord[],
 ): string | null {
-  if (seat.roleKind === "supervisor") return memberChip(room, members).supervisor;
-  if (seat.roleKind === "lead") return memberChip(room, members).lead;
-  return null;
+  const memberId =
+    seat.roleKind === "supervisor"
+      ? room.supervisorMemberId
+      : seat.roleKind === "lead"
+        ? room.leadMemberId
+        : null;
+  if (memberId === null) return null;
+
+  const member = members.find((candidate) => candidate.id === memberId);
+  if (member === undefined) return null;
+  if (member.provider !== seat.provider || member.model !== seat.model) return null;
+  return member.name;
 }
 
 /**

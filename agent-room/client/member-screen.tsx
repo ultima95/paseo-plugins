@@ -789,7 +789,7 @@ export function MemberScreen(props: PluginScreenProps) {
               key={`${lesson.scope}-${lesson.at}-${String(index)}`}
               surface={surface}
               kind={`[${lesson.scope}]`}
-              meta={`${lesson.at} · ${lesson.promotedBy}`}
+              meta={`${lesson.at} · ${lesson.promotedBy} · ${lesson.sourceRoomId}`}
               text={lesson.text}
             />
           ))}

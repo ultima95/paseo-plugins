@@ -97,8 +97,30 @@ describe("migrateMembers", () => {
     });
     expect(out.seeded).toBe(false);
     expect(members.records).toEqual([]);
-    expect(log.warn).toHaveBeenCalledWith("member migration skipped: catalog has no lead", {
-      error: expect.any(String),
+    expect(log.warn).toHaveBeenCalledWith(
+      "member migration skipped: catalog is missing a required role",
+      { error: "no lead role" },
+    );
+  });
+
+  it("does not seed from a catalog without a supervisor role", async () => {
+    // The warning is shared by both required roles, so it must name the one that
+    // is missing rather than always blaming the lead.
+    const members = fakeMembers(false);
+    const out = await migrateMembers({
+      store: fakeRooms(true),
+      members: members.store,
+      readSettings: async () => ({
+        roles: DEFAULT_SETTINGS.roles.filter((role) => role.kind !== "supervisor"),
+      }),
+      now: () => 0,
+      log,
     });
+    expect(out.seeded).toBe(false);
+    expect(members.records).toEqual([]);
+    expect(log.warn).toHaveBeenCalledWith(
+      "member migration skipped: catalog is missing a required role",
+      { error: "no supervisor role" },
+    );
   });
 });

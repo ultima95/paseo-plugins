@@ -1190,6 +1190,37 @@ describe("onTurnEnded", () => {
     );
   });
 
+  it("captures no episode from a user message that opens with a signal", async () => {
+    // The user's "REJECT: …" is instruction, not the seat's own decision: only
+    // the row the seat itself produced may become a member fact.
+    const { store, appendFeed } = storedRoom();
+    const { paseo } = fakePaseo({}, [
+      { item: { type: "user_message", text: "REJECT: do not touch the lockfile" } },
+      { item: { type: "assistant_message", text: "STATUS acknowledged" } },
+    ]);
+    const { created, ctx } = eventsWith(paseo, store, undefined, {
+      members: fakeMembers({ "sup-1": member() }),
+      repoIdFor: async () => null,
+    });
+    store.room("S1")!.room.supervisorMemberId = "sup-1";
+
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "S1", title: "Supervisor: fix auth" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+
+    // The turn is still the room's record: the user row lands, labelled REJECT.
+    expect(appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({ roomId: "S1", from: null, to: "S1", label: "REJECT" }),
+    );
+    expect(appendEpisode).not.toHaveBeenCalled();
+  });
+
   it("captures no episode when the room bound no member", async () => {
     const { store, appendFeed } = storedRoom();
     const { paseo } = fakePaseo({}, [
