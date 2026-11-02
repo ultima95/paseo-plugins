@@ -153,9 +153,8 @@ export function RoomPopover(props: PluginButtonContentProps & { onManage?: () =>
         <View style={{ gap: 6, borderTopWidth: 1, borderTopColor: theme.colors.border, paddingTop: pad }}>
           {adopted !== null ? (
             <Text style={{ color: theme.colors.foreground }}>
-              This chat is the room Supervisor now. Give it a task here; it will title Leads with
-              {" "}
-              {"`Lead: <workstream>`."}
+              This chat is the room Supervisor now. Give it a task here; it will title Leads
+              {` Uses "Lead: <workstream>".`}
             </Text>
           ) : (
             <>

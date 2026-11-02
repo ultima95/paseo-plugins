@@ -41,7 +41,7 @@ export function renderRoleTable(role: Role, settings: RoomSettings): string {
       "|---|---|---|",
       ...leads.map((lead) => `| ${lead.name} | ${code(`${lead.name}: <workstream>`)} | ${providerModel(lead)} |`),
       "",
-      "Never launch a worker role directly, and never launch an agent whose title carries no role: an unmarked child of a room seat is archived by the room guard.",
+      "Never launch a worker role directly, and never launch an agent whose title carries no role: a child of a room seat with no role is archived by the room guard.",
     ].join("\n");
   }
 

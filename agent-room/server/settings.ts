@@ -17,7 +17,7 @@ export const SETTINGS_TIMEOUT_MS = 2_000;
  * What a strict reader rejects with when the seats never arrived. It reaches the
  * launch form, so it says what the user can do about it.
  */
-export const SEAT_SETTINGS_UNLOADED = "room seat settings did not load; try again";
+export const SEAT_SETTINGS_UNLOADED = "room role settings did not load; try again";
 
 export interface SettingsReaderOptions {
   /** How long `settings.read()` may take; defaults to `SETTINGS_TIMEOUT_MS`. */

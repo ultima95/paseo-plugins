@@ -7,6 +7,8 @@ import type { SeatMarker } from "./seats";
 export const AGENT_TITLE_MAX_LENGTH = 60;
 /** Longest role name that still leaves room for `: ` and an outcome. */
 export const ROLE_NAME_MAX_LENGTH = 20;
+/** Longest role id the schema accepts. */
+export const ROLE_ID_MAX_LENGTH = 40;
 
 const nonEmptyText = z.string().min(1);
 
@@ -26,7 +28,7 @@ export type RoleKind = z.infer<typeof roleKindSchema>;
 export const roleIdSchema = z
   .string()
   .regex(/^[a-z][a-z0-9-]*$/, "role id must be lowercase kebab-case")
-  .max(40);
+  .max(ROLE_ID_MAX_LENGTH);
 
 export const roleSchema = seatConfigSchema.extend({
   id: roleIdSchema,
@@ -68,9 +70,28 @@ function titleCaseRoleName(id: string): string {
   return name.length > 0 ? name : "Worker";
 }
 
+/**
+ * A tier id that is already taken becomes `<id>-<index>`, and keeps gaining a
+ * numeric tail until it is unique. Without this a legal legacy document whose
+ * tier is called `lead` or `supervisor` would produce duplicate role ids and the
+ * whole document would be rejected, silently reverting the user to defaults.
+ */
+function uniqueRoleId(id: string, index: number, usedIds: Set<string>): string {
+  if (!usedIds.has(id)) return id;
+  const base = `${id}-${index}`.slice(0, ROLE_ID_MAX_LENGTH);
+  let candidate = base;
+  let suffix = 1;
+  while (usedIds.has(candidate)) {
+    candidate = `${base.slice(0, ROLE_ID_MAX_LENGTH - String(suffix).length - 1)}-${suffix}`;
+    suffix += 1;
+  }
+  return candidate;
+}
+
 /** Convert a stored v1 seats document into the role catalog. */
 export function legacyToRoles(legacy: LegacyRoomSettings): RoomSettings {
   const usedNames = new Set(["supervisor", "lead"]);
+  const usedIds = new Set(["supervisor", "lead"]);
   const roles: Role[] = [
     { id: "supervisor", name: "Supervisor", kind: "supervisor", useFor: "Talks to the user and launches Leads", ...legacy.supervisor },
     { id: "lead", name: "Lead", kind: "lead", useFor: "Owns one project", ...legacy.lead },
@@ -80,8 +101,10 @@ export function legacyToRoles(legacy: LegacyRoomSettings): RoomSettings {
     let name = titleCaseRoleName(tier.id);
     if (usedNames.has(name.toLowerCase())) name = `${name.slice(0, ROLE_NAME_MAX_LENGTH - 3)}-${index}`;
     usedNames.add(name.toLowerCase());
+    const id = uniqueRoleId(tier.id, index, usedIds);
+    usedIds.add(id);
     roles.push({
-      id: tier.id,
+      id,
       name,
       kind: "worker",
       provider: tier.provider,
@@ -133,11 +156,17 @@ export const roomSettings = defineSettings({
   schema: roomSettingsSchema,
 });
 
+/**
+ * A worker role. The mode is per provider on purpose: `bypassPermissions` is a
+ * Claude mode id and Codex would reject it, so each caller names its provider's
+ * own full-trust mode (`full-access` on Codex).
+ */
 const worker = (
   id: string,
   name: string,
   provider: string,
   model: string,
+  modeId: string,
   thinkingOptionId: string,
   useFor: string,
   brief?: string,
@@ -147,7 +176,7 @@ const worker = (
   kind: "worker",
   provider,
   model,
-  modeId: "bypassPermissions",
+  modeId,
   thinkingOptionId,
   useFor,
   ...(brief !== undefined ? { brief } : {}),
@@ -175,13 +204,13 @@ export const DEFAULT_SETTINGS: RoomSettings = {
       thinkingOptionId: "high",
       useFor: "Owns one project, launches workers, integrates and verifies",
     },
-    worker("implementer", "Implementer", "claude", "claude-sonnet-5-5", "medium", "Implementation, debugging, research"),
-    worker("reviewer", "Reviewer", "claude", "claude-sonnet-5-5", "high", "Read-only review of a candidate", "Review only. Do not edit files; report findings to your Lead."),
-    worker("researcher", "Researcher", "claude", "claude-sonnet-5-5", "medium", "Read-only investigation of unfamiliar code"),
-    worker("mechanic", "Mechanic", "claude", "claude-haiku-4-5", "medium", "Extraction, formatting, log triage, mechanical edits"),
-    worker("specialist", "Specialist", "claude", "claude-opus-5-5", "medium", "Hard problems a cheaper role failed on"),
-    worker("codex", "Codex", "codex", "gpt-5.6-sol", "medium", "Cross-family implementation or second opinion"),
-    worker("codex-review", "Codex Review", "codex", "gpt-5.6-sol", "high", "Cross-family read-only review"),
+    worker("implementer", "Implementer", "claude", "claude-sonnet-5-5", "bypassPermissions", "medium", "Implementation, debugging, research"),
+    worker("reviewer", "Reviewer", "claude", "claude-sonnet-5-5", "bypassPermissions", "high", "Read-only review of a candidate", "Review only. Do not edit files; report findings to your Lead."),
+    worker("researcher", "Researcher", "claude", "claude-sonnet-5-5", "bypassPermissions", "medium", "Read-only investigation of unfamiliar code"),
+    worker("mechanic", "Mechanic", "claude", "claude-haiku-4-5", "bypassPermissions", "medium", "Extraction, formatting, log triage, mechanical edits"),
+    worker("specialist", "Specialist", "claude", "claude-opus-5-5", "bypassPermissions", "medium", "Hard problems a cheaper role failed on"),
+    worker("codex", "Codex", "codex", "gpt-5.6-sol", "full-access", "medium", "Cross-family implementation or second opinion"),
+    worker("codex-review", "Codex Review", "codex", "gpt-5.6-sol", "full-access", "high", "Cross-family read-only review"),
   ],
 };
 

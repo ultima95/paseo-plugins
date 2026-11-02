@@ -480,6 +480,12 @@ export function SeatEditor(props: SeatEditorProps) {
             disabled={props.disabled}
             onChangeText={props.onNameChange}
           />
+          {props.roleKind !== undefined && props.roleKind !== "worker" ? (
+            <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12 }}>
+              Renaming stops the old name resolving. Running agents still title children with the
+              old name, and the guard archives those children.
+            </Text>
+          ) : null}
         </Field>
       ) : null}
 

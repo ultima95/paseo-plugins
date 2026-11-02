@@ -15,6 +15,35 @@ import {
 
 const roles = DEFAULT_SETTINGS.roles;
 
+/**
+ * The mode ids each provider actually accepts. A role that names another
+ * provider's mode fails to launch, so this table is the guard against a Codex
+ * role carrying a Claude-only id.
+ */
+const MODES_BY_PROVIDER: Readonly<Record<string, readonly string[]>> = {
+  claude: ["bypassPermissions", "acceptEdits", "plan", "default"],
+  codex: ["auto", "auto-review", "full-access"],
+};
+
+describe("DEFAULT_SETTINGS", () => {
+  it.each(DEFAULT_SETTINGS.roles.map((role) => [role.id, role] as const))(
+    "%s names a mode its provider offers",
+    (_id, role) => {
+      const modes = MODES_BY_PROVIDER[role.provider];
+      expect(modes).toBeDefined();
+      // A role that leaves the mode unset lets the provider pick its default.
+      if (role.modeId === undefined || modes === undefined) return;
+      expect(modes).toContain(role.modeId);
+    },
+  );
+
+  it("puts each Codex role in full-access, not the Claude mode", () => {
+    for (const role of roles.filter((candidate) => candidate.provider === "codex")) {
+      expect(role.modeId).toBe("full-access");
+    }
+  });
+});
+
 describe("parseRoleTitle", () => {
   it.each([
     ["Supervisor: fix auth", "supervisor", "fix auth"],
@@ -165,5 +194,45 @@ describe("roomSettingsSchema", () => {
     expect(parsed.data.roles.find((role) => role.kind === "supervisor")?.provider).toBe("codex");
     expect(parsed.data.roles.find((role) => role.id === "review")?.kind).toBe("worker");
     expect(parsed.data.roles.find((role) => role.id === "review")?.useFor).toBe("Review");
+  });
+
+  it("keeps a legacy document whose peer-tier ids collide with supervisor and lead", () => {
+    // A legal v1 document: tier ids are arbitrary kebab-case, so `lead` and
+    // `supervisor` are allowed. Copying them verbatim would duplicate the role
+    // ids the catalog already holds and reject the whole document, dropping the
+    // user back to defaults.
+    const legacy = {
+      supervisor: { provider: "claude", model: "claude-opus-5-5" },
+      lead: { provider: "claude", model: "claude-opus-5-5" },
+      peerTiers: [
+        { id: "lead", provider: "claude", model: "claude-sonnet-5-5", useFor: "A second lead" },
+        { id: "supervisor", provider: "claude", model: "claude-sonnet-5-5", useFor: "A second supervisor" },
+        { id: "default", provider: "claude", model: "claude-sonnet-5-5", useFor: "Implementation" },
+      ],
+    };
+
+    const parsed = roomSettingsSchema.safeParse(legacy);
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    const migrated = parsed.data.roles;
+
+    const ids = migrated.map((role) => role.id);
+    expect(new Set(ids).size).toBe(ids.length);
+
+    // The real supervisor and lead keep their ids and kinds.
+    expect(migrated.filter((role) => role.kind === "supervisor")).toHaveLength(1);
+    expect(migrated.find((role) => role.kind === "supervisor")?.id).toBe("supervisor");
+    expect(migrated.find((role) => role.kind === "lead")?.id).toBe("lead");
+
+    // The colliding tiers survive as worker roles with ids of their own.
+    const workers = migrated.filter((role) => role.kind === "worker");
+    expect(workers).toHaveLength(3);
+    expect(workers.map((role) => role.id)).toEqual(["lead-0", "supervisor-1", "default"]);
+    expect(workers.map((role) => role.useFor)).toEqual([
+      "A second lead",
+      "A second supervisor",
+      "Implementation",
+    ]);
+    expect(new Set(workers.map((role) => role.name.toLowerCase())).size).toBe(3);
   });
 });
