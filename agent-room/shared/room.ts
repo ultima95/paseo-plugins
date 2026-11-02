@@ -7,8 +7,10 @@ import type { SeatMarker } from "./seats";
 export const FEED_CAP_PER_ROOM = 500;
 /** Longest feed text kept; anything longer is truncated before it is stored. */
 export const FEED_TEXT_CAP = 4000;
-/** Schema version of `rooms.json`; any other version is treated as corrupt. */
-export const ROOMS_FILE_VERSION = 1;
+/** Schema version of `rooms.json`; version 2 adds room member bindings. */
+export const ROOMS_FILE_VERSION = 2;
+/** Version 1 is read and migrated in memory, then rewritten as version 2. */
+export const LEGACY_ROOMS_FILE_VERSION = 1;
 
 /**
  * The timeline row the guard appends to a violator's parent, and the version of
@@ -53,6 +55,9 @@ export const roomRecordSchema = z.object({
   task: z.string(),
   cwd: z.string(),
   workspaceId: z.string().nullable(),
+  // Bound at launch. `default(null)` is what lets a v1 row parse without them.
+  supervisorMemberId: z.string().nullable().default(null),
+  leadMemberId: z.string().nullable().default(null),
   createdAt: timestampSchema,
   endedAt: timestampSchema.optional(),
 });
@@ -117,12 +122,16 @@ export const feedEventSchema = z.object({
 export type FeedEvent = z.infer<typeof feedEventSchema>;
 
 /** The whole `rooms.json` document, versioned so a future format can be refused. */
-export const roomsFileSchema = z.object({
-  version: z.literal(ROOMS_FILE_VERSION),
+const roomsDocumentSchema = z.object({
   rooms: z.array(roomRecordSchema),
   seats: z.array(seatRecordSchema),
   feed: z.array(feedEventSchema),
 });
+
+export const roomsFileSchema = z.discriminatedUnion("version", [
+  roomsDocumentSchema.extend({ version: z.literal(LEGACY_ROOMS_FILE_VERSION) }),
+  roomsDocumentSchema.extend({ version: z.literal(ROOMS_FILE_VERSION) }),
+]);
 
 export type RoomsFile = z.infer<typeof roomsFileSchema>;
 

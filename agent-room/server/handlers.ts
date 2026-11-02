@@ -126,6 +126,8 @@ export function createHandlers(deps: HandlerDeps): RoomHandlers {
         task: title.length > 0 ? title : "Adopted chat",
         cwd: agent.cwd,
         workspaceId: agent.workspaceId ?? null,
+        supervisorMemberId: null,
+        leadMemberId: null,
         createdAt: agent.createdAt,
       });
       // A complete role seat, never the legacy marker: the feed, the guard and

@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import {
   FEED_CAP_PER_ROOM,
   FEED_TEXT_CAP,
+  LEGACY_ROOMS_FILE_VERSION,
   ROOMS_FILE_VERSION,
   feedEventSchema,
   roomRecordSchema,
@@ -37,6 +38,17 @@ export interface RoomStore {
    */
   appendFeed(event: Omit<FeedEvent, "id" | "at"> & { at?: string }): FeedEvent;
   endRoom(roomId: string): void;
+  /**
+   * Bind the room's Supervisor and Lead members. Order-independent: a call
+   * before the room exists is merged by `addRoom`, because `room.launch`
+   * cannot know whether `agent.created` has run yet.
+   */
+  bindRoomMembers(
+    roomId: string,
+    binding: { supervisorMemberId?: string | null; leadMemberId?: string | null },
+  ): void;
+  /** True when the load migrated a v1 document; drives the one-time member seed. */
+  migratedFromV1(): boolean;
   /** Newest first by `createdAt`. */
   listRooms(): RoomRecord[];
   room(roomId: string): { room: RoomRecord; seats: SeatRecord[]; feed: FeedEvent[] } | undefined;
@@ -84,6 +96,11 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
   let rooms: RoomRecord[] = [];
   let seats: SeatRecord[] = [];
   let feed: FeedEvent[] = [];
+  let migratedFromV1 = false;
+  const pendingBindings = new Map<
+    string,
+    { supervisorMemberId: string | null; leadMemberId: string | null }
+  >();
 
   let writing: Promise<void> = Promise.resolve();
   let dirty = false;
@@ -109,6 +126,8 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
     rooms = [];
     seats = [];
     feed = [];
+    pendingBindings.clear();
+    migratedFromV1 = false;
   };
 
   /** Drop all but the newest `FEED_CAP_PER_ROOM` events for one room. */
@@ -196,6 +215,11 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
     seats = result.data.seats;
     feed = result.data.feed;
     normalise();
+    if (result.data.version === LEGACY_ROOMS_FILE_VERSION) {
+      migratedFromV1 = true;
+      // Write the normalized v2 document through the same atomic path.
+      scheduleWrite();
+    }
   };
 
   const addRoom = (room: RoomRecord): void => {
@@ -205,11 +229,45 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
       return;
     }
     const record = parsed.data;
+    const pending = pendingBindings.get(record.id);
+    if (pending !== undefined) {
+      record.supervisorMemberId = pending.supervisorMemberId;
+      record.leadMemberId = pending.leadMemberId;
+      pendingBindings.delete(record.id);
+    }
     const index = rooms.findIndex((candidate) => candidate.id === record.id);
     if (index === -1) rooms.push(record);
     else rooms[index] = record;
     scheduleWrite();
   };
+
+  const bindRoomMembers = (
+    roomId: string,
+    binding: { supervisorMemberId?: string | null; leadMemberId?: string | null },
+  ): void => {
+    const current = pendingBindings.get(roomId) ?? {
+      supervisorMemberId: null,
+      leadMemberId: null,
+    };
+    const next = {
+      supervisorMemberId:
+        binding.supervisorMemberId !== undefined
+          ? binding.supervisorMemberId
+          : current.supervisorMemberId,
+      leadMemberId:
+        binding.leadMemberId !== undefined ? binding.leadMemberId : current.leadMemberId,
+    };
+    pendingBindings.set(roomId, next);
+
+    const target = rooms.find((candidate) => candidate.id === roomId);
+    if (target !== undefined) {
+      target.supervisorMemberId = next.supervisorMemberId;
+      target.leadMemberId = next.leadMemberId;
+      scheduleWrite();
+    }
+  };
+
+  const migrated = (): boolean => migratedFromV1;
 
   const addSeat = (seat: SeatRecord): void => {
     const parsed = seatRecordSchema.safeParse(seat);
@@ -297,6 +355,8 @@ export function createRoomStore(deps: RoomStoreDeps): RoomStore {
     children,
     appendFeed,
     endRoom,
+    bindRoomMembers,
+    migratedFromV1: migrated,
     listRooms,
     room,
     flush,

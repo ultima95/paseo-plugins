@@ -338,6 +338,8 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
         task,
         cwd: agent.cwd,
         workspaceId: agent.workspaceId,
+        supervisorMemberId: null,
+        leadMemberId: null,
         createdAt: new Date().toISOString(),
       });
       store.addSeat(seatRecord(agent, roomId, role, legacy));

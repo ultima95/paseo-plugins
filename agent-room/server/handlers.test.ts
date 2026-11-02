@@ -111,6 +111,8 @@ const roomRecord = (id: string, createdAt: string): RoomRecord => ({
   task: "Fix the room",
   cwd: "/repo",
   workspaceId: null,
+  supervisorMemberId: null,
+  leadMemberId: null,
   createdAt,
 });
 
@@ -362,6 +364,8 @@ describe("adopt", () => {
       task: "New chat",
       cwd: "/repo",
       workspaceId: "W1",
+      supervisorMemberId: null,
+      leadMemberId: null,
       createdAt: "2026-10-28T10:00:00.000Z",
     });
     expect(addSeat).toHaveBeenCalledWith(

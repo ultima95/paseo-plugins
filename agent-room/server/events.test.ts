@@ -81,6 +81,8 @@ function fakeStore(seed: { rooms?: RoomRecord[]; seats?: SeatRecord[] } = {}) {
     children: (agentId) => seats.filter((candidate) => candidate.parentId === agentId),
     appendFeed,
     endRoom,
+    bindRoomMembers: () => undefined,
+    migratedFromV1: () => false,
     listRooms: () =>
       [...rooms].sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0)),
     room: (roomId) => {
@@ -103,6 +105,8 @@ const room = (id: string): RoomRecord => ({
   task: "fix auth",
   cwd: "/repo",
   workspaceId: "W1",
+  supervisorMemberId: null,
+  leadMemberId: null,
   createdAt: "2026-10-28T09:00:00.000Z",
 });
 
