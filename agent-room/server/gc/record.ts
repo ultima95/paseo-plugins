@@ -76,8 +76,11 @@ export const ALERT_WINDOW_MINUTES = 15;
 export const MEMORY_SAMPLE_PROCS = 30;
 /** A proven orphan above this many MB always alerts (:1218, :1227). */
 export const ORPHAN_ALERT_MB = 1024;
-/** `display notification … with title "slp-gc"` (:1232). */
-export const NOTIFY_TITLE = "slp-gc";
+/**
+ * The notification title. The reference says `"slp-gc"` (:1232), but that is its own
+ * script name; this port alerts from the plugin, so it names itself instead.
+ */
+export const NOTIFY_TITLE = "agent-room gc";
 /** The reference's notification body (:1232): the alert itself is in `alerts.log`. */
 export const NOTIFY_BODY = "Paseo memory alert (see alerts.log)";
 /** `run_to 10 "$OSASCRIPT"` (:1232). */

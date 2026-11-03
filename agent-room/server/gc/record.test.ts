@@ -634,13 +634,13 @@ describe("recordSample — the stamp lands before the alert line", () => {
 describe("recordSample — notify", () => {
   const NOW = 1_800_000_000;
 
-  it("notifies once per alert, with the reference's fixed text", async () => {
+  it("notifies once per alert, with the fixed title and body", async () => {
     const dir = tmpDir("gc-notify-");
     const { notify, calls } = recorder();
     const trip = reportWith([proc({ pid: 9, footprint_mb: 4096 })]);
 
     await recordSample({ stateDir: dir, report: trip, now: NOW, notify });
-    expect(calls).toEqual([["slp-gc", "Paseo memory alert (see alerts.log)"]]);
+    expect(calls).toEqual([["agent-room gc", "Paseo memory alert (see alerts.log)"]]);
 
     // A suppressed trip notifies nothing.
     await recordSample({ stateDir: dir, report: trip, now: NOW + 60, notify });
