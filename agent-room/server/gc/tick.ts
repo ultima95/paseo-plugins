@@ -116,11 +116,11 @@ import { classify, parsePs, parseTop, type ProcRow, type ParsedPs, type TopRow }
 
 /**
  * `AGENT_MIN_DAYS` (slp-gc.bash:32): how long an archived agent must have been
- * archived before its record is garbage. The reference fixes it at 14 days; it is
- * a constant and not a settings knob, because a user who could lower it could
- * delete live history.
+ * archived before its record is garbage. The reference fixes it at 14 days; this
+ * port uses 7, a deliberate deviation recorded here. It stays a constant and not
+ * a settings knob, because a user who could lower it could delete live history.
  */
-export const AGENT_MIN_DAYS = 14;
+export const AGENT_MIN_DAYS = 7;
 
 /** `run_to 20 "$PS" -axww …` (slp-gc.bash:563). */
 export const PS_TIMEOUT_MS = 20_000;

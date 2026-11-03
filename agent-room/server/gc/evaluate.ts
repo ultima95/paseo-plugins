@@ -1299,7 +1299,10 @@ export interface GarbageCandidate {
 export interface GarbageInput {
   /** `$now`: epoch seconds, read once by the caller. */
   now: number;
-  /** `$minDays`: `SLP_GC_AGENT_MIN_DAYS`, 14 by default (slp-gc.bash:32). */
+  /**
+   * `$minDays`: `SLP_GC_AGENT_MIN_DAYS`, 14 in the reference (slp-gc.bash:32) and
+   * 7 in this port (`AGENT_MIN_DAYS`, tick.ts).
+   */
   minDays: number;
   /** `$agents`: the agent index (`snapshotAgents().agents`). */
   agents?: readonly AgentRecord[];

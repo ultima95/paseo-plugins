@@ -510,7 +510,7 @@ export function ruleConfirm(rule: RuleKey, next: boolean, memKillMb: KillThresho
           title: "Turn on record reclamation",
           body:
             "The next tick will delete records the garbage rules judged eligible: completed room schedules, and " +
-            "agents archived for at least 14 days that no live process and no unarchived agent still references. " +
+            "agents archived for at least 7 days that no live process and no unarchived agent still references. " +
             "Deletion goes through `paseo schedule delete` / `paseo agent delete`; the record file is removed, not " +
             "moved. No process is signalled by this rule.",
           confirm: "Turn on and save",

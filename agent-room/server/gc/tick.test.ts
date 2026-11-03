@@ -176,7 +176,7 @@ describe("runTick", () => {
     const candidate = result.candidates.find((row) => row.id === agentId);
     expect(candidate).toBeDefined();
     expect(candidate?.refusedBy).toContain("identification");
-    expect(AGENT_MIN_DAYS).toBe(14);
+    expect(AGENT_MIN_DAYS).toBe(7);
 
     // …and a refused candidate is never acted on, even with `apply` on.
     expect(test.deleteAgent).not.toHaveBeenCalled();

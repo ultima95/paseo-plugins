@@ -33,7 +33,7 @@ const RULES: { key: RuleKey; label: string; hint: string }[] = [
   {
     key: "apply",
     label: "Reclaim records",
-    hint: "Deletes completed room schedules and agents archived for at least 14 d. The other two rules cannot act without it.",
+    hint: "Deletes completed room schedules and agents archived for at least 7 d. The other two rules cannot act without it.",
   },
   {
     key: "killStale",

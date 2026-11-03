@@ -92,11 +92,11 @@ describe("toGcRows", () => {
       alertsReadable: true,
       settings: { apply: false, killStale: false, killMemory: false, memWarnMb: 3072, memKillMb: 4096 },
       procs: [],
-      candidates: [{ kind: "agent", id: "a1", refusedBy: "archived 3d < 14d" }],
+      candidates: [{ kind: "agent", id: "a1", refusedBy: "archived 3d < 7d" }],
     } as never);
     expect(rows.candidates[0]).toMatchObject({
       label: "agent a1",
-      refusal: "archived 3d < 14d",
+      refusal: "archived 3d < 7d",
       actionable: false,
     });
   });
@@ -139,12 +139,12 @@ describe("toGcRows", () => {
   it("keeps a refused candidate non-actionable even when a rule names it", () => {
     const rows = toGcRows(
       status({
-        candidates: [{ kind: "agent", id: "b2", rule: "agent-archived", refusedBy: "agent-archived: archived 3 d ago (< 14 d)" }],
+        candidates: [{ kind: "agent", id: "b2", rule: "agent-archived", refusedBy: "agent-archived: archived 3 d ago (< 7 d)" }],
         settings: { ...SETTINGS, apply: true },
       }),
     );
     expect(rows.candidates[0].actionable).toBe(false);
-    expect(rows.candidates[0].refusal).toContain("< 14 d");
+    expect(rows.candidates[0].refusal).toContain("< 7 d");
     // Nothing reclaimable, so the summary cannot promise a deletion.
     expect(row(rows, "candidates")?.value).toContain("0 reclaimable");
   });
