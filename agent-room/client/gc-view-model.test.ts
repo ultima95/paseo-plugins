@@ -310,19 +310,17 @@ describe("toGcRows", () => {
     expect(row(empty, "ledger")).toMatchObject({ value: "no ledger rows yet", tone: "muted" });
   });
 
-  it("draws the Paseo tree as its own row, against the resolved warn threshold and the kill threshold", () => {
+  it("draws the Paseo tree against its own warn threshold, with the per-process kill as context", () => {
     const below = toGcRows(status());
     expect(row(below, "Paseo tree")).toMatchObject({
-      value: "2814.2 MB · app 2600 MB · orphan 214.2 MB · below warn 6144 MB · kill 4096 MB",
+      value: "2814.2 MB · app 2600 MB · orphan 214.2 MB · below warn 6144 MB · kill 4096 MB (per process)",
       tone: "normal",
     });
     // The label, not the value, is what keeps this apart from the daemon's row.
     expect(row(below, "Paseo tree")?.label).toBe("Paseo tree");
     expect(row(below, "footprint vs warn/kill")?.label).not.toContain("tree");
 
-    // `over` is the tick's verdict, at the resolved warn value it published. The
-    // kill threshold is above the tree warn here, which is the state where "over
-    // warn, below kill" can exist at all.
+    // `over` is the tick's verdict, at the resolved warn value it published.
     const over = toGcRows(
       status({
         tree: { ...TREE, totalMb: 7000, over: true },
@@ -330,15 +328,18 @@ describe("toGcRows", () => {
       }),
     );
     expect(row(over, "Paseo tree")).toMatchObject({
-      value: "7000 MB · app 2600 MB · orphan 214.2 MB · over warn 6144 MB · kill 8192 MB",
+      value: "7000 MB · app 2600 MB · orphan 214.2 MB · over warn 6144 MB · kill 8192 MB (per process)",
       tone: "warning",
     });
 
-    // Above the memory kill threshold the row is a danger, not a warning.
-    const kill = toGcRows(status({ tree: { ...TREE, totalMb: 5000, over: true }, settings: { ...SETTINGS, memKillMb: 4096 } }));
-    expect(row(kill, "Paseo tree")).toMatchObject({
-      value: "5000 MB · app 2600 MB · orphan 214.2 MB · over kill 4096 MB",
-      tone: "danger",
+    // The tree is above the per-process kill threshold but below its own warn
+    // threshold. No rule can signal the tree, so that is not a danger state.
+    const aboveKill = toGcRows(
+      status({ tree: { ...TREE, totalMb: 5000, over: false }, settings: { ...SETTINGS, memKillMb: 4096 } }),
+    );
+    expect(row(aboveKill, "Paseo tree")).toMatchObject({
+      value: "5000 MB · app 2600 MB · orphan 214.2 MB · below warn 6144 MB · kill 4096 MB (per process)",
+      tone: "normal",
     });
   });
 

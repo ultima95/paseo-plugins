@@ -226,13 +226,14 @@ function indexRow(status: GcStatus): StatusRow {
 }
 
 /**
- * The Paseo tree's footprint against the two thresholds the reference prints it
- * against: the resolved tree warn threshold and the memory kill threshold.
+ * The Paseo tree's footprint against its own warn threshold, with the memory kill
+ * threshold kept as context only.
  *
  * Labelled "Paseo tree" on purpose — this is the app main plus its agents (and the
  * proven orphans), not the daemon, and the daemon has its own row. The footprint,
- * the resolved `warnMb` and the `over` verdict are the tick's; only the kill
- * comparison is drawn here, exactly as `thresholdRow` does for the daemon.
+ * the resolved `warnMb` and the `over` verdict are the tick's. The kill threshold
+ * is per process and no rule signals the tree, so it never sets this row's tone;
+ * drawing it as a danger state was a false alarm.
  *
  * `tree === null` is a fresh install: no tick has measured the tree, and that is
  * said in words rather than drawn as a zero-byte tree.
@@ -245,10 +246,7 @@ function treeRow(status: GcStatus): StatusRow {
   const tree = status.tree;
   const total = mbText(tree.totalMb);
   const split = `app ${mbText(tree.appMb)} · orphan ${mbText(tree.orphanMb)}`;
-  const kill = mbText(status.settings.memKillMb);
-  if (tree.totalMb >= status.settings.memKillMb) {
-    return { label, value: `${total} · ${split} · over kill ${kill}`, tone: "danger" };
-  }
+  const kill = `${mbText(status.settings.memKillMb)} (per process)`;
   if (tree.over) {
     return {
       label,
