@@ -355,6 +355,26 @@ describe("onCreated — membership", () => {
     expect(handleFor("L2").archive).not.toHaveBeenCalled();
   });
 
+  it("records each Lead as a dispatch row, so parallel tasks are visible", async () => {
+    const { store, appendFeed } = storedRoom();
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, store);
+
+    await created.onCreated(
+      { agent: agent({ id: "L2", parentAgentId: "S1", title: "Lead: billing export" }) },
+      ctx,
+    );
+
+    expect(appendFeed).toHaveBeenCalledWith({
+      roomId: "S1",
+      kind: "note",
+      from: "S1",
+      to: "L2",
+      label: "dispatch",
+      text: "Lead: billing export",
+    });
+  });
+
   it("places a worker role title under a role-seated lead", async () => {
     const { store, addSeat } = storedRoom();
     const { paseo, handleFor } = fakePaseo();

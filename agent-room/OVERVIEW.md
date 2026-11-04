@@ -1,16 +1,20 @@
-Agent Room runs a supervised team of Paseo agents around one task: a Supervisor that works with you, a Lead that owns the project, and worker roles that do bounded work. The room protocol reaches every role as a system prompt and the plugin enforces it, so the same room runs on Claude Code, Codex, Command Code, and the other providers Paseo supports.
+Agent Room runs a supervised team of Paseo agents around one or more tasks: a Supervisor that works with you, a Lead per independent task, and worker roles that do bounded work. The room protocol reaches every role as a system prompt and the plugin enforces it, so the same room runs on Claude Code, Codex, Command Code, and the other providers Paseo supports.
 
 ## Three kinds of role
 
 Every role has a kind, and the kind is the whole hierarchy:
 
-- `supervisor`: the root of the room and your only point of contact. It pins down what you want, launches Leads, keeps them on course against that intent, and reports back. It does not edit project work.
+- `supervisor`: the root of the room, your only point of contact, and the room's orchestration plane. It pins down what you want, dispatches every independent task to its own Lead as it arrives, keeps them on course against that intent, and reports back. It does not edit project work.
 - `lead`: owns project framing, technical decisions, integration, verification, and acceptance, and launches worker roles.
 - `worker`: takes one bounded outcome from a Lead and talks to that Lead in both directions. It launches nothing.
 
 A role is a name, a kind, a seat (provider, model, and optionally a mode, a thinking level, and provider feature values), a `use for` line, and an optional brief. Roles are saved as one host settings document, so one catalog serves every room on the daemon and survives a plugin reload. The schema requires at least three roles: exactly one supervisor, at least one lead, and at least one worker. Ids and names are unique (names case-insensitively), a name is at most 20 characters and may not contain a colon, because the name is what the title parser reads.
 
 The stock catalog is nine roles. The Claude roles run in `bypassPermissions`; the two Codex roles run in `full-access`, because `bypassPermissions` is a Claude mode id and Codex offers `auto`, `auto-review` and `full-access` instead. The catalog is `Supervisor` (supervisor, `claude/claude-opus-5-5` at `xhigh`), `Lead` (lead, `claude/claude-opus-5-5` at `high`), and seven worker roles — `Implementer` and `Researcher` (`claude/claude-sonnet-5-5` at `medium`), `Reviewer` (`claude/claude-sonnet-5-5` at `high`, with a read-only brief), `Mechanic` (`claude/claude-haiku-4-5` at `medium`), `Specialist` (`claude/claude-opus-5-5` at `medium`), and `Codex` and `Codex Review` (`codex/gpt-5.6-sol` at `medium` and `high`). A Lead picks a role because it fits the work, not because it was told which model to use. The old `peerTiers` document is still read and transformed into roles on load, so an existing settings file keeps working; the first save writes the role shape.
+
+## Orchestration is parallel
+
+The Supervisor is an orchestrator, not a queue. Every independent task Human sends becomes its own Lead, and the ready ones are launched together in one turn; the Supervisor never makes a task wait for a running Lead to finish and never holds a turn open to watch one. A new task arriving mid-run is dispatched in the same turn. Sequencing is reserved for a task whose input is not ready or whose write scope overlaps another Lead's. The guard keeps the hierarchy — a Supervisor creates only Leads, a Lead only workers — and records every Lead create as a `dispatch` row in the room feed, so parallel tasks are visible there and in the status card. Supervision is event-driven: Paseo finish, error and permission notifications wake the Supervisor, and its `supervisor: room` heartbeat every 2 minutes covers the idle gaps. No seat blocks or polls (`paseo wait`, `sleep`, `pgrep`, retry loops), because a blocked Supervisor is what serialized the room.
 
 ## Titles decide roles
 

@@ -447,6 +447,20 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
     store.addSeat(seatRecord(agent, roomId, role, legacy));
     await noteMemberTruncation(agent, roomId, role);
 
+    // Orchestration is visible: a Lead is one task dispatched in parallel, so
+    // the room feed gets its own row instead of hiding the dispatch in the
+    // role tree. The guard still owns the rule; this is the record of it.
+    if (role.kind === "lead") {
+      store.appendFeed({
+        roomId,
+        kind: "note",
+        from: parent.id,
+        to: agent.id,
+        label: "dispatch",
+        text: `${role.name}: ${task.trim().length > 0 ? task.trim() : "(untitled)"}`,
+      });
+    }
+
     const fallbackFrom = resolved?.fallbackFrom;
     if (fallbackFrom !== undefined) {
       // The legacy marker stays as parsed; only the role came from the fallback.

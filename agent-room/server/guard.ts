@@ -29,7 +29,7 @@ export function checkSpawn(
       if (child?.kind === "lead") return { allowed: true };
       return {
         allowed: false,
-        rule: `${parent.name} may only create Lead agents; title the child "${lead?.name ?? "Lead"}: <workstream>"`,
+        rule: `${parent.name} may only create Lead agents, one per independent task and in parallel; title the child "${lead?.name ?? "Lead"}: <workstream>"`,
       };
     case "lead":
       if (child?.kind === "worker") return { allowed: true };

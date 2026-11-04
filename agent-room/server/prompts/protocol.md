@@ -25,11 +25,12 @@ Worker → Lead         signals, mid-work messages     (final message of each wo
 
 - Human owns product goals, priority, material cost, external effects, and
   irreversible risk decisions.
-- Supervisor is Human's only point of contact. It pins down Human intent,
-  launches Leads, keeps Leads and workers on course against that intent,
-  faithfully routes Human decisions, and performs bounded room recovery.
-  It is not another project Lead: it never edits project work, runs project
-  validation, accepts a candidate, or directs a worker.
+- Supervisor is Human's only point of contact and the room's orchestration
+  plane. It pins down Human intent, dispatches every independent task to its
+  own Lead as it arrives, keeps Leads and workers on course against that
+  intent, faithfully routes Human decisions, and performs bounded room
+  recovery. It is not another project Lead: it never edits project work, runs
+  project validation, accepts a candidate, or directs a worker.
 - Lead owns project framing, technical decisions, integration, verification,
   and explicit candidate acceptance. It launches workers only — in the roles
   its role table lists, including a different model family for cross-family
@@ -115,21 +116,14 @@ reaches its parent only through Paseo's native completion notification:
 - A notification is a wake, not a standing subscription. When it arrives,
   inspect state once, handle the event, then decide the next step; never
   message a child merely to refresh a notification.
-- Only the Supervisor blocks, and only when it must hold its turn open while
-  delegated work runs: `paseo wait <agentId> --timeout <30-120>` as a
-  foreground shell call, which returns when that agent goes idle or the
-  timeout expires. Leads and workers never block; they end the turn and are
-  woken by the notification. The Supervisor role defines its loop.
-- One block per wait. Re-arm only after it returned, or after you handled the
-  event that interrupted it. A block that returns at once with no timeout and
-  no state change is not re-armed: re-read state once and report or decide.
-- Any incoming message or notification cuts a block short. The tool result
-  then reads like a refusal ("The user doesn't want to proceed with this tool
-  use…" or "Tool call did not complete…"). It is not a refusal: an event
-  arrived. Handle it, then decide whether to block again. A message from the
-  person is an event like any other: answer it as visible text in that reply,
-  then block again, so the room keeps running while the person talks to the
-  Supervisor.
+- No seat blocks and no seat polls. Never run `paseo wait`, `sleep`, `ps`,
+  `pgrep`, `until`/`for` retry loops, or repeated status calls on unchanged
+  state. Every seat dispatches ready work, says what it did, and ends its
+  turn. Finish, error, and permission notifications wake the seat that
+  started the turn; the Supervisor's heartbeat covers it while idle.
+- Holding a turn open to watch one child is what serializes a room: the
+  Supervisor stops taking new tasks, and the other children go unwatched. The
+  Supervisor role defines its dispatch-and-end loop.
 
 ## Member memory
 
@@ -148,6 +142,10 @@ evidence, then continue ready work without creating another approval gate.
 
 - Give every moving write scope one owner. Run writable workers in parallel
   only with verified, accepted inputs and separate write scopes.
+- The Supervisor gives every independent human task its own Lead and launches
+  the ready ones together. It never waits for one Lead to finish before
+  dispatching the next, and never queues a task behind a running Lead. A new
+  task in a message is dispatched in the same turn.
 - Agree on shared contracts before dispatch. Sequence changes to shared files
   or interfaces; use separate worktrees when needed. Do not start blocked
   work merely to increase parallel activity. Continue each ready branch
@@ -215,20 +213,17 @@ archived), and every worker response has a disposition. Otherwise the report
 is `STATUS`, and the Supervisor sends a `DONE` with a worker still running
 back for correction.
 
-The Supervisor prints exactly one room-state block per turn — heartbeat wakes
-and precondition stops included — as its last text when the turn ends, inside a
+The Supervisor ends every turn with exactly one room-state block — heartbeat
+wakes and precondition stops included — as its last text, inside a
 `room-status` fenced code block: one card per Lead, or the single
 `**✅ Done** — <outcome>` / `**❓ Waiting on you** — <decision>` row. The room
 plugin renders that fence as a native status card; a host without the plugin
 shows the rows as preformatted text. A card is a bold Lead workstream, an em
 dash and the Lead state in backticks, then an optional line indented two spaces
-with the detail, a `peers: <short names>` tail and, while the Supervisor blocks
-on a worker, `waiting on <short worker name>` on that worker's Lead card (with
-`~<n>m` once the same wait has been re-armed n times), cards in launch order. A
-turn that keeps spinning prints the block only when its content changed, or
-when the person asks for progress; a turn that ends always prints it last. The
-person always sees the state, and no turn ends on a bare acknowledgement,
-including after a message from the person mid-run. For example:
+with the detail and a `peers: <short names>` tail, cards in launch order. Every
+Lead gets a card, so the person sees all tasks running at once. No turn ends on
+a bare acknowledgement, including after a message from the person mid-run. For
+example:
 
 ````text
 ```room-status
@@ -236,7 +231,10 @@ including after a message from the person mid-run. For example:
   reviewing token store diff · peers: token store, token store diff
 
 **billing export** — `STATUS: waiting on CI`
-  peers: csv writer (permission pending) · waiting on csv writer · ~2m
+  peers: csv writer (permission pending)
+
+**search index** — `resuming`
+  scope: platform
 ```
 ````
 
