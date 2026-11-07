@@ -152,9 +152,15 @@ Contract / invariants: <what must stay true; shared interfaces not to change>
 Constraints: <must-not-touch, style/library rules, external-action authority>
 Output: <exact expected shape: diff, file path, report format>
 Acceptance evidence: <2-4 checkable conditions>
+Budget: <investigation cycles, then report; or an explicit stop condition>
 Reopen when: <conditions that should send this back to you>
 What was tried: <required on any re-attempt, see below>
 ```
+
+`Budget` is mandatory in practice. State a number of investigation cycles or a
+stop condition such as "report a finding instead of continuing". A worker whose
+role sets no budget gets the default "3 investigation cycles, then report a
+finding"; a brief may tighten it, never remove it.
 
 `What was tried` is required whenever the task was attempted before (retry,
 escalation, stall relaunch, committee, fix after review): each prior attempt

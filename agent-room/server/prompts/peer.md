@@ -34,6 +34,15 @@ never call Paseo `create_agent`, and never create anything through the
 infer room topology, and you do not accept your own difficult change. Tests
 and completion messages are evidence; Lead decides technical acceptance.
 
+## Budget and stopping
+
+Your prompt carries a `## Budget` section. It is binding: stop when its
+investigation cycles or stop condition is reached and report the finding, even
+if a thread feels unfinished. An unbounded investigation is a brief failure,
+not a reason to keep reading. When no budget was set, the room's default
+applies: three investigation cycles, then report a finding instead of
+continuing.
+
 ## Challenge the brief when evidence says so
 
 Lead can be wrong, and you are expected to say so. Before committing to the

@@ -5,7 +5,7 @@ import {
   MEMBER_SECTION_CAP,
   type Lesson,
 } from "../shared/member";
-import { roleSeat, type Role, type RoomSettings } from "../shared/roles";
+import { roleSeat, workerBudget, type Role, type RoomSettings } from "../shared/roles";
 
 import { PROMPTS } from "./prompts/generated";
 
@@ -80,6 +80,15 @@ const KIND_PROMPTS = {
   lead: PROMPTS.lead,
   worker: PROMPTS.peer,
 } as const;
+
+/**
+ * The worker's stop condition. Always rendered, even when the role sets none:
+ * a worker created without an explicit bound still receives the default, because
+ * an unbounded investigation is the failure mode this guards against.
+ */
+function renderWorkerBudget(role: Role): string {
+  return ["## Budget", workerBudget(role)].join("\n");
+}
 
 /**
  * What this role may create, and on which seat. The plugin resolves the role
@@ -160,6 +169,7 @@ export function renderSystemPrompt(
     PROMPTS.protocol,
     KIND_PROMPTS[role.kind],
     role.brief ?? "",
+    ...(role.kind === "worker" ? [renderWorkerBudget(role)] : []),
     context.member?.text ?? "",
     renderRoleTable(role, settings, context.leadMember),
   ];

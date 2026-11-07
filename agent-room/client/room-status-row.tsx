@@ -65,7 +65,19 @@ function StatusCard(props: { card: RoomStatusCard; theme: Theme; pad: number }) 
       )}
       {card.waitingOn === undefined ? null : (
         <Text style={{ color: theme.colors.statusWarning, fontSize: 11 }}>
-          {`waiting on ${card.waitingOn}${card.elapsed === undefined ? "" : ` · ${card.elapsed}`}`}
+          {`waiting on ${card.waitingOn}`}
+        </Text>
+      )}
+      {card.elapsed === undefined && card.cost === undefined ? null : (
+        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
+          {[card.elapsed, card.cost].filter((value) => value !== undefined).join(" · ")}
+        </Text>
+      )}
+      {card.progress === undefined ? null : (
+        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
+          {`progress: ${card.progress.files} files, ${card.progress.commits} ${
+            card.progress.commits === 1 ? "commit" : "commits"
+          }`}
         </Text>
       )}
     </View>

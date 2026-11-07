@@ -4,6 +4,7 @@ import {
   type Role,
   AGENT_TITLE_MAX_LENGTH,
   DEFAULT_SETTINGS,
+  DEFAULT_WORKER_BUDGET,
   ROLE_NAME_MAX_LENGTH,
   parseRoleTitle,
   roleByName,
@@ -11,6 +12,7 @@ import {
   roleSeat,
   roomSettingsSchema,
   seatTitleForRole,
+  workerBudget,
 } from "./roles";
 
 const roles = DEFAULT_SETTINGS.roles;
@@ -123,6 +125,23 @@ describe("roleSeat", () => {
   });
 });
 
+describe("workerBudget", () => {
+  it("uses the role's budget when it sets one", () => {
+    const reviewer = roleByName("Reviewer", roles)!;
+    expect(workerBudget({ ...reviewer, budget: "one review cycle, then report" })).toBe(
+      "one review cycle, then report",
+    );
+  });
+
+  it("gives every worker a default bound when the role sets none", () => {
+    const reviewer = roleByName("Reviewer", roles)!;
+    expect(reviewer.budget).toBeUndefined();
+    expect(workerBudget(reviewer)).toBe(DEFAULT_WORKER_BUDGET);
+    expect(DEFAULT_WORKER_BUDGET).toMatch(/cycles/i);
+    expect(DEFAULT_WORKER_BUDGET).toMatch(/report a finding/i);
+  });
+});
+
 describe("roomSettingsSchema", () => {
   it("accepts DEFAULT_SETTINGS", () => {
     expect(roomSettingsSchema.safeParse(DEFAULT_SETTINGS).success).toBe(true);
@@ -138,6 +157,23 @@ describe("roomSettingsSchema", () => {
     expect(
       roomSettingsSchema.safeParse({
         roles: [...roles, roles.find((role) => role.kind === "supervisor")],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("accepts an optional budget and rejects an empty one", () => {
+    const reviewer = roles.find((role) => role.id === "reviewer")!;
+    expect(roomSettingsSchema.safeParse(DEFAULT_SETTINGS).success).toBe(true);
+    expect(
+      roomSettingsSchema.safeParse({
+        roles: roles.map((role) =>
+          role.id === reviewer.id ? { ...role, budget: "2 cycles, then report" } : role,
+        ),
+      }).success,
+    ).toBe(true);
+    expect(
+      roomSettingsSchema.safeParse({
+        roles: roles.map((role) => (role.id === reviewer.id ? { ...role, budget: "" } : role)),
       }).success,
     ).toBe(false);
   });

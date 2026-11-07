@@ -55,6 +55,24 @@ describe("episodeFactFor", () => {
   it("drops a signal with no text, which would not parse as a fact", () => {
     expect(episodeFactFor(event("DONE", "   "), "lead")).toBeNull();
   });
+
+  it("records a DONE that still carries a FAIL as a blocked fact, not an outcome", () => {
+    const captured = episodeFactFor(
+      event("DONE", "DONE\ninvoice rounding: FAIL\nshipped anyway"),
+      "lead",
+    );
+    expect(captured?.fact).toMatchObject({
+      kind: "blocked",
+      signal: "DONE",
+      text: "DONE\ninvoice rounding: FAIL\nshipped anyway",
+    });
+  });
+
+  it("keeps a clean DONE with only PASS rows as an outcome", () => {
+    expect(episodeFactFor(event("DONE", "DONE\ninvoice rounding: PASS"), "lead")?.fact.kind).toBe(
+      "outcome",
+    );
+  });
 });
 
 describe("EPISODE_SIGNAL_KINDS", () => {

@@ -41,7 +41,23 @@ export const roleSchema = seatConfigSchema.extend({
   kind: roleKindSchema,
   useFor: nonEmptyText,
   brief: z.string().optional(),
+  /**
+   * How much investigation a worker role may do before it must report. A
+   * cycle bound (`"3 investigation cycles, then report"`) or an explicit stop
+   * condition (`"report a finding instead of continuing"`). The prompt renderer
+   * supplies `DEFAULT_WORKER_BUDGET` when a role leaves it unset, so a worker
+   * created without an explicit bound still receives one.
+   */
+  budget: z.string().min(1).optional(),
 });
+
+/** The bound every worker gets when its role sets none. */
+export const DEFAULT_WORKER_BUDGET =
+  "3 investigation cycles, then report a finding instead of continuing; stop at the first accepted candidate.";
+
+export function workerBudget(role: Role): string {
+  return role.budget ?? DEFAULT_WORKER_BUDGET;
+}
 
 export type Role = z.infer<typeof roleSchema>;
 

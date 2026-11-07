@@ -14,6 +14,12 @@ export const ROOM_STATUS_FENCE = "room-status";
 export const ROOM_STATUS_KIND = "room-status";
 export const ROOM_STATUS_VERSION = 1;
 
+/** How much a Lead's workers have actually produced, from the progress probe. */
+export type RoomStatusProgress = {
+  files: number;
+  commits: number;
+};
+
 /** One `**<name>** — `<state>`` card and its optional detail line. */
 export type RoomStatusCard = {
   name: string;
@@ -22,6 +28,9 @@ export type RoomStatusCard = {
   peers: string[];
   waitingOn?: string;
   elapsed?: string;
+  /** Provider-reported spend, when the provider exposes it. */
+  cost?: string;
+  progress?: RoomStatusProgress;
 };
 
 /** The single row a finished or blocked turn ends on. */
@@ -62,6 +71,13 @@ export const roomStatusSchema: z.ZodType<RoomStatusData> = z.object({
       peers: z.array(z.string()),
       waitingOn: z.string().optional(),
       elapsed: z.string().optional(),
+      cost: z.string().optional(),
+      progress: z
+        .object({
+          files: z.number().int().nonnegative(),
+          commits: z.number().int().nonnegative(),
+        })
+        .optional(),
     }),
   ),
   terminal: z
@@ -80,7 +96,7 @@ const DASH = "[—–-]";
 const TERMINAL = new RegExp(`^\\*\\*(✅|❓)\\s*([^*]+?)\\*\\*\\s*${DASH}\\s*(.+)$`);
 const CARD = new RegExp(`^\\*\\*(.+?)\\*\\*\\s*${DASH}\\s*\`(.+?)\`\\s*$`);
 
-/** `detail · peers: a, b · waiting on review · ~2m`, in any order. */
+/** `detail · peers: a, b · waiting on review · progress: 2 files, 1 commit · $0.40 · ~2m`, in any order. */
 function applyDetail(card: RoomStatusCard, line: string): void {
   for (const part of line.split(/\s*·\s*/)) {
     const peers = /^peers:\s*(.*)$/i.exec(part);
@@ -96,9 +112,22 @@ function applyDetail(card: RoomStatusCard, line: string): void {
       card.waitingOn = waiting[1].trim();
       continue;
     }
-    const elapsed = /^(~\s*\d+\s*m)$/i.exec(part);
+    const progress = /^progress:\s*(\d+)\s*files?(?:,\s*(\d+)\s*commits?)?$/i.exec(part);
+    if (progress) {
+      card.progress = {
+        files: Number(progress[1]),
+        commits: progress[2] === undefined ? 0 : Number(progress[2]),
+      };
+      continue;
+    }
+    const cost = /^(?:cost:\s*)?\$(\d+(?:\.\d+)?)$/i.exec(part);
+    if (cost) {
+      card.cost = `$${cost[1]}`;
+      continue;
+    }
+    const elapsed = /^(~\s*\d+\s*(?:h(?:\s*\d+\s*m)?|m))$/i.exec(part);
     if (elapsed) {
-      card.elapsed = elapsed[1].replace(/\s+/g, "");
+      card.elapsed = elapsed[1].replace(/\s+/g, " ");
       continue;
     }
     card.detail = card.detail === undefined ? part : `${card.detail} · ${part}`;
@@ -178,5 +207,13 @@ export function roomStatusLine(card: RoomStatusCard): string {
   if (card.peers.length > 0) parts.push(`peers: ${card.peers.join(", ")}`);
   if (card.waitingOn !== undefined) parts.push(`waiting on ${card.waitingOn}`);
   if (card.elapsed !== undefined) parts.push(card.elapsed);
+  if (card.cost !== undefined) parts.push(card.cost);
+  if (card.progress !== undefined) {
+    parts.push(
+      `progress: ${card.progress.files} files, ${card.progress.commits} ${
+        card.progress.commits === 1 ? "commit" : "commits"
+      }`,
+    );
+  }
   return parts.join(" · ");
 }
