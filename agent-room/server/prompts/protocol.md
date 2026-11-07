@@ -222,11 +222,12 @@ wakes and precondition stops included — as its last text, inside a
 plugin renders that fence as a native status card; a host without the plugin
 shows the rows as preformatted text. A card is a bold Lead workstream, an em
 dash and the Lead state in backticks, then an indented line with the detail,
-`peers: <short names>`, the Lead's `~<elapsed>` and `$<cost>` when the provider
-exposes it, and `progress: <n> files, <n> commits` when it has workers. Every
-Lead gets a card, so the person sees all tasks running at once. No turn ends on
-a bare acknowledgement, including after a message from the person mid-run. For
-example:
+`peers: <short names>`, the Lead's `~<elapsed>` and `$<cost>` read from
+`get_agent_status` (`activeTurn.startedAt`/`createdAt` and
+`lastUsage.totalCostUsd`), and `progress: <n> files, <n> commits` when it has
+workers. Every Lead gets a card, so the person sees all tasks running at once.
+No turn ends on a bare acknowledgement, including after a message from the
+person mid-run. For example:
 
 ````text
 ```room-status

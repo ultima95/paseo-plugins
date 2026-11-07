@@ -79,7 +79,7 @@ The Room screen holds the role editor (one card per role with its name, kind, pr
 
 The live view of one room shows the role tree depth first from the Supervisor, with each agent's role name, provider, model, and live status, and the room feed oldest first with sender, recipient, and label. Both refresh every 2 seconds. A tap on an agent opens it on hosts that offer agent navigation.
 
-The Supervisor ends every turn with one room-state block inside a `room-status` fenced code block. The plugin's timeline transformer parses that fence, and its timeline renderer draws it as a native card: one surface per Lead with the workstream, its live state, the current detail, running workers, the worker the Supervisor is blocking on, the Lead's elapsed time and provider-reported cost, and the file/commit progress the Supervisor's probe found. The reply text around the fence stays Markdown, the room feed shows the same rows as plain lines, and a host without the plugin shows the fence as preformatted text.
+The Supervisor ends every turn with one room-state block inside a `room-status` fenced code block. The plugin's timeline transformer parses that fence, and its timeline renderer draws it as a native card: one surface per Lead with the workstream, its live state, the current detail, running workers, the worker the Supervisor is blocking on, the Lead's elapsed time and cost read from the agent snapshot (`activeTurn.startedAt`, `lastUsage.totalCostUsd`), and the file/commit progress the Supervisor's probe found. The reply text around the fence stays Markdown, the room feed shows the same rows as plain lines, and a host without the plugin shows the fence as preformatted text.
 
 ## Setup
 

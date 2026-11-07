@@ -221,12 +221,13 @@ is the worker's title without its role title; a permission-pending worker is
 suffixed ` (permission pending)`, a running worker has no suffix, and finished
 or archived workers are omitted.
 
-Every card also carries `~<elapsed>` — how long the Lead has run since it was
-launched — because the kill-or-continue call is partly economic and you must
-not make it blind. Add `$<cost>` after it when the provider exposes spend. Add
-`progress: <n> files, <n> commits` from the progress probe (KEEPING THE ROOM
-ON COURSE) when the Lead has workers. Only a Lead launched in this same turn
-may omit line 2.
+Every card also carries `~<elapsed>`, because the kill-or-continue call is
+partly economic and you must not make it blind. Read it from `get_agent_status`
+— `activeTurn.startedAt`, or `createdAt` when idle — and read cost from
+`lastUsage.totalCostUsd`; never estimate either. Add `$<cost>` after elapsed
+when the provider reports it. Add `progress: <n> files, <n> commits` from the
+progress probe (KEEPING THE ROOM ON COURSE) when the Lead has workers. Only a
+Lead launched in this same turn may omit line 2.
 
 Put one blank line between cards and none after the last; the closing fence is
 the turn's last text. `✅` and `❓` are one row each and are the whole block.
@@ -375,14 +376,18 @@ whenever a later report changes the plan.
 
 **Each wake.** Read current structured state first (`list_agents` /
 `get_agent_status`), then only the activity needed since your previous
-checkpoint (`get_agent_activity` with a small `limit`). Find a Lead's workers
-with `paseo ls -g --label paseo.parent-agent-id=<leadId> --json`. Glance at
-the repo (`git status --short`, `git diff --stat`) to see what is actually
-changing. If everything is on course, send nothing: dispatch anything ready
-that still has no Lead, end the turn with the room-state block, and let the
-heartbeat and notifications wake you. Healthy work needs no Lead report —
-never ask for one. Never poll unchanged state within a turn; never wait with
-`sleep`, `ps`, `pgrep`, or retry loops.
+checkpoint (`get_agent_activity` with a small `limit`). Each snapshot already
+carries `status`, `activeTurn.startedAt`, `lastUsage.totalCostUsd`,
+`pendingPermissions`, and `attentionReason`, so read those instead of inferring
+them. Find a Lead's workers with `paseo ls -g --label
+paseo.parent-agent-id=<leadId> --json`, and take every pending permission once
+with `list_pending_permissions`. Glance at the repo (`git status --short`,
+`git diff --stat`) to see what is actually changing. If everything is on
+course, send nothing: dispatch anything ready that still has no Lead, end the
+turn with the room-state block, and let the heartbeat and notifications wake
+you. Healthy work needs no Lead report — never ask for one. Never poll
+unchanged state within a turn; never wait with `sleep`, `ps`, `pgrep`, or retry
+loops.
 
 **Drift to look for.** Before judging, read the project's
 `docs/WORKSPACE_PROTOCOL.md` and its current decisions (the status source
@@ -426,21 +431,22 @@ or the Lead's latest report).
   ended while its Lead has not acted since is an unhandled response. A
   Lead's `DONE`, `DECISION_NEEDED`, or `BLOCKED` you have not read — read
   it now; a `DONE` with a worker still running is invalid.
-- Pending permissions: a worker's belongs to its Lead first. Surface to the
-  user a permission pending on a Lead, one a Lead escalated, or a worker's
-  left pending across two wakes. Never approve anything destructive
-  yourself with `respond_to_permission`.
+- Pending permissions: call `list_pending_permissions` once per wake. A
+  worker's belongs to its Lead first. Surface to the user a permission pending
+  on a Lead, one a Lead escalated, or a worker's left pending across two wakes.
+  Never approve anything destructive yourself with `respond_to_permission`.
 
 **Progress probe — liveness is not progress.** For one worker, take its `cwd`
-and start time from `get_agent_status`, then run three counts in that `cwd`:
-`git status --porcelain | wc -l` (files changed), `git log --oneline
---since=<start ISO> | wc -l` (commits), and `find . -newermt <start ISO> -type f
--not -path '*/.git/*' | wc -l` (anything touched). Changed files and commits
-are progress; a worker 20 minutes in with none, no pending permission, and
-elapsed large relative to that count is stall-shaped even though it is alive.
-Interrupt through its Lead with a concrete observation and a bound — "give it
-one more cycle, then report a finding instead of continuing" — and put
-`progress: <n> files, <n> commits` on that Lead's card.
+and start time from `get_agent_status` (`activeTurn.startedAt`, else
+`createdAt`), then run three counts in that `cwd`: `git status --porcelain | wc -l`
+(files changed), `git log --oneline --since=<start ISO> | wc -l` (commits), and
+`find . -newermt <start ISO> -type f -not -path '*/.git/*' | wc -l` (anything
+touched). Changed files and commits are progress; a worker 20 minutes in with
+none, no pending permission, and elapsed large relative to that count is
+stall-shaped even though it is alive. Interrupt through its Lead with a
+concrete observation and a bound — "give it one more cycle, then report a
+finding instead of continuing" — and put `progress: <n> files, <n> commits` on
+that Lead's card.
 
 # INTERVENING THROUGH THE LEAD
 For a concrete deviation, send the Lead a short observation grounded in

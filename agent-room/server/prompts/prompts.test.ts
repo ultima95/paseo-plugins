@@ -83,7 +83,7 @@ describe("room prompts", () => {
     expect(PROMPTS.supervisor).toContain("Progress probe");
     expect(PROMPTS.supervisor).toContain("git status --porcelain | wc -l");
     expect(PROMPTS.supervisor).toContain("elapsed large relative to that count");
-    expect(PROMPTS.supervisor).toContain("report a finding instead of continuing");
+    expect(PROMPTS.supervisor).toMatch(/report a\s+finding instead of continuing/);
   });
 
   it("shows elapsed, cost and progress on the status card", () => {
@@ -91,6 +91,20 @@ describe("room prompts", () => {
     expect(PROMPTS.supervisor).toContain("$<cost>");
     expect(PROMPTS.supervisor).toContain("progress: <n> files, <n> commits");
     expect(PROMPTS.protocol).toContain("~<elapsed>");
+  });
+
+  it("reads elapsed, cost and permissions from the agent snapshot, not estimates", () => {
+    for (const field of [
+      "activeTurn.startedAt",
+      "lastUsage.totalCostUsd",
+      "pendingPermissions",
+      "attentionReason",
+      "list_pending_permissions",
+    ]) {
+      expect(PROMPTS.supervisor).toContain(field);
+    }
+    expect(PROMPTS.supervisor).toContain("never estimate either");
+    expect(PROMPTS.protocol).toContain("lastUsage.totalCostUsd");
   });
 
   it("keeps verdicts and dispositions distinct, and requires owner evidence", () => {
