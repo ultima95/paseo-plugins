@@ -27,6 +27,7 @@ export type RoleDraft = SeatDraft & {
   kind: RoleKind;
   useFor: string;
   brief?: string;
+  budget?: string;
 };
 
 export type RolePatch = Partial<Role>;
@@ -105,6 +106,9 @@ export function setRole(draft: RoomDraft, id: string, patch: RolePatch): RoomDra
   // brief: it would either ride along into a prompt or fail the schema.
   const brief =
     patch.brief === "" ? undefined : patch.brief !== undefined ? patch.brief : current.brief;
+  // The budget clears the same way; an empty bound would be a schema error.
+  const budget =
+    patch.budget === "" ? undefined : patch.budget !== undefined ? patch.budget : current.budget;
   const next: RoleDraft = {
     ...merged,
     id: current.id,
@@ -112,6 +116,7 @@ export function setRole(draft: RoomDraft, id: string, patch: RolePatch): RoomDra
     kind: patch.kind ?? current.kind,
     useFor: patch.useFor ?? current.useFor,
     ...(brief !== undefined ? { brief } : {}),
+    ...(budget !== undefined ? { budget } : {}),
   };
 
   const roles = draft.roles.slice();

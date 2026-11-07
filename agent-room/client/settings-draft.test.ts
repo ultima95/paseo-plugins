@@ -60,6 +60,18 @@ describe("setRole", () => {
     );
   });
 
+  it("sets and clears a worker budget like the brief", () => {
+    const set = setRole(draft, "reviewer", { budget: "one review cycle, then report" });
+    expect(roleById(set, "reviewer").budget).toBe("one review cycle, then report");
+
+    const kept = setRole(set, "reviewer", { name: "Auditor" });
+    expect(roleById(kept, "reviewer").budget).toBe("one review cycle, then report");
+
+    const cleared = setRole(kept, "reviewer", { budget: "" });
+    expect(roleById(cleared, "reviewer").budget).toBeUndefined();
+    expect(parses(cleared)).toBe(true);
+  });
+
   it("keeps the document valid when only the model moves", () => {
     const next = setRole(draft, "lead", { model: "claude-sonnet-5-5" });
 

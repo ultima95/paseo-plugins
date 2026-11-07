@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { CHARTER_PROMPT_CAP, MEMBER_SECTION_CAP } from "../shared/member";
-import { DEFAULT_SETTINGS, roleByName } from "../shared/roles";
+import { DEFAULT_SETTINGS, DEFAULT_WORKER_BUDGET, roleByName } from "../shared/roles";
 import { PROMPTS } from "./prompts/generated";
 import { renderMemberSection, renderRoleTable, renderSystemPrompt } from "./render";
 
@@ -40,6 +40,24 @@ describe("renderSystemPrompt", () => {
     const p = renderSystemPrompt(lead, DEFAULT_SETTINGS, "BASE");
     expect(p.startsWith("BASE\n\n")).toBe(true);
     expect(p.endsWith(renderRoleTable(lead, DEFAULT_SETTINGS))).toBe(true);
+  });
+
+  it("renders a worker budget, defaulting when the role sets none", () => {
+    const p = renderSystemPrompt(reviewer, DEFAULT_SETTINGS);
+    expect(p).toContain(`## Budget\n${DEFAULT_WORKER_BUDGET}`);
+    expect(p.indexOf("Review only.")).toBeLessThan(p.indexOf(DEFAULT_WORKER_BUDGET));
+  });
+
+  it("uses the role's own budget when it sets one", () => {
+    const bounded = { ...reviewer, budget: "one review cycle, then report" };
+    const p = renderSystemPrompt(bounded, DEFAULT_SETTINGS);
+    expect(p).toContain("## Budget\none review cycle, then report");
+    expect(p).not.toContain(DEFAULT_WORKER_BUDGET);
+  });
+
+  it("gives no budget section to a supervisor or lead", () => {
+    expect(renderSystemPrompt(supervisor, DEFAULT_SETTINGS)).not.toContain("## Budget");
+    expect(renderSystemPrompt(lead, DEFAULT_SETTINGS)).not.toContain("## Budget");
   });
 });
 

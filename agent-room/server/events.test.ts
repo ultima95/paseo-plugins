@@ -1115,6 +1115,131 @@ describe("onCreated — guard", () => {
 describe("onTurnEnded", () => {
   const storedPeer = seat("P1", "S1", "L1", { seat: "peer", tier: "cheap" }, "[room:peer:cheap] logs");
 
+  /** A room feed row that was already there before the turn being recorded. */
+  const feedRow = (over: Partial<FeedEvent> & { text: string }): FeedEvent => ({
+    id: `seed-${over.text}`,
+    roomId: "S1",
+    at: "2026-11-07T09:00:00.000Z",
+    kind: "message",
+    from: null,
+    to: "S1",
+    label: "task",
+    ...over,
+  });
+
+  const endLeadTurn = async (assistant: string, feedRows: FeedEvent[] = []) => {
+    const seeded = storedRoom();
+    seeded.feed.push(...feedRows);
+    const { paseo } = fakePaseo({}, [
+      { item: { type: "user_message", text: "status?" } },
+      { item: { type: "assistant_message", text: assistant } },
+    ]);
+    const { created, ctx } = eventsWith(paseo, seeded.store);
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "L1", parentAgentId: "S1" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+    return seeded.appendFeed;
+  };
+
+  const notes = (appendFeed: ReturnType<typeof vi.fn>, label: string) =>
+    appendFeed.mock.calls
+      .map((call) => call[0] as Omit<FeedEvent, "id" | "at">)
+      .filter((event) => event.label === label);
+
+  it("cannot write a fabricated owner-accepted claim silently", async () => {
+    const appendFeed = await endLeadTurn("DONE\n**invoice rounding**: owner-accepted");
+
+    const attribution = notes(appendFeed, "attribution");
+    expect(attribution).toHaveLength(1);
+    expect(attribution[0]).toMatchObject({ kind: "note", from: "L1" });
+    expect(attribution[0]?.text).toContain("not traceable");
+    expect(attribution[0]?.text).toContain("accepted-by-lead");
+  });
+
+  it("audits a legacy lead seat that predates role titles", async () => {
+    const { store, appendFeed } = fakeStore({
+      rooms: [room("S1")],
+      seats: [
+        seat("S1", "S1", null, { seat: "supervisor" }),
+        seat("L1", "S1", "S1", { seat: "lead" }, "[room:lead] invoice"),
+      ],
+    });
+    const { paseo } = fakePaseo({}, [
+      { item: { type: "user_message", text: "status?" } },
+      { item: { type: "assistant_message", text: "DONE\ninvoice: owner-accepted" } },
+    ]);
+    const { created, ctx } = eventsWith(paseo, store);
+
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "L1", parentAgentId: "S1" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+
+    const note = appendFeed.mock.calls
+      .map((call) => call[0] as Omit<FeedEvent, "id" | "at">)
+      .find((event) => event.label === "attribution");
+    expect(note?.text).toContain("accepted-by-lead");
+  });
+
+  it("leaves an owner-accepted claim alone when a Human turn supports it", async () => {
+    const appendFeed = await endLeadTurn("DONE\ninvoice rounding: owner-accepted", [
+      feedRow({ text: "I accept invoice rounding, ship it" }),
+    ]);
+
+    expect(notes(appendFeed, "attribution")).toHaveLength(0);
+  });
+
+  it("accepts a claim backed by the Human message that arrived in the same turn", async () => {
+    const seeded = storedRoom();
+    const { paseo } = fakePaseo({}, [
+      { item: { type: "user_message", text: "I accept invoice rounding, ship it" } },
+      { item: { type: "assistant_message", text: "DONE\ninvoice rounding: owner-accepted" } },
+    ]);
+    const { created, ctx } = eventsWith(paseo, seeded.store);
+
+    await created.onTurnEnded(
+      {
+        agent: agent({ id: "S1", title: "Supervisor: fix auth" }),
+        turnId: "t1",
+        outcome: { kind: "completed" },
+        timeline: [],
+      },
+      ctx,
+    );
+
+    expect(notes(seeded.appendFeed, "attribution")).toHaveLength(0);
+  });
+
+  it("makes a FAIL-to-PASS move loud when nothing new was walked", async () => {
+    const appendFeed = await endLeadTurn("DONE\ninvoice rounding: PASS", [
+      feedRow({ from: "L1", to: "S1", label: "DONE", text: "DONE\ninvoice rounding: FAIL" }),
+    ]);
+
+    const change = notes(appendFeed, "verdict change");
+    expect(change).toHaveLength(1);
+    expect(change[0]?.text).toContain("invoice rounding: FAIL → PASS");
+    expect(change[0]?.text).toContain("never a silent PASS");
+  });
+
+  it("stays quiet when the new PASS cites a fresh candidate", async () => {
+    const appendFeed = await endLeadTurn("DONE\ninvoice rounding: PASS\ncommit abc1234", [
+      feedRow({ from: "L1", to: "S1", label: "DONE", text: "DONE\ninvoice rounding: FAIL" }),
+    ]);
+
+    expect(notes(appendFeed, "verdict change")).toHaveLength(0);
+  });
+
   it("appends the turn's feed events for a stored seat", async () => {
     const { store, appendFeed } = fakeStore({
       rooms: [room("S1")],

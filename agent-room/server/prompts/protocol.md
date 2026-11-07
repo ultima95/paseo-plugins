@@ -98,11 +98,12 @@ room seat is archived by the room guard. That is why a seat never creates one
   and the worker then resumes.
 - Lead → Supervisor: the final message of each Lead turn. Only turns the
   Supervisor started notify it; turns woken by a worker reach it through the
-  Supervisor's own inspections (or its heartbeat when it is idle). Healthy
-  work needs no report beyond that.
-- Everything is event-driven: finish, error, permission, and heartbeat events
-  wake a seat. Never wait with `sleep`, `ps`, `pgrep`, `until`/`for` retry
-  loops, or repeated status calls on unchanged state.
+  Supervisor's own inspections. Healthy work needs no report beyond that.
+- Everything is event-driven: finish, error, and permission notifications
+  wake the seat that started the turn, and a heartbeat (when a room adopted
+  one) covers an adopted room or a missed notification. Never wait with
+  `sleep`, `ps`, `pgrep`, `until`/`for` retry loops, or repeated status calls
+  on unchanged state.
 
 ### notifyOnFinish — the only report channel
 
@@ -120,7 +121,8 @@ reaches its parent only through Paseo's native completion notification:
   `pgrep`, `until`/`for` retry loops, or repeated status calls on unchanged
   state. Every seat dispatches ready work, says what it did, and ends its
   turn. Finish, error, and permission notifications wake the seat that
-  started the turn; the Supervisor's heartbeat covers it while idle.
+  started the turn; an adopted room adds a 15-minute heartbeat as a stall
+  detector.
 - Holding a turn open to watch one child is what serializes a room: the
   Supervisor stops taking new tasks, and the other children go unwatched. The
   Supervisor role defines its dispatch-and-end loop.
@@ -219,8 +221,9 @@ wakes and precondition stops included — as its last text, inside a
 `**✅ Done** — <outcome>` / `**❓ Waiting on you** — <decision>` row. The room
 plugin renders that fence as a native status card; a host without the plugin
 shows the rows as preformatted text. A card is a bold Lead workstream, an em
-dash and the Lead state in backticks, then an optional line indented two spaces
-with the detail and a `peers: <short names>` tail, cards in launch order. Every
+dash and the Lead state in backticks, then an indented line with the detail,
+`peers: <short names>`, the Lead's `~<elapsed>` and `$<cost>` when the provider
+exposes it, and `progress: <n> files, <n> commits` when it has workers. Every
 Lead gets a card, so the person sees all tasks running at once. No turn ends on
 a bare acknowledgement, including after a message from the person mid-run. For
 example:
@@ -228,15 +231,28 @@ example:
 ````text
 ```room-status
 **auth refactor** — `running`
-  reviewing token store diff · peers: token store, token store diff
+  reviewing token store diff · peers: token store, token store diff · ~18m · $1.40 · progress: 4 files, 1 commit
 
 **billing export** — `STATUS: waiting on CI`
-  peers: csv writer (permission pending)
+  peers: csv writer (permission pending) · ~42m · $0.85 · progress: 0 files, 0 commits
 
 **search index** — `resuming`
-  scope: platform
+  scope: platform · ~1m
 ```
 ````
+
+## Verdicts and dispositions
+
+A **verdict** is what verification found for a named work item: `FAIL`, `PASS`,
+or `BLOCKED`, written as `<work>: <verdict>`. A **disposition** is what the room
+decided about that verdict: `owner-accepted`, `accepted-by-<role>`, or
+`blocked-by-<role>`. Keep them separate: shipping a known defect is a `FAIL`
+with an accepted disposition or a `BLOCKED` with an owner, never a silent
+`PASS`. `owner-accepted` is a claim about a Human: it is valid only when a
+recorded Human turn says so. When no such turn exists the room records the
+accepting role (`accepted-by-supervisor`) and flags the mismatch in the feed.
+Never rewrite a verification record to drop a `FAIL`, and never label an
+unanswered request as accepted.
 
 ## Independent judgment and debate
 

@@ -7,6 +7,7 @@ import {
 } from "../shared/member";
 import type { RoleKind } from "../shared/roles";
 import type { FeedEvent } from "../shared/room";
+import { hasUnresolvedVerdict } from "./record";
 
 /** Only these five signals become episode facts. */
 export const EPISODE_SIGNAL_KINDS: Readonly<Record<string, EpisodeKind>> = {
@@ -69,10 +70,16 @@ export function episodeFactFor(
   const redacted = redactSecrets(event.text);
   // `episodeFactSchema` requires non-empty text, so a blank signal carries no fact.
   if (redacted.text.trim().length === 0) return null;
+  // A verdict and a disposition are different facts. A `DONE` or `ACCEPT` that
+  // still carries a `FAIL` or `BLOCKED` row is shipped-anyway: it becomes a
+  // blocked fact, never a clean outcome. The signal is kept, so a reader sees
+  // that the seat said DONE and the record still says FAIL.
+  const finalKind: EpisodeKind =
+    kind === "outcome" && hasUnresolvedVerdict(redacted.text) ? "blocked" : kind;
   return {
     fact: {
       at: event.at,
-      kind,
+      kind: finalKind,
       signal: event.label,
       text: redacted.text,
     },

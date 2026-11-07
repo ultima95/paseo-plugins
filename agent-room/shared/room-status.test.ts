@@ -68,6 +68,29 @@ describe("parseRoomStatusMessage", () => {
     });
   });
 
+  it("reads elapsed, cost and worker progress on the detail line", () => {
+    const text = message(
+      ...fenced(
+        "**auth refactor** — `running`",
+        "  reviewing token store diff · peers: reviewer · ~1h 5m · $1.40 · progress: 4 files, 1 commit",
+      ),
+    );
+    expect(parseRoomStatusMessage(text)?.cards[0]).toEqual({
+      name: "auth refactor",
+      state: "running",
+      detail: "reviewing token store diff",
+      peers: ["reviewer"],
+      elapsed: "~1h 5m",
+      cost: "$1.40",
+      progress: { files: 4, commits: 1 },
+    });
+  });
+
+  it("defaults a progress row with no commit count to zero commits", () => {
+    const text = message(...fenced("**auth** — `running`", "  progress: 3 files"));
+    expect(parseRoomStatusMessage(text)?.cards[0]?.progress).toEqual({ files: 3, commits: 0 });
+  });
+
   it("reads a done row as the whole block", () => {
     const text = message(...fenced("**✅ Done** — committed on feat/auth, 14 tests pass"));
     expect(parseRoomStatusMessage(text)).toEqual({
@@ -140,8 +163,12 @@ describe("roomStatusLine", () => {
         peers: ["csv writer"],
         waitingOn: "csv writer",
         elapsed: "~2m",
+        cost: "$0.40",
+        progress: { files: 2, commits: 1 },
       }),
-    ).toBe("billing export · STATUS: waiting on CI · records recorded · peers: csv writer · waiting on csv writer · ~2m");
+    ).toBe(
+      "billing export · STATUS: waiting on CI · records recorded · peers: csv writer · waiting on csv writer · ~2m · $0.40 · progress: 2 files, 1 commit",
+    );
   });
 
   it("omits what the card does not have", () => {

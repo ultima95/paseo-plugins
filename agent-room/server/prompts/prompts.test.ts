@@ -70,4 +70,39 @@ describe("room prompts", () => {
     for (const name of PROMPT_NAMES)
       expect(PROMPTS[name]).toBe(await readFile(new URL(`./${name}.md`, import.meta.url), "utf8"));
   });
+
+  it("makes the heartbeat a 15-minute adoption detector, not a 2-minute poll", () => {
+    expect(PROMPTS.supervisor).toContain("*/15 * * * *");
+    expect(PROMPTS.supervisor).not.toContain("*/2 * * * *");
+    expect(PROMPTS.supervisor).toMatch(/event-driven/i);
+    expect(PROMPTS.supervisor).toMatch(/stall detector/i);
+    expect(PROMPTS.supervisor).toMatch(/10–60 minutes/);
+  });
+
+  it("gives the Supervisor a progress probe and a stall heuristic", () => {
+    expect(PROMPTS.supervisor).toContain("Progress probe");
+    expect(PROMPTS.supervisor).toContain("git status --porcelain | wc -l");
+    expect(PROMPTS.supervisor).toContain("elapsed large relative to that count");
+    expect(PROMPTS.supervisor).toContain("report a finding instead of continuing");
+  });
+
+  it("shows elapsed, cost and progress on the status card", () => {
+    expect(PROMPTS.supervisor).toContain("~<elapsed>");
+    expect(PROMPTS.supervisor).toContain("$<cost>");
+    expect(PROMPTS.supervisor).toContain("progress: <n> files, <n> commits");
+    expect(PROMPTS.protocol).toContain("~<elapsed>");
+  });
+
+  it("keeps verdicts and dispositions distinct, and requires owner evidence", () => {
+    expect(PROMPTS.protocol).toContain("## Verdicts and dispositions");
+    expect(PROMPTS.protocol).toMatch(/never a silent\s+`PASS`/);
+    expect(PROMPTS.protocol).toContain("recorded Human turn");
+    expect(PROMPTS.protocol).toContain("accepted-by-supervisor");
+  });
+
+  it("carries a bound into every worker brief and worker prompt", () => {
+    expect(PROMPTS.lead).toContain("Budget: <investigation cycles");
+    expect(PROMPTS.lead).toMatch(/3 investigation cycles/);
+    expect(PROMPTS.peer).toContain("## Budget and stopping");
+  });
 });

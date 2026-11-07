@@ -6,7 +6,7 @@ import type {
 } from "@getpaseo/plugin/server";
 
 import type { MemberRecord, MemberRole } from "../shared/member";
-import type { SeatRecord } from "../shared/room";
+import type { FeedEvent, SeatRecord } from "../shared/room";
 import { GUARD_ROW_KIND, GUARD_ROW_VERSION } from "../shared/room";
 import { parseRoleTitle, roleForLegacyMarker, type Role, type RoomSettings } from "../shared/roles";
 import { parseSeatMarker, type SeatMarker } from "../shared/seats";
@@ -16,6 +16,7 @@ import { checkSpawn } from "./guard";
 import type { Logger } from "./logger";
 import type { MemberStore } from "./member-store";
 import { applyPromotion } from "./promotion";
+import { auditAcceptance, verdictsIn, verdictUpgrades } from "./record";
 import { renderMemberSection } from "./render";
 import { candidateScope, scopesFor } from "./scope";
 import type { RoomStore } from "./store";
@@ -524,8 +525,15 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
       return memberPresent;
     };
 
+    // The room before this turn: an `owner-accepted` claim may only be vouched
+    // for by a Human turn the room already recorded, and a verdict change may
+    // only be judged against a row that was there before this turn wrote one.
+    const feedBefore = store.room(seat.roomId)?.feed ?? [];
+    const storedTurn: FeedEvent[] = [];
+
     for (const draft of feedFromTurn({ agent: seat, childIds, timeline })) {
       const stored = store.appendFeed({ roomId: seat.roomId, ...draft });
+      storedTurn.push(stored);
       if (memberId === null) continue;
       // Only the seat's own reply is member memory. A user, task or instruction
       // row can open with a signal word (`REJECT: …`) without being the seat's
@@ -546,6 +554,68 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
         });
       }
       await deps.members.appendEpisode(memberId, seat.roomId, captured.fact);
+    }
+
+    // Record integrity is the room's job, not the seat's goodwill. A Lead whose
+    // goal is a green report can rewrite a row or attribute an acceptance nobody
+    // gave; both are caught here and made loud in the feed, without blocking the
+    // turn.
+    // A seat recorded before roles carries a marker instead of `roleKind`; read
+    // it so an in-flight legacy room gets the same audit. A worker is never
+    // audited: its claim belongs to its Lead.
+    const auditKind =
+      seat.roleKind ??
+      (seat.marker?.seat === "supervisor" || seat.marker?.seat === "lead"
+        ? seat.marker.seat
+        : seat.marker?.seat === "peer"
+          ? "worker"
+          : undefined);
+    if (auditKind !== "supervisor" && auditKind !== "lead") return;
+    const own = storedTurn.filter((event) => event.from === agent.id).at(-1);
+    if (own === undefined) return;
+
+    // The Human's utterance can arrive in the same turn the seat echoes it, so
+    // the audit sees this turn's incoming rows too. The seat's own reply is
+    // excluded: a claim cannot vouch for itself.
+    const auditFeed = [
+      ...feedBefore,
+      ...storedTurn.filter((event) => event.from !== agent.id),
+    ];
+
+    for (const audit of auditAcceptance({
+      text: own.text,
+      feed: auditFeed,
+      role: auditKind,
+    })) {
+      if (audit.verified) continue;
+      const work = audit.work === null ? "the work" : `"${audit.work}"`;
+      store.appendFeed({
+        roomId: seat.roomId,
+        kind: "note",
+        from: agent.id,
+        to: null,
+        label: "attribution",
+        text: `owner-accepted is not traceable to a recorded Human turn for ${work}; recorded ${audit.recorded}.`,
+      });
+    }
+
+    const earlierVerdicts = [...feedBefore]
+      .reverse()
+      .find(
+        (event) =>
+          event.kind === "message" && event.from === agent.id && verdictsIn(event.text).length > 0,
+      );
+    if (earlierVerdicts === undefined) return;
+
+    for (const change of verdictUpgrades(earlierVerdicts.text, own.text)) {
+      store.appendFeed({
+        roomId: seat.roomId,
+        kind: "note",
+        from: agent.id,
+        to: null,
+        label: "verdict change",
+        text: `${change.work}: ${change.from} → ${change.to} with no new candidate or walk; record it as ${change.from} with a disposition, never a silent PASS.`,
+      });
     }
   };
 

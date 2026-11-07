@@ -66,11 +66,13 @@ function childNamedIn(text: string, childIds: readonly string[]): string | null 
 }
 
 /**
- * The Supervisor protocol mandates a 2-minute heartbeat named `supervisor: room`,
- * whose prompt opens with this tag. A long room writes hundreds of those prompt
- * turns, and each one is a `user_message` in the timeline: emitted as feed rows
- * they would evict the room's real history at the 500-row cap, so a heartbeat
- * wake is not a room turn and contributes no user row.
+ * The Supervisor protocol's heartbeat is a stall detector created only when a
+ * room is adopted (or a finish notification was missed), and its prompt opens
+ * with this tag. A long room writes one of these prompt turns per wake, and each
+ * one is a `user_message` in the timeline: emitted as feed rows they would
+ * evict the room's real history at the 500-row cap, so a heartbeat wake is not a
+ * room turn and contributes no user row. The tag, not the cadence, is the
+ * contract: changing the heartbeat interval must not change what the feed shows.
  */
 const HEARTBEAT_TAG = "[supervisor-heartbeat]";
 
