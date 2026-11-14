@@ -1,40 +1,47 @@
 import type { PluginSidebarItemProps } from "@getpaseo/plugin/client";
-import { useWorkspaces } from "@getpaseo/plugin/client";
-import { SidebarRow, Icon } from "@getpaseo/plugin/client/ui";
+import { Icon, SidebarRow } from "@getpaseo/plugin/client/ui";
 import { useMemo } from "react";
 import { Text, View } from "react-native";
-import { needsYou } from "./board-model";
+import { groupBoard, isChildWorkspace } from "./board-model";
 import { colorWithAlpha, columnAccent } from "./column-accent";
+import { useBoardWorkspaces } from "./use-board-workspaces";
 
 export function BoardItem({ currentScreen, openScreen, theme }: PluginSidebarItemProps) {
-  // Sidebar items, unlike screens, run inside the host's state context. The board reads the
-  // daemon `status` rather than the snapshot's `indicator`, so this count matches its columns.
-  const count = useWorkspaces({
-    where: (ws) =>
-      needsYou({
-        indicator: ws.status,
-        labels: ws.labels,
-        background: ws.background,
-        archivingAt: ws.archivingAt,
-      }),
-  }).length;
+  // The board's own subscription, so the count matches its columns on every host version.
+  const board = useBoardWorkspaces();
+  const counts = useMemo(() => {
+    if (board.status !== "ready") return { blocked: 0, review: 0 };
+    const grouped = groupBoard(
+      board.workspaces.filter((workspace) => !isChildWorkspace(workspace)),
+    );
+    return { blocked: grouped["needs-you"].length, review: grouped.review.length };
+  }, [board]);
 
-  const accent = useMemo(() => columnAccent("needs-you", theme.colors), [theme]);
+  const badges = useMemo(
+    () =>
+      (
+        [
+          { column: "needs-you", icon: "AlertCircle", label: "needs input", count: counts.blocked },
+          { column: "review", icon: "Eye", label: "to review", count: counts.review },
+        ] as const
+      ).filter((badge) => badge.count > 0),
+    [counts],
+  );
 
   const styles = useMemo(
     () => ({
+      row: { flexDirection: "row" as const, alignItems: "center" as const, gap: 4 },
       badge: {
         flexDirection: "row" as const,
         alignItems: "center" as const,
         gap: 4,
-        backgroundColor: colorWithAlpha(accent, 0.14),
         borderRadius: 999,
         paddingHorizontal: 7,
         paddingVertical: 2,
       },
-      count: { color: accent, fontSize: 11, fontWeight: "600" as const },
+      count: { fontSize: 11, fontWeight: "600" as const },
     }),
-    [accent],
+    [],
   );
 
   return (
@@ -43,15 +50,23 @@ export function BoardItem({ currentScreen, openScreen, theme }: PluginSidebarIte
       active={currentScreen?.screenId === "board"}
       onPress={() => openScreen({ screenId: "board" })}
       trailing={
-        count > 0 ? (
-          <View
-            style={styles.badge}
-            accessibilityLabel={`${count} ${count === 1 ? "workspace needs" : "workspaces need"} you`}
-          >
-            <Icon name="AlertCircle" size={11} color={accent} />
-            <Text style={styles.count}>{count}</Text>
+        badges.length === 0 ? undefined : (
+          <View style={styles.row}>
+            {badges.map((badge) => {
+              const accent = columnAccent(badge.column, theme.colors);
+              return (
+                <View
+                  key={badge.column}
+                  style={[styles.badge, { backgroundColor: colorWithAlpha(accent, 0.14) }]}
+                  accessibilityLabel={`${badge.count} ${badge.label}`}
+                >
+                  <Icon name={badge.icon} size={11} color={accent} />
+                  <Text style={[styles.count, { color: accent }]}>{badge.count}</Text>
+                </View>
+              );
+            })}
           </View>
-        ) : undefined
+        )
       }
     />
   );

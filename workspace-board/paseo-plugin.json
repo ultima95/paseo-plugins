@@ -3,6 +3,6 @@
   "name": "Workspace Board",
   "description": "A board of open workspaces grouped by what needs you",
   "requirements": {
-    "paseo": ">=0.16.0-beta.2"
+    "paseo": ">=0.15.0"
   }
 }

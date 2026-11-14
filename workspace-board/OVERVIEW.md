@@ -10,13 +10,15 @@ Each workspace appears as a card in one of five columns:
 
 A card shows the workspace title, its project, and how long it has been in its current state. Pressing a card opens the workspace. The Park button on a card moves it to Parked. A parked workspace stays out of the way unless it starts needing you, fails, or finishes; then it moves back to the matching column.
 
-Child workspaces, the worktrees an agent creates from another workspace, are never shown as cards; the board keeps a quiet count of how many it left out. A sidebar row opens the board and shows a count of workspaces in Needs you and Review. The count is hidden when it is zero.
+Child workspaces, the worktrees an agent creates from another workspace, are never shown as cards; the board keeps a quiet count of how many it left out. A sidebar row opens the board and carries one count per attention column, Needs you and Review, each hidden when it is zero.
 
 The board updates as workspace state changes. Background workspaces and workspaces being archived are not shown.
 
 ## Requirements
 
-Paseo 0.16.0-beta.2 or later on both the daemon and the app.
+Paseo 0.15.0 or later on both the daemon and the app.
+
+On 0.15 hosts the daemon does not report which workspaces an agent created, so child workspaces cannot be detected, and the workspace handle has no label API, so the Park button is hidden. Everything else works the same.
 
 ## What it reads and writes
 

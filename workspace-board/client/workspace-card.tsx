@@ -111,6 +111,9 @@ export function WorkspaceCard({
   const isParked = workspace.labels.some(
     (label) => label.toLowerCase() === PARKED_LABEL.toLowerCase(),
   );
+  // Older hosts have no label API on a workspace handle; hide Park rather than fail on press.
+  const canPark =
+    typeof (paseo.workspaces.ref(workspace.id) as { setLabel?: unknown }).setLabel === "function";
 
   async function togglePark() {
     try {
@@ -166,15 +169,17 @@ export function WorkspaceCard({
       ) : (
         <View style={styles.body}>{body}</View>
       )}
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={`${isParked ? "Unpark" : "Park"} ${title}`}
-        onPress={togglePark}
-        style={({ pressed }) => [styles.parkButton, pressed && styles.pressed]}
-      >
-        <Icon name={isParked ? "ArchiveRestore" : "Archive"} size={12} color={theme.colors.foregroundMuted} />
-        <Text style={styles.parkLabel}>{isParked ? "Unpark" : "Park"}</Text>
-      </Pressable>
+      {canPark ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`${isParked ? "Unpark" : "Park"} ${title}`}
+          onPress={togglePark}
+          style={({ pressed }) => [styles.parkButton, pressed && styles.pressed]}
+        >
+          <Icon name={isParked ? "ArchiveRestore" : "Archive"} size={12} color={theme.colors.foregroundMuted} />
+          <Text style={styles.parkLabel}>{isParked ? "Unpark" : "Park"}</Text>
+        </Pressable>
+      ) : null}
     </View>
   );
 }
