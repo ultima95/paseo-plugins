@@ -69,6 +69,10 @@ Every role gets its prompt through `config.systemPrompt`: any system prompt the 
 
 The separate `command-code` plugin carries the same prompt to Command Code roles. It is not bundled with agent-room. Command Code has no ACP field for a session system prompt, so that plugin stages the prompt in a per-connection file and ships a small Command Code mod that appends it.
 
+## Provider questions
+
+A provider question tool is not a room channel, but a model can still call one. Paseo's finish subscription only wakes a caller for a turn it started, and a Lead woken by a worker runs turns its Supervisor did not start, so a question in one of those turns can arrive with no notification and block the Lead invisibly. The plugin therefore listens to `agent.permission_requested`: a `question` request on a Lead is relayed to its Supervisor, a worker's to its Lead, with the question, its options, the asking agent id and the `requestId`. The request stays pending; the receiving seat closes it with `respond_to_permission` using the answer keyed by question header, so the Lead's tool result receives the real answer. The relay is written once to the room feed under `question pending` and deduplicated by request id. The role prompts forbid the native tool and keep `DECISION_NEEDED` (Lead) or `QUESTION` (worker) as the normal path; the relay is the guard for when a provider invokes it anyway.
+
 ## The guard
 
 A Supervisor may create only Leads, a Lead only worker roles, and a worker role nothing. When a room agent breaks that rule, the new child is archived, the violator is told which rule it broke and which title to use instead — named from the catalog, so the message says `Lead: <workstream>` or `Implementer: <outcome>` for the roles actually configured — the room feed gets a guard row, and a worker's Lead also gets a `room-guard` row in its timeline. A child whose title names no role carries no role, so it counts as the same kind of violation and is archived the same way: that is the only case in which an unmanaged agent is touched.

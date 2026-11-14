@@ -4,6 +4,7 @@ import type {
   PluginHookContext,
   PluginLifecycleEvents,
 } from "@getpaseo/plugin/server";
+import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 
 import type { MemberRecord, MemberRole } from "../shared/member";
 import type { FeedEvent, SeatRecord } from "../shared/room";
@@ -65,6 +66,10 @@ export interface RoomEvents {
   ): Promise<void>;
   onTurnEnded(
     event: PluginLifecycleEvents["agent.turn_ended"],
+    ctx: PluginHookContext,
+  ): Promise<void>;
+  onPermissionRequested(
+    event: PluginLifecycleEvents["agent.permission_requested"],
     ctx: PluginHookContext,
   ): Promise<void>;
   onArchived(
@@ -153,6 +158,128 @@ export async function lookupTitle(paseo: PaseoApi, agentId: string): Promise<str
   }
 }
 
+/** The feed label for a question the room relayed to a parent seat. */
+export const QUESTION_RELAY_LABEL = "question pending";
+
+interface PendingQuestion {
+  header: string;
+  question: string;
+  options: Array<{ label: string; description?: string }>;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function asText(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+/**
+ * The questions a provider sent with a permission request, normalized the way
+ * Paseo's question form reads them. A provider that omits `questions` leaves the
+ * request title and description as the only text worth relaying.
+ */
+function pendingQuestions(request: AgentPermissionRequest): PendingQuestion[] {
+  const input = asRecord(request.input);
+  const list = Array.isArray(input?.questions) ? input.questions : [];
+  const questions: PendingQuestion[] = [];
+  for (const [index, value] of list.entries()) {
+    const question = asRecord(value);
+    const text = asText(question?.question);
+    if (!question || !text) continue;
+    const header = asText(question.header) ?? `Question ${index + 1}`;
+    const options: PendingQuestion["options"] = [];
+    for (const entry of Array.isArray(question.options) ? question.options : []) {
+      const label = typeof entry === "string" ? asText(entry) : asText(asRecord(entry)?.label);
+      if (!label) continue;
+      const description = asText(asRecord(entry)?.description);
+      options.push(description === undefined ? { label } : { label, description });
+    }
+    questions.push({ header, question: text, options });
+  }
+  return questions;
+}
+
+/** The question itself, with its headers and options, as the parent should see it. */
+function questionBody(
+  seat: SeatRecord,
+  request: AgentPermissionRequest,
+  questions: readonly PendingQuestion[],
+): string {
+  const name = seat.title.trim() || seat.agentId;
+  const lines = [
+    `[room-question] ${name} (${seat.agentId}) is waiting on a provider question (request ${request.id}).`,
+    "",
+  ];
+  if (questions.length === 0) {
+    lines.push(
+      asText(request.description) ?? asText(request.title) ?? "A question is pending with no text.",
+    );
+    return lines.join("\n");
+  }
+  for (const [index, question] of questions.entries()) {
+    lines.push(`${index + 1}. ${question.header}`, question.question);
+    if (question.options.length > 0) {
+      lines.push("Options:");
+      for (const option of question.options) {
+        lines.push(
+          `- ${option.label}${option.description === undefined ? "" : ` — ${option.description}`}`,
+        );
+      }
+    }
+    lines.push("");
+  }
+  return lines.join("\n").trimEnd();
+}
+
+/**
+ * How the seat that receives the relay should close it. The Supervisor must not
+ * answer for Human; a worker's Lead answers inside its own workstream, and only
+ * escalates a decision Human owns.
+ */
+function questionReply(
+  agentId: string,
+  request: AgentPermissionRequest,
+  questions: readonly PendingQuestion[],
+  target: "supervisor" | "lead",
+): string {
+  const example: Record<string, string> = {};
+  for (const question of questions) example[question.header] = "<answer>";
+  const allow = JSON.stringify({
+    agentId,
+    requestId: request.id,
+    response: { behavior: "allow", updatedInput: { answers: example } },
+  });
+  const deny = JSON.stringify({
+    agentId,
+    requestId: request.id,
+    response: { behavior: "deny", message: "The question was dismissed." },
+  });
+  const instruction =
+    target === "supervisor"
+      ? "This is yours to relay, not to answer. Present the question and its options to Human verbatim, then wait for their answer."
+      : "This is inside your workstream, not Human's. Answer it as the owning Lead, or send the worker the answer as a normal instruction.";
+  const keys =
+    questions.length === 0
+      ? ""
+      : ` Keep every answer keyed by its header: ${questions.map((question) => question.header).join(", ")}.`;
+  return [
+    instruction,
+    keys.trim(),
+    `Close the pending question with respond_to_permission: ${allow}`,
+    `If it is dismissed instead, use: ${deny}`,
+    "If the request is no longer pending, do nothing: it was already answered.",
+  ]
+    .filter((line) => line.length > 0)
+    .join("\n");
+}
+
+function relayTag(id: string): string {
+  return `request: ${id}`;
+}
+
 /** One plain-text message: what was archived and the rule it broke. */
 function violationMessage(childId: string, childTitle: string, rule: string): string {
   const name = childTitle.trim() === "" ? "(untitled)" : childTitle;
@@ -165,6 +292,9 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
   const store = deps.store;
   const log = deps.log;
   const now = deps.now ?? (() => Date.now());
+  // A relayed question is answered on the asking agent, so the same request is
+  // never relayed twice in this process; the feed row covers a plugin reload.
+  const relayedQuestions = new Set<string>();
 
   const resolveParent = async (
     agent: PluginHookAgent,
@@ -620,6 +750,85 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
   };
 
   /**
+   * A provider question blocks its turn and addresses the person directly, but
+   * only the Supervisor owns that channel. Paseo wakes a caller only for a turn
+   * it started, and a Lead that wakes from a worker turns autonomously, so its
+   * question can arrive with no notification. Relay it to the seat that owns the
+   * next level instead, once per request, and leave the request pending: the
+   * receiving seat closes it with `respond_to_permission`.
+   */
+  const handlePermissionRequested = async (
+    agent: PluginHookAgent,
+    request: AgentPermissionRequest,
+    paseo: PaseoApi,
+  ): Promise<void> => {
+    if (request.kind !== "question") return;
+    const seat = store.seat(agent.id);
+    if (seat === undefined) return;
+
+    const kind =
+      seat.roleKind ??
+      (seat.marker?.seat === "supervisor"
+        ? "supervisor"
+        : seat.marker?.seat === "lead"
+          ? "lead"
+          : seat.marker?.seat === "peer"
+            ? "worker"
+            : null);
+    // The Supervisor's own question is already a question for Human.
+    if (kind === null || kind === "supervisor") return;
+
+    const found = store.room(seat.roomId);
+    if (found === undefined || found.room.endedAt !== undefined) return;
+
+    // The Supervisor owns the room id; a worker's parent is its Lead.
+    const targetId = kind === "lead" ? found.room.id : seat.parentId;
+    if (targetId === null || targetId === agent.id) return;
+
+    const tag = relayTag(request.id);
+    const relayKey = `${agent.id}:${request.id}`;
+    const relayed =
+      relayedQuestions.has(relayKey) ||
+      found.feed.some(
+        (event) =>
+          event.label === QUESTION_RELAY_LABEL &&
+          event.from === agent.id &&
+          event.text.includes(tag),
+      );
+    if (relayed) return;
+
+    const questions = pendingQuestions(request);
+    const body = questionBody(seat, request, questions);
+    relayedQuestions.add(relayKey);
+    store.appendFeed({
+      roomId: seat.roomId,
+      kind: "note",
+      from: agent.id,
+      to: targetId,
+      label: QUESTION_RELAY_LABEL,
+      text: `${body}\n\n${tag}`,
+    });
+
+    const message = `${body}\n\n${questionReply(
+      agent.id,
+      request,
+      questions,
+      kind === "lead" ? "supervisor" : "lead",
+    )}`;
+    try {
+      await paseo.agents.ref(targetId).send(message, { activeTurnBehavior: "steer" });
+    } catch (error) {
+      // The feed row is the durable record; a failed wake must be diagnosable.
+      log.error("question relay failed", {
+        agentId: agent.id,
+        targetId,
+        requestId: request.id,
+        error: reason(error),
+      });
+    }
+  };
+
+  /**
    * What a closed room leaves in a member's memory: the task it ended on. The
    * task is the user's own words and memory is read back for years, so an
    * obvious credential is stripped here as strictly as on the turn-end path
@@ -708,6 +917,17 @@ export function createRoomEvents(deps: RoomEventsDeps): RoomEvents {
         await handleTurnEnded(event.agent, ctx.paseo);
       } catch (error) {
         log.error("agent.turn_ended handling failed", {
+          agentId: event.agent.id,
+          error: reason(error),
+        });
+      }
+    },
+
+    async onPermissionRequested(event, ctx) {
+      try {
+        await handlePermissionRequested(event.agent, event.request, ctx.paseo);
+      } catch (error) {
+        log.error("agent.permission_requested handling failed", {
           agentId: event.agent.id,
           error: reason(error),
         });

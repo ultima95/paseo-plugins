@@ -262,7 +262,12 @@ describe("agent-room server contribution", () => {
       readState({ status: "ready", revision: "1", values: DEFAULT_SETTINGS }),
     );
 
-    expect(Object.keys(hooks).sort()).toEqual(["agent.archived", "agent.created", "agent.turn_ended"]);
+    expect(Object.keys(hooks).sort()).toEqual([
+      "agent.archived",
+      "agent.created",
+      "agent.permission_requested",
+      "agent.turn_ended",
+    ]);
     await expect(cleanup()).resolves.toBeUndefined();
   });
 

@@ -215,6 +215,14 @@ archived), and every worker response has a disposition. Otherwise the report
 is `STATUS`, and the Supervisor sends a `DONE` with a worker still running
 back for correction.
 
+A provider question tool is not a room channel. Lead and workers never use
+`ask_user_question` or an equivalent to reach Human: Lead ends its turn with
+`DECISION_NEEDED`, and a worker sends `QUESTION` to its Lead. When a provider
+invokes one anyway, the room relays it to the next seat up and leaves the
+request pending; the Supervisor presents a Lead's question to Human and closes
+it with `respond_to_permission` once Human answers, and a Lead does the same
+for a worker's question inside its own workstream.
+
 The Supervisor ends every turn with exactly one room-state block — heartbeat
 wakes and precondition stops included — as its last text, inside a
 `room-status` fenced code block: one card per Lead, or the single

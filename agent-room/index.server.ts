@@ -320,6 +320,10 @@ export default function contribute(
 
   server.on("agent.created", afterLoad("agent.created", events.onCreated));
   server.on("agent.turn_ended", afterLoad("agent.turn_ended", events.onTurnEnded));
+  server.on(
+    "agent.permission_requested",
+    afterLoad("agent.permission_requested", events.onPermissionRequested),
+  );
   server.on("agent.archived", afterLoad("agent.archived", events.onArchived));
 
   server.before("agent.create", async ({ request }) => {

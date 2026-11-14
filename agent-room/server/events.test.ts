@@ -1,5 +1,6 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { PluginHookAgent, PluginHookContext } from "@getpaseo/plugin/server";
+import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -12,7 +13,12 @@ import {
 import type { FeedEvent, RoomRecord, SeatRecord } from "../shared/room";
 import { DEFAULT_SETTINGS } from "../shared/roles";
 import type { SeatMarker } from "../shared/seats";
-import { createRoomEvents, lookupTitle, type RoomEventsDeps } from "./events";
+import {
+  createRoomEvents,
+  lookupTitle,
+  QUESTION_RELAY_LABEL,
+  type RoomEventsDeps,
+} from "./events";
 import type { Logger } from "./logger";
 import type { MemberStore } from "./member-store";
 import type { RoomStore } from "./store";
@@ -227,6 +233,7 @@ const roleSeat = (
 
 const SUPERVISOR: RoleShape = { id: "supervisor", name: "Supervisor", kind: "supervisor" };
 const LEAD: RoleShape = { id: "lead", name: "Lead", kind: "lead" };
+const WORKER: RoleShape = { id: "implementer", name: "Implementer", kind: "worker" };
 
 const agent = (over: Partial<PluginHookAgent> & { id: string }): PluginHookAgent => ({
   id: over.id,
@@ -1109,6 +1116,177 @@ describe("onCreated — guard", () => {
     );
 
     expect(handleFor("P9").archive).not.toHaveBeenCalled();
+  });
+});
+
+describe("onPermissionRequested — question relay", () => {
+  const questionRequest = (over: Partial<AgentPermissionRequest> = {}): AgentPermissionRequest => ({
+    id: "question:call-1",
+    provider: "command-code",
+    name: "Question",
+    kind: "question",
+    title: "Push",
+    input: {
+      questions: [
+        {
+          header: "Push",
+          question: "How should I proceed with the push?",
+          options: [
+            { label: "Push now", description: "Publishes the merge" },
+            { label: "Hold" },
+          ],
+        },
+      ],
+    },
+    ...over,
+  });
+
+  const storedWorker = () =>
+    fakeStore({
+      rooms: [room("S1")],
+      seats: [
+        roleSeat("S1", "S1", null, SUPERVISOR),
+        roleSeat("L1", "S1", "S1", LEAD),
+        roleSeat("P1", "S1", "L1", WORKER),
+      ],
+    });
+
+  const relay = async (
+    seeded: ReturnType<typeof fakeStore>,
+    request: AgentPermissionRequest,
+    asking = "L1",
+    parent: string | null = "S1",
+  ) => {
+    const { paseo, handleFor } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, seeded.store);
+    await created.onPermissionRequested(
+      { agent: agent({ id: asking, parentAgentId: parent }), request },
+      ctx,
+    );
+    return { handleFor, appendFeed: seeded.appendFeed };
+  };
+
+  it("relays a Lead question to the Supervisor and leaves the request pending", async () => {
+    const seeded = storedRoom();
+    const { handleFor, appendFeed } = await relay(seeded, questionRequest());
+
+    const supervisor = handleFor("S1");
+    expect(supervisor.send).toHaveBeenCalledTimes(1);
+    const [message, options] = supervisor.send.mock.calls[0] as [string, unknown];
+    expect(message).toContain("[room-question]");
+    expect(message).toContain("How should I proceed with the push?");
+    expect(message).toContain("Push now — Publishes the merge");
+    expect(message).toContain('"requestId":"question:call-1"');
+    expect(message).toContain('"agentId":"L1"');
+    expect(message).toContain('"answers":{"Push":"<answer>"}');
+    expect(message).toContain("Present the question and its options to Human verbatim");
+    expect(options).toEqual({ activeTurnBehavior: "steer" });
+
+    expect(appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "note",
+        from: "L1",
+        to: "S1",
+        label: QUESTION_RELAY_LABEL,
+      }),
+    );
+    const feed = appendFeed.mock.calls[0][0] as { text: string };
+    expect(feed.text).toContain("request: question:call-1");
+  });
+
+  it("relays a worker question to its Lead, not to the Supervisor", async () => {
+    const seeded = storedWorker();
+    const { handleFor } = await relay(seeded, questionRequest(), "P1", "L1");
+
+    expect(handleFor("L1").send).toHaveBeenCalledTimes(1);
+    expect(handleFor("S1").send).not.toHaveBeenCalled();
+    const message = handleFor("L1").send.mock.calls[0][0] as string;
+    expect(message).toContain('"agentId":"P1"');
+    expect(message).toContain("This is inside your workstream, not Human's");
+  });
+
+  it("relays only once per pending request", async () => {
+    const seeded = storedRoom();
+    const { handleFor, appendFeed } = await relay(seeded, questionRequest());
+
+    const { paseo } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, seeded.store);
+    await created.onPermissionRequested(
+      { agent: agent({ id: "L1", parentAgentId: "S1" }), request: questionRequest() },
+      ctx,
+    );
+
+    expect(handleFor("S1").send).toHaveBeenCalledTimes(1);
+    expect(appendFeed).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores the Supervisor's own question and non-question permissions", async () => {
+    const seeded = storedRoom();
+    const { paseo, handleFor } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, seeded.store);
+
+    await created.onPermissionRequested(
+      { agent: agent({ id: "S1" }), request: questionRequest() },
+      ctx,
+    );
+    await created.onPermissionRequested(
+      {
+        agent: agent({ id: "L1", parentAgentId: "S1" }),
+        request: questionRequest({ id: "permission:1", kind: "tool", name: "Bash" }),
+      },
+      ctx,
+    );
+
+    expect(handleFor("S1").send).not.toHaveBeenCalled();
+    expect(handleFor("L1").send).not.toHaveBeenCalled();
+    expect(seeded.appendFeed).not.toHaveBeenCalled();
+  });
+
+  it("ignores a question outside a known room seat", async () => {
+    const seeded = storedRoom();
+    const { paseo, handleFor } = fakePaseo();
+    const { created, ctx } = eventsWith(paseo, seeded.store);
+
+    await created.onPermissionRequested(
+      { agent: agent({ id: "X9", parentAgentId: "L1" }), request: questionRequest() },
+      ctx,
+    );
+
+    expect(handleFor("L1").send).not.toHaveBeenCalled();
+    expect(seeded.appendFeed).not.toHaveBeenCalled();
+  });
+
+  it("keeps the feed row when the wake fails", async () => {
+    const seeded = storedRoom();
+    const { paseo, handleFor } = fakePaseo();
+    handleFor("S1").send.mockRejectedValueOnce(new Error("supervisor gone"));
+    const { created, ctx } = eventsWith(paseo, seeded.store);
+
+    await created.onPermissionRequested(
+      { agent: agent({ id: "L1", parentAgentId: "S1" }), request: questionRequest() },
+      ctx,
+    );
+
+    expect(seeded.appendFeed).toHaveBeenCalledWith(
+      expect.objectContaining({ label: QUESTION_RELAY_LABEL }),
+    );
+    expect(log.error).toHaveBeenCalledWith(
+      "question relay failed",
+      expect.objectContaining({ targetId: "S1", error: "supervisor gone" }),
+    );
+  });
+
+  it("relays a legacy lead seat by its marker", async () => {
+    const seeded = fakeStore({
+      rooms: [room("S1")],
+      seats: [
+        seat("S1", "S1", null, { seat: "supervisor" }),
+        seat("L1", "S1", "S1", { seat: "lead" }),
+      ],
+    });
+    const { handleFor } = await relay(seeded, questionRequest());
+
+    expect(handleFor("S1").send).toHaveBeenCalledTimes(1);
   });
 });
 
