@@ -12,7 +12,7 @@ interface BoardSectionProps {
   id: ColumnId;
   title: string;
   items: readonly BoardWorkspaceCard[];
-  serverId: string;
+  showHost: boolean;
   theme: PluginTheme;
   navigation?: PluginSurfaceProps["navigation"];
   now: number;
@@ -28,7 +28,7 @@ export function BoardSection({
   id,
   title,
   items,
-  serverId,
+  showHost,
   theme,
   navigation,
   now,
@@ -111,10 +111,10 @@ export function BoardSection({
         <View style={styles.grid}>
           {items.map((workspace) => (
             <WorkspaceCard
-              key={workspace.id}
+              key={workspace.key}
               workspace={workspace}
               column={id}
-              serverId={serverId}
+              showHost={showHost}
               theme={theme}
               navigation={navigation}
               now={now}

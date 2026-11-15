@@ -36,7 +36,7 @@ function gridCardWidth(width: number, compact: boolean): number | undefined {
 }
 
 export function BoardScreen({ theme, layout, host, navigation }: PluginScreenProps) {
-  const board = useBoardWorkspaces();
+  const board = useBoardWorkspaces(host);
   const now = useNow(AGE_TICK_MS);
   const { width: windowWidth } = useWindowDimensions();
   const [query, setQuery] = useState("");
@@ -132,6 +132,8 @@ export function BoardScreen({ theme, layout, host, navigation }: PluginScreenPro
   );
 
   const workspaces = board.status === "ready" ? board.workspaces : null;
+  const hostCount = board.status === "ready" ? board.hostCount : 1;
+  const unavailable = board.status === "ready" ? board.unavailable : [];
   const children = useMemo(
     () => (workspaces ?? []).filter((workspace) => isChildWorkspace(workspace)),
     [workspaces],
@@ -261,6 +263,12 @@ export function BoardScreen({ theme, layout, host, navigation }: PluginScreenPro
               </Pressable>
             )}
           </View>
+          {unavailable.length === 0 ? null : (
+            <View style={styles.toggle}>
+              <Icon name="CloudOff" size={13} color={theme.colors.foregroundMuted} />
+              <Text style={styles.toggleText}>Not showing {unavailable.join(", ")}</Text>
+            </View>
+          )}
           {children.length === 0 ? null : (
             <View style={styles.toggle}>
               <Icon name="CornerDownRight" size={13} color={theme.colors.foregroundMuted} />
@@ -282,7 +290,7 @@ export function BoardScreen({ theme, layout, host, navigation }: PluginScreenPro
                 id={column.id}
                 title={column.title}
                 items={shown[column.id]}
-                serverId={host.id}
+                showHost={hostCount > 1}
                 theme={theme}
                 navigation={navigation}
                 now={now}

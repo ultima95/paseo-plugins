@@ -6,9 +6,9 @@ import { groupBoard, isChildWorkspace } from "./board-model";
 import { colorWithAlpha, columnAccent } from "./column-accent";
 import { useBoardWorkspaces } from "./use-board-workspaces";
 
-export function BoardItem({ currentScreen, openScreen, theme }: PluginSidebarItemProps) {
-  // The board's own subscription, so the count matches its columns on every host version.
-  const board = useBoardWorkspaces();
+export function BoardItem({ currentScreen, openScreen, theme, host }: PluginSidebarItemProps) {
+  // The board's own subscription, so the count matches its columns and spans every host.
+  const board = useBoardWorkspaces(host);
   const counts = useMemo(() => {
     if (board.status !== "ready") return { blocked: 0, review: 0 };
     const grouped = groupBoard(
