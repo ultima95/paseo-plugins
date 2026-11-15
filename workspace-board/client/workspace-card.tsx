@@ -1,5 +1,5 @@
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
-import { usePaseo } from "@getpaseo/plugin/client";
+import { getPaseoClient, usePaseo } from "@getpaseo/plugin/client";
 import { Icon, useToast } from "@getpaseo/plugin/client/ui";
 import type { PluginTheme } from "@getpaseo/plugin";
 import { useMemo } from "react";
@@ -11,8 +11,8 @@ import type { BoardWorkspaceCard } from "./use-board-workspaces";
 interface WorkspaceCardProps {
   workspace: BoardWorkspaceCard;
   column: ColumnId;
-  /** The host the board is showing; `openWorkspace` needs it to pick the right daemon. */
-  serverId: string;
+  /** Name the host on the card; only worth the space when the board merges several. */
+  showHost: boolean;
   theme: PluginTheme;
   navigation?: PluginSurfaceProps["navigation"];
   /** Epoch ms from the board's clock, so ages keep counting without a data refetch. */
@@ -32,7 +32,7 @@ function attentionLabel(column: ColumnId, indicator: string): string | null {
 export function WorkspaceCard({
   workspace,
   column,
-  serverId,
+  showHost,
   theme,
   navigation,
   now,
@@ -106,25 +106,35 @@ export function WorkspaceCard({
 
   const title = workspace.title ?? workspace.name;
   const age = formatAge(workspace.statusEnteredAt, now);
-  const meta = workspace.projectDisplayName;
+  const meta = showHost
+    ? `${workspace.projectDisplayName} · ${workspace.hostLabel}`
+    : workspace.projectDisplayName;
   const chip = attentionLabel(column, workspace.indicator);
   const isParked = workspace.labels.some(
     (label) => label.toLowerCase() === PARKED_LABEL.toLowerCase(),
   );
+  // The card may live on another host than the screen: label it through its own daemon.
+  const hostApi = () =>
+    typeof getPaseoClient === "function" ? getPaseoClient(workspace.serverId) : paseo;
   // Older hosts have no label API on a workspace handle; hide Park rather than fail on press.
-  const canPark =
-    typeof (paseo.workspaces.ref(workspace.id) as { setLabel?: unknown }).setLabel === "function";
+  const canPark = (() => {
+    try {
+      return typeof (hostApi().workspaces.ref(workspace.id) as { setLabel?: unknown }).setLabel === "function";
+    } catch {
+      return false; // that host went offline since the board last drew
+    }
+  })();
 
   async function togglePark() {
     try {
-      await paseo.workspaces.ref(workspace.id).setLabel(PARKED_LABEL, { assigned: !isParked });
+      await hostApi().workspaces.ref(workspace.id).setLabel(PARKED_LABEL, { assigned: !isParked });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
     }
   }
 
   function openWorkspace() {
-    navigation?.openWorkspace({ workspaceId: workspace.id, serverId });
+    navigation?.openWorkspace({ workspaceId: workspace.id, serverId: workspace.serverId });
   }
 
   const body = (
