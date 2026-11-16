@@ -1,0 +1,8 @@
+{
+  "id": "reply-to-message",
+  "name": "Reply to Message",
+  "description": "Copy and reply to any agent reply in a conversation",
+  "requirements": {
+    "paseo": ">=0.16.0-beta.2"
+  }
+}
