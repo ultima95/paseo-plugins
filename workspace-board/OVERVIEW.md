@@ -8,7 +8,9 @@ Each workspace appears as a card in one of five columns:
 - Idle: nothing is happening and nothing is waiting for you.
 - Parked: workspaces you marked to come back to later.
 
-A card shows the workspace title, its project, and how long it has been in its current state. With more than one host, a card also names its host. Pressing a card opens the workspace on that host. A host that is offline is listed in a quiet note, and its workspaces come back when it reconnects. The Park button on a card moves it to Parked. A parked workspace stays out of the way unless it starts needing you, fails, or finishes; then it moves back to the matching column.
+A card shows the workspace title, its project, and how long it has been in its current state. With more than one host, a card also names its host. Pressing a card opens a quick preview beside the board: the conversation with the agent, live, with a reply box and any pending question or permission to answer without leaving the board. The preview shows what was said, not the reasoning, tool calls, and task lists behind it, so a turn reads as a conversation. A workspace with more than one agent gets a chip per agent to switch between them. The preview's Open button, and the small button on the card, jump to the workspace in its project. A host that is offline is listed in a quiet note, and its workspaces come back when it reconnects. The Park button on a card moves it to Parked. A parked workspace stays out of the way unless it starts needing you, fails, or finishes; then it moves back to the matching column.
+
+On a narrow window the preview covers the board instead of sitting beside it; closing it or pressing the dimmed board returns to the board. Beside the board, the divider between them is a drag handle: drag it to make the conversation wider or narrower, and the board keeps enough room to stay usable.
 
 Child workspaces, the worktrees an agent creates from another workspace, are never shown as cards; the board keeps a quiet count of how many it left out. A sidebar row opens the board and carries one count per attention column, Needs you and Review, each hidden when it is zero.
 
@@ -20,6 +22,8 @@ Paseo 0.15.0 or later on both the daemon and the app.
 
 On an app too old to list its hosts to plugins, the board shows only the host it is opened on. On 0.15 hosts the daemon does not report which workspaces an agent created, so child workspaces cannot be detected, and the workspace handle has no label API, so the Park button is hidden. Everything else works the same.
 
+A host whose daemon cannot serve agent timelines still shows the card and its Park button, and its preview says the chat is unavailable.
+
 ## What it reads and writes
 
-The plugin reads workspace state that Paseo already provides. Its only write is the `Parked` label on a workspace, added or removed when you press Park or Unpark. It has no backend, sends nothing off your machine, and does not send notifications.
+The plugin reads workspace state and agent timelines that Paseo already provides. Its writes are the `Parked` label on a workspace, added or removed when you press Park or Unpark, a reply sent to the agent the preview shows, and the answer to a pending permission or question. It has no backend, sends nothing off your machine, and does not send notifications.

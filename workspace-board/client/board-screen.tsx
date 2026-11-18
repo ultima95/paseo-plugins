@@ -1,6 +1,6 @@
 import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Pressable,
@@ -13,10 +13,18 @@ import {
 import { COLUMNS, groupBoard, isChildWorkspace, matchesFilter, type ColumnId } from "./board-model";
 import { BoardSection } from "./board-section";
 import { columnAccent, columnIcon } from "./column-accent";
-import { useBoardWorkspaces } from "./use-board-workspaces";
+import { PreviewPanel } from "./preview-panel";
+import { PreviewResizer } from "./preview-resizer";
+import { clampPanelWidth, panelMaxWidth } from "./preview-size";
+import { usePreviewWidth } from "./preview-width-store";
+import { useBoardWorkspaces, type BoardWorkspaceCard } from "./use-board-workspaces";
 
 const AGE_TICK_MS = 30_000;
 const GRID_GAP = 10;
+/** Below this the board cannot spare a column for the preview, so the preview covers it. */
+const SIDE_BY_SIDE_MIN = 900;
+/** The board keeps at least this much width, so the preview cannot squeeze it away. */
+const BOARD_MIN_WIDTH = 420;
 
 /** A local clock so "5m" on a card keeps counting while the board sits open. */
 function useNow(intervalMs: number): number {
@@ -42,13 +50,41 @@ export function BoardScreen({ theme, layout, host, navigation }: PluginScreenPro
   const [query, setQuery] = useState("");
   const [focused, setFocused] = useState(false);
   const [contentWidth, setContentWidth] = useState(0);
+  const [previewKey, setPreviewKey] = useState<string | null>(null);
+  // The width a person last dragged to, kept outside this screen so a remount does not reset it.
+  const [previewWidth, setPreviewWidth] = usePreviewWidth();
+
+  // Stable across renders: a new handler identity would re-render every card on any board change.
+  const handlePreview = useCallback((workspace: BoardWorkspaceCard) => {
+    setPreviewKey((current) => (current === workspace.key ? null : workspace.key));
+  }, []);
 
   const pad = layout.compact ? 16 : 24;
   const styles = useMemo(
     () => ({
       root: { flex: 1, backgroundColor: theme.colors.surface0 },
+      shell: { flex: 1, flexDirection: "row" as const, minHeight: 0, minWidth: 0 },
       content: { padding: pad, paddingBottom: 48 },
       stack: { gap: 18 },
+      overlay: {
+        position: "absolute" as const,
+        top: 0,
+        right: 0,
+        bottom: 0,
+        left: 0,
+        flexDirection: "row" as const,
+        justifyContent: "flex-end" as const,
+        backgroundColor: "transparent",
+      },
+      overlayBoard: { flex: 1 },
+      scrim: {
+        position: "absolute" as const,
+        top: 0,
+        right: 0,
+        bottom: 0,
+        left: 0,
+        backgroundColor: "rgba(0,0,0,0.28)",
+      },
       hero: {
         backgroundColor: theme.colors.surface1,
         borderColor: theme.colors.border,
@@ -200,12 +236,28 @@ export function BoardScreen({ theme, layout, host, navigation }: PluginScreenPro
 
   const filtering = query.trim() !== "";
   const matches = COLUMNS.reduce((sum, column) => sum + shown[column.id].length, 0);
+  const previewWorkspace =
+    (previewKey === null
+      ? null
+      : (visible ?? []).find((workspace) => workspace.key === previewKey)) ?? null;
+  const previewColumn: ColumnId | null =
+    previewWorkspace === null
+      ? null
+      : COLUMNS.find((column) =>
+          all[column.id].some((workspace) => workspace.key === previewWorkspace.key),
+        )?.id ?? null;
+  const sideBySide = !layout.compact && windowWidth >= SIDE_BY_SIDE_MIN;
+  const previewMax = panelMaxWidth(windowWidth, BOARD_MIN_WIDTH);
+  const panelWidth = clampPanelWidth(previewWidth, windowWidth, BOARD_MIN_WIDTH);
+  // The board pane measures itself, so it already excludes the preview beside it.
   const cardWidth = gridCardWidth(
-    contentWidth > 0 ? contentWidth : Math.max(0, windowWidth - pad * 2),
+    contentWidth > 0
+      ? contentWidth
+      : Math.max(0, windowWidth - pad * 2 - (sideBySide ? panelWidth : 0)),
     layout.compact,
   );
 
-  return (
+  const boardView = (
     <ScrollView
       style={styles.root}
       contentContainerStyle={styles.content}
@@ -295,11 +347,57 @@ export function BoardScreen({ theme, layout, host, navigation }: PluginScreenPro
                 navigation={navigation}
                 now={now}
                 cardWidth={cardWidth}
+                onPreview={handlePreview}
+                previewKey={previewKey}
               />
             ),
           )
         )}
       </View>
     </ScrollView>
+  );
+
+  const preview =
+    previewWorkspace === null || previewColumn === null ? null : (
+      <PreviewPanel
+        workspace={previewWorkspace}
+        column={previewColumn}
+        theme={theme}
+        navigation={navigation}
+        variant={sideBySide ? "side" : "overlay"}
+        width={panelWidth}
+        onClose={() => setPreviewKey(null)}
+      />
+    );
+
+  if (preview === null) return boardView;
+  if (sideBySide) {
+    return (
+      <View style={styles.shell}>
+        <View style={styles.overlayBoard}>{boardView}</View>
+        <PreviewResizer
+          theme={theme}
+          width={panelWidth}
+          maxWidth={previewMax}
+          onChange={setPreviewWidth}
+        />
+        {preview}
+      </View>
+    );
+  }
+  return (
+    <View style={styles.root}>
+      {boardView}
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="Close preview"
+        onPress={() => setPreviewKey(null)}
+        style={styles.scrim}
+      />
+      {/* box-none lets a press on the strip beside the panel fall through to the scrim. */}
+      <View style={styles.overlay} pointerEvents="box-none">
+        {preview}
+      </View>
+    </View>
   );
 }

@@ -18,6 +18,10 @@ interface BoardSectionProps {
   now: number;
   /** Measured cell width for an even grid; undefined on a narrow layout. */
   cardWidth?: number;
+  /** Open the quick preview for the pressed card. */
+  onPreview?(workspace: BoardWorkspaceCard): void;
+  /** The workspace the preview shows, marked on its card. */
+  previewKey?: string | null;
 }
 
 /**
@@ -33,6 +37,8 @@ export function BoardSection({
   navigation,
   now,
   cardWidth,
+  onPreview,
+  previewKey = null,
 }: BoardSectionProps) {
   const [collapsed, setCollapsed] = useState(false);
   const accent = columnAccent(id, theme.colors);
@@ -119,6 +125,8 @@ export function BoardSection({
               navigation={navigation}
               now={now}
               width={cardWidth}
+              onPreview={onPreview}
+              selected={previewKey === workspace.key}
             />
           ))}
         </View>

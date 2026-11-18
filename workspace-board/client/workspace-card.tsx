@@ -2,7 +2,7 @@ import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { getPaseoClient, usePaseo } from "@getpaseo/plugin/client";
 import { Icon, useToast } from "@getpaseo/plugin/client/ui";
 import type { PluginTheme } from "@getpaseo/plugin";
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import { Pressable, Text, View } from "react-native";
 import { PARKED_LABEL, formatAge, type ColumnId } from "./board-model";
 import { columnAccent, columnSurface, isDarkTheme } from "./column-accent";
@@ -19,6 +19,10 @@ interface WorkspaceCardProps {
   now: number;
   /** Grid cell width measured by the board, so cards line up in even columns. */
   width?: number;
+  /** The card's own press: open the quick preview beside the board. */
+  onPreview?: (workspace: BoardWorkspaceCard) => void;
+  /** The card this preview is showing, so its press reads as selected. */
+  selected?: boolean;
 }
 
 /** What the card says about a workspace that is waiting on the user. */
@@ -29,7 +33,7 @@ function attentionLabel(column: ColumnId, indicator: string): string | null {
   return null;
 }
 
-export function WorkspaceCard({
+export const WorkspaceCard = memo(function WorkspaceCard({
   workspace,
   column,
   showHost,
@@ -37,6 +41,8 @@ export function WorkspaceCard({
   navigation,
   now,
   width,
+  onPreview,
+  selected = false,
 }: WorkspaceCardProps) {
   const paseo = usePaseo();
   const toast = useToast();
@@ -55,7 +61,7 @@ export function WorkspaceCard({
         width: width ?? ("100%" as const),
         minHeight: 58,
         backgroundColor: surface,
-        borderColor: theme.colors.border,
+        borderColor: selected ? accent : theme.colors.border,
         borderWidth: 1,
         borderRadius: 10,
         paddingVertical: 10,
@@ -99,9 +105,18 @@ export function WorkspaceCard({
         paddingVertical: 5,
       },
       parkLabel: { color: theme.colors.foregroundMuted, fontSize: 11.5 },
+      openButton: {
+        alignItems: "center" as const,
+        justifyContent: "center" as const,
+        width: 26,
+        height: 26,
+        borderColor: theme.colors.border,
+        borderWidth: 1,
+        borderRadius: 7,
+      },
       pressed: { opacity: 0.7 },
     }),
-    [theme, accent, surface, width],
+    [theme, accent, surface, width, selected],
   );
 
   const title = workspace.title ?? workspace.name;
@@ -162,22 +177,29 @@ export function WorkspaceCard({
     </>
   );
 
-  // The open area and the Park button are siblings: nesting one Pressable in another
-  // hides the inner one from screen readers and breaks button semantics on web.
+  // The open area, the preview and the Park button are siblings: nesting one Pressable in
+  // another hides the inner one from screen readers and breaks button semantics on web.
   return (
     <View style={styles.card}>
       <View style={styles.accentBar} />
-      {navigation ? (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`Preview ${title}`}
+        accessibilityState={{ selected }}
+        onPress={() => (onPreview === undefined ? openWorkspace() : onPreview(workspace))}
+        style={({ pressed }) => [styles.body, pressed && styles.pressed]}
+      >
+        {body}
+      </Pressable>
+      {onPreview === undefined || navigation === undefined ? null : (
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`Open ${title}`}
+          accessibilityLabel={`Open ${title} in its project`}
           onPress={openWorkspace}
-          style={({ pressed }) => [styles.body, pressed && styles.pressed]}
+          style={({ pressed }) => [styles.openButton, pressed && styles.pressed]}
         >
-          {body}
+          <Icon name="ExternalLink" size={12} color={theme.colors.foregroundMuted} />
         </Pressable>
-      ) : (
-        <View style={styles.body}>{body}</View>
       )}
       {canPark ? (
         <Pressable
@@ -192,4 +214,4 @@ export function WorkspaceCard({
       ) : null}
     </View>
   );
-}
+});
