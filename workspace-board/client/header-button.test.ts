@@ -66,6 +66,15 @@ describe("pillCounts", () => {
       ]),
     ).toEqual({ needYou: 0, running: 1 });
   });
+
+  it("skips a child workspace the board never draws", () => {
+    expect(
+      pillCounts([
+        { id: "a", status: "running", parentWorkspaceId: "parent" },
+        { id: "b", status: "needs_input", parentWorkspaceId: "parent" },
+      ]),
+    ).toEqual({ needYou: 0, running: 0 });
+  });
 });
 
 describe("pillLabel", () => {

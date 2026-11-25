@@ -1,5 +1,5 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
-import { classify, isOnBoard, type BoardWorkspace } from "./board-model";
+import { classify, isChildWorkspace, isOnBoard, type BoardWorkspace } from "./board-model";
 
 /**
  * A header pill for the board, on every open workspace.
@@ -17,6 +17,7 @@ interface WorkspaceRow {
   readonly status?: BoardWorkspace["indicator"] | null;
   readonly labels?: readonly string[] | null;
   readonly archivingAt?: string | null;
+  readonly parentWorkspaceId?: string | null;
 }
 
 /** Header button ids must be lowercase letters, numbers, and hyphens, starting with a letter. */
@@ -44,6 +45,9 @@ export function pillCounts(rows: readonly WorkspaceRow[]): BoardPillCounts {
   let needYou = 0;
   let running = 0;
   for (const row of rows) {
+    // The board never draws a child workspace, so counting one here would promise a card
+    // the reader cannot find.
+    if (isChildWorkspace({ parentWorkspaceId: row.parentWorkspaceId ?? null })) continue;
     const workspace = {
       indicator: row.status ?? "done",
       labels: row.labels ?? [],
@@ -84,12 +88,17 @@ export function registerBoardHeaderButtons(client: PluginClientContext): () => v
   let release: (() => Promise<void>) | undefined;
   let retry: ReturnType<typeof setTimeout> | null = null;
   const buttons = new Map<string, ReturnType<PluginClientContext["addHeaderButton"]>>();
+  // The last text handed to the host, so an unrelated workspace update does not re-render
+  // every pill for a label that did not move.
+  let shownLabel: string | undefined;
 
   const sync = (workspaces: readonly WorkspaceRow[]) => {
     if (disposed) return;
     // One label for every pill on this host: the counts span all open workspaces, the same
     // numbers the sidebar row carries.
     const label = pillLabel(pillCounts(workspaces));
+    const labelChanged = label !== shownLabel;
+    shownLabel = label;
     const title = label === undefined ? "Workspace board" : `Workspace board · ${label}`;
     const wanted = new Set(buttonWorkspaces(workspaces));
     for (const [workspaceId, button] of buttons) {
@@ -100,7 +109,7 @@ export function registerBoardHeaderButtons(client: PluginClientContext): () => v
     for (const workspaceId of wanted) {
       const existing = buttons.get(workspaceId);
       if (existing !== undefined) {
-        existing.update({ label, title });
+        if (labelChanged) existing.update({ label, title });
         continue;
       }
       try {
