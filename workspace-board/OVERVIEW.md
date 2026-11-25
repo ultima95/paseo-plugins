@@ -12,7 +12,7 @@ A card shows the workspace title, its project, and how long it has been in its c
 
 On a narrow window the preview covers the board instead of sitting beside it; closing it or pressing the dimmed board returns to the board. Beside the board, the divider between them is a drag handle: drag it to make the conversation wider or narrower, and the board keeps enough room to stay usable.
 
-Child workspaces, the worktrees an agent creates from another workspace, are never shown as cards; the board keeps a quiet count of how many it left out. A sidebar row opens the board and carries one count per attention column, Needs you and Review, each hidden when it is zero.
+Child workspaces, the worktrees an agent creates from another workspace, are never shown as cards; the board keeps a quiet count of how many it left out. A sidebar row opens the board and carries one count per attention column, Needs you and Review, each hidden when it is zero. Every open workspace also carries a small board button in its header, so closing the sidebar does not hide the way in.
 
 The sidebar counts cover every host too. The board updates as workspace state changes. Background workspaces and workspaces being archived are not shown.
 
