@@ -187,6 +187,8 @@ export function PreviewPanel({
   const [answered, setAnswered] = useState<Record<string, boolean>>({});
   // The subagent list is folded behind one line: a busy agent can delegate to many at once.
   const [showSubagents, setShowSubagents] = useState(false);
+  // Same for a workspace with several agents: one line names the shown one, the rest hide.
+  const [showAgents, setShowAgents] = useState(false);
 
   const accent = columnAccent(column, theme.colors);
   const api = useMemo(
@@ -216,6 +218,7 @@ export function PreviewPanel({
     setConfirmingArchive(false);
     setAnswered({});
     setShowSubagents(false);
+    setShowAgents(false);
     pinned.current = true;
   }, [workspace.id]);
 
@@ -223,6 +226,7 @@ export function PreviewPanel({
   useEffect(() => {
     pinned.current = true;
     setShowSubagents(false);
+    setShowAgents(false);
   }, [chosen]);
 
   const rows = timeline.status === "ready" ? timeline.rows : [];
@@ -349,17 +353,6 @@ export function PreviewPanel({
         gap: 8,
         flexWrap: "wrap" as const,
       },
-      agentChip: {
-        flexDirection: "row" as const,
-        alignItems: "center" as const,
-        gap: 5,
-        borderColor: theme.colors.border,
-        borderWidth: 1,
-        borderRadius: 999,
-        paddingHorizontal: 8,
-        paddingVertical: 3,
-      },
-      agentChipText: { color: theme.colors.foregroundMuted, fontSize: 11 },
       summaryRow: {
         flexDirection: "row" as const,
         alignItems: "center" as const,
@@ -490,6 +483,8 @@ export function PreviewPanel({
   const canSend = chosen !== null && draft.trim() !== "" && !sending;
   const summary = subagentSummary(subagents);
   const summaryTone = subagentSummaryTone(subagents);
+  const currentLabel =
+    agent?.title ?? (chosen === null ? "" : chosen.slice(0, 8));
   const summaryColor =
     summaryTone === "failed"
       ? theme.colors.statusDanger
@@ -753,35 +748,58 @@ export function PreviewPanel({
           </ScrollView>
         )}
         {agents.length > 1 ? (
-          <View style={styles.composerRow}>
-            {agents.map((entry) => {
-              const on = entry.agentId === chosen;
-              const label = entry.title ?? entry.agentId.slice(0, 8);
-              return (
-                <Pressable
-                  key={entry.agentId}
-                  accessibilityRole="button"
-                  accessibilityLabel={`Show ${label}`}
-                  accessibilityState={{ selected: on }}
-                  onPress={() => setAgentId(entry.agentId)}
-                  style={({ pressed }) => [
-                    styles.agentChip,
-                    on && { borderColor: accent },
-                    pressed && styles.pressed,
-                  ]}
-                >
-                  <Icon
-                    name="Bot"
-                    size={11}
-                    color={on ? accent : theme.colors.foregroundMuted}
-                  />
-                  <Text style={[styles.agentChipText, on && { color: theme.colors.foreground }]}>
-                    {label}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </View>
+          <>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={`${showAgents ? "Hide" : "Show"} the ${agents.length} agents`}
+              accessibilityState={{ expanded: showAgents }}
+              onPress={() => setShowAgents((value) => !value)}
+              style={({ pressed }) => [styles.summaryRow, pressed && styles.pressed]}
+            >
+              <Icon name="Bot" size={12} color={theme.colors.foregroundMuted} />
+              <Text style={styles.summaryText} numberOfLines={1}>
+                {`${agents.length} agents · ${currentLabel}`}
+              </Text>
+              <Icon
+                name={showAgents ? "ChevronDown" : "ChevronRight"}
+                size={13}
+                color={theme.colors.foregroundMuted}
+              />
+            </Pressable>
+            {showAgents ? (
+              <ScrollView style={styles.subagentList} contentContainerStyle={styles.subagentListContent}>
+                {agents.map((entry) => {
+                  const on = entry.agentId === chosen;
+                  const label = entry.title ?? entry.agentId.slice(0, 8);
+                  return (
+                    <Pressable
+                      key={entry.agentId}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Show ${label}`}
+                      accessibilityState={{ selected: on }}
+                      onPress={() => {
+                        setAgentId(entry.agentId);
+                        setShowAgents(false);
+                      }}
+                      style={({ pressed }) => [styles.subagentLine, pressed && styles.pressed]}
+                    >
+                      <Icon
+                        name={on ? "Check" : "Bot"}
+                        size={11}
+                        color={on ? accent : theme.colors.foregroundMuted}
+                      />
+                      <Text
+                        style={[styles.subagentLabel, on && { color: theme.colors.foreground }]}
+                        numberOfLines={1}
+                      >
+                        {label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+            ) : null}
+          </>
         ) : null}
         <View style={styles.composerRow}>
           <TextInput
