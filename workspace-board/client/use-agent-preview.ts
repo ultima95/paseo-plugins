@@ -208,6 +208,17 @@ export function useAgentTimeline(
       setState({ status: "ready", rows, subagents: ordered });
     };
 
+    // A provider streams a fast turn as many events. Publishing each one re-rendered the whole
+    // conversation, so they are folded into one publish per tick instead.
+    let pendingPublish: ReturnType<typeof setTimeout> | null = null;
+    const publishSoon = () => {
+      if (disposed || pendingPublish !== null) return;
+      pendingPublish = setTimeout(() => {
+        pendingPublish = null;
+        publish();
+      }, 50);
+    };
+
     const rememberFromTimeline = (subagent: SubagentRow) => {
       if (!providerManaged.has(subagent.id)) subagents.set(subagent.id, subagent);
     };
@@ -254,7 +265,7 @@ export function useAgentTimeline(
       rows = appendLiveItem(rows, item, `live:${live}`);
       const subagent = subagentFromItem(item);
       if (subagent !== null) rememberFromTimeline(subagent);
-      if (loaded) publish();
+      if (loaded) publishSoon();
     });
 
     // Session events carry status the timeline only shows while the Task call is running.
@@ -286,7 +297,7 @@ export function useAgentTimeline(
           } else {
             return;
           }
-          if (loaded) publish();
+          if (loaded) publishSoon();
         },
         error: () => undefined,
       });
@@ -300,6 +311,7 @@ export function useAgentTimeline(
 
     return () => {
       disposed = true;
+      if (pendingPublish !== null) clearTimeout(pendingPublish);
       void subscription?.release().catch(() => undefined);
       void observation?.release().catch(() => undefined);
     };

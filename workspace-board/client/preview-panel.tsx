@@ -1,7 +1,7 @@
 import { usePaseo, type PluginSurfaceProps } from "@getpaseo/plugin/client";
 import type { PluginTheme } from "@getpaseo/plugin";
 import { Icon, Markdown, useToast } from "@getpaseo/plugin/client/ui";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Image,
@@ -54,6 +54,8 @@ interface PreviewPanelProps {
 }
 
 const MAX_PANEL_WIDTH = 460;
+/** How many messages draw on the first frame; the rest follow once the panel is up. */
+const RECENT_ROWS = 12;
 
 function rowStyle(row: TimelineRow, theme: PluginTheme) {
   switch (row.kind) {
@@ -75,7 +77,12 @@ function subagentAccent(state: SubagentRow["state"], theme: PluginTheme): string
   return columnAccent("needs-you", theme.colors);
 }
 
-function ChatRow({
+/**
+ * One message. Memoized because a streamed chunk only replaces the row it belongs to: without
+ * this, every chunk re-parsed the Markdown of every message above it, which is what made a
+ * conversation take seconds to draw and a new message take a second to appear.
+ */
+const ChatRow = memo(function ChatRow({
   row,
   theme,
   head,
@@ -169,7 +176,7 @@ function ChatRow({
       )}
     </View>
   );
-}
+});
 
 export function PreviewPanel({
   workspace,
@@ -197,6 +204,10 @@ export function PreviewPanel({
   const [showAgents, setShowAgents] = useState(false);
   // Images pasted into the reply box, sent with the next prompt.
   const [pasted, setPasted] = useState<readonly PastedImage[]>([]);
+  // The reply just sent, shown before the host echoes it back so Enter feels immediate.
+  const [optimistic, setOptimistic] = useState<TimelineRow | null>(null);
+  // The newest messages draw at once; the rest follow a frame later so opening is not a wait.
+  const [showAllRows, setShowAllRows] = useState(false);
   // The reply box's node, once it exists; only a browser node has paste events.
   const [inputNode, setInputNode] = useState<PasteTarget | null>(null);
   const attachInput = useRef((node: unknown) => {
@@ -229,6 +240,7 @@ export function PreviewPanel({
     setAgentId(null);
     setDraft("");
     setPasted([]);
+    setOptimistic(null);
     setArchiving(false);
     setConfirmingArchive(false);
     setAnswered({});
@@ -242,6 +254,7 @@ export function PreviewPanel({
     pinned.current = true;
     setShowSubagents(false);
     setShowAgents(false);
+    setOptimistic(null);
   }, [chosen]);
 
   // A screenshot pasted into the reply box rides along with the next prompt.
@@ -254,6 +267,33 @@ export function PreviewPanel({
 
   const rows = timeline.status === "ready" ? timeline.rows : [];
   const subagents = timeline.status === "ready" ? timeline.subagents : [];
+
+  // The host echoes the reply a moment later; drop the local copy once the real row lands.
+  useEffect(() => {
+    if (optimistic === null) return;
+    if (rows.some((row) => row.kind === "user" && row.text.trim() === optimistic.text)) {
+      setOptimistic(null);
+    }
+  }, [rows, optimistic]);
+
+  // A host that never echoes the prompt must not leave the local copy in the conversation.
+  useEffect(() => {
+    if (optimistic === null) return undefined;
+    const timer = setTimeout(() => setOptimistic(null), 12_000);
+    return () => clearTimeout(timer);
+  }, [optimistic]);
+
+  // The last messages draw at once and the rest on the next tick: a long Markdown history
+  // otherwise holds the panel blank for seconds before the conversation appears.
+  useEffect(() => {
+    if (timeline.status !== "ready") return undefined;
+    setShowAllRows(false);
+    const timer = setTimeout(() => setShowAllRows(true), 40);
+    return () => clearTimeout(timer);
+  }, [chosen, workspace.id, timeline.status]);
+
+  const history = showAllRows ? rows : rows.slice(-RECENT_ROWS);
+  const shownRows = optimistic === null ? history : [...history, optimistic];
 
   const styles = useMemo(
     () => ({
@@ -448,19 +488,27 @@ export function PreviewPanel({
 
   async function submit() {
     const text = draft.trim();
+    const images = pasted;
     // A pasted image alone is a complete reply; a prompt with neither is not.
-    if ((text === "" && pasted.length === 0) || chosen === null || sending) return;
+    if ((text === "" && images.length === 0) || chosen === null || sending) return;
     setSending(true);
+    // Clear the box and show the reply now: waiting for the host to echo it is what made Enter
+    // feel like it took a second.
+    setDraft("");
+    setPasted([]);
+    if (text !== "") setOptimistic({ key: "optimistic", kind: "user", text });
     try {
       await sendPrompt(
         api,
         chosen,
         text,
-        pasted.map((image) => ({ data: image.data, mimeType: image.mimeType })),
+        images.map((image) => ({ data: image.data, mimeType: image.mimeType })),
       );
-      setDraft("");
-      setPasted([]);
     } catch (error) {
+      // The reply never left, so put it back where the user can retry it.
+      setOptimistic(null);
+      setDraft(text);
+      setPasted(images);
       toast.error(error instanceof Error ? error.message : String(error));
     } finally {
       setSending(false);
@@ -680,23 +728,23 @@ export function PreviewPanel({
               if (pinned.current) scroll.current?.scrollToEnd({ animated: false });
             }}
           >
-            {rows.length === 0 ? (
+            {shownRows.length === 0 ? (
               <Text style={styles.message}>This agent has no messages yet.</Text>
             ) : (
-              rows.map((row, index) => (
+              shownRows.map((row, index) => (
                 <ChatRow
                   key={row.key}
                   row={row}
                   theme={theme}
-                  head={index === 0 || rows[index - 1]?.kind !== row.kind}
+                  head={index === 0 || shownRows[index - 1]?.kind !== row.kind}
                   streaming={
-                    busy !== null && index === rows.length - 1 && row.kind !== "user"
+                    busy !== null && index === shownRows.length - 1 && row.kind !== "user"
                   }
                 />
               ))
             )}
             {/* A trailing activity line already reads as live, so this row would say it twice. */}
-            {busy === null || rows[rows.length - 1]?.kind === "activity" ? null : (
+            {busy === null || shownRows[shownRows.length - 1]?.kind === "activity" ? null : (
               <View
                 accessible
                 accessibilityLabel={`Agent is ${busy.toLowerCase()}`}
