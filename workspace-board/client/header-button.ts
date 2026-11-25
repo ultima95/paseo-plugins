@@ -1,17 +1,22 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
+import { classify, isOnBoard, type BoardWorkspace } from "./board-model";
 
 /**
- * A header button for the board, on every open workspace.
+ * A header pill for the board, on every open workspace.
  *
  * The sidebar row is the board's usual way in, but it lives in the sidebar, so closing the
  * sidebar hides the only way back. Header buttons are per workspace, so this keeps one for
- * each open workspace on the host and drops it when that workspace closes.
+ * each open workspace on the host, drops it when that workspace closes, and keeps its label
+ * showing how many workspaces still need the user or are running.
  */
 
 /** What this module reads from a workspace on the host's list. */
 interface WorkspaceRow {
   readonly id: string;
   readonly background?: boolean | null;
+  readonly status?: BoardWorkspace["indicator"] | null;
+  readonly labels?: readonly string[] | null;
+  readonly archivingAt?: string | null;
 }
 
 /** Header button ids must be lowercase letters, numbers, and hyphens, starting with a letter. */
@@ -20,9 +25,47 @@ export function boardButtonId(workspaceId: string): string {
   return `board-${safe}`;
 }
 
-/** The workspaces that carry a button: every open one, not a background workspace. */
+/** The workspaces that carry a pill: every open one, not a background workspace. */
 export function buttonWorkspaces(rows: readonly WorkspaceRow[]): string[] {
   return rows.filter((row) => row.background !== true).map((row) => row.id);
+}
+
+/** What the pill says: the board's two attention columns, plus the ones still working. */
+export interface BoardPillCounts {
+  readonly needYou: number;
+  readonly running: number;
+}
+
+/**
+ * The counts the pill shows, over every open workspace on the host. They follow the board's
+ * own classification, so the pill and the sidebar never disagree about what needs the user.
+ */
+export function pillCounts(rows: readonly WorkspaceRow[]): BoardPillCounts {
+  let needYou = 0;
+  let running = 0;
+  for (const row of rows) {
+    const workspace = {
+      indicator: row.status ?? "done",
+      labels: row.labels ?? [],
+      background: row.background === true,
+      archivingAt: row.archivingAt ?? null,
+    };
+    if (!isOnBoard(workspace)) continue;
+    const column = classify(workspace);
+    if (column === "needs-you" || column === "review") needYou += 1;
+    else if (column === "running") running += 1;
+  }
+  return { needYou, running };
+}
+
+/** The pill's text, or undefined to leave it an icon when nothing is happening. */
+export function pillLabel(counts: BoardPillCounts): string | undefined {
+  const needs = counts.needYou === 1 ? "1 needs you" : `${counts.needYou} need you`;
+  const runs = counts.running === 1 ? "1 running" : `${counts.running} running`;
+  if (counts.needYou > 0 && counts.running > 0) return `${needs} · ${runs}`;
+  if (counts.needYou > 0) return needs;
+  if (counts.running > 0) return runs;
+  return undefined;
 }
 
 /** How many times a host that was not reachable at load is asked again before giving up. */
@@ -40,10 +83,14 @@ export function registerBoardHeaderButtons(client: PluginClientContext): () => v
   let stop: (() => void) | undefined;
   let release: (() => Promise<void>) | undefined;
   let retry: ReturnType<typeof setTimeout> | null = null;
-  const buttons = new Map<string, { remove(): void }>();
+  const buttons = new Map<string, ReturnType<PluginClientContext["addHeaderButton"]>>();
 
   const sync = (workspaces: readonly WorkspaceRow[]) => {
     if (disposed) return;
+    // One label for every pill on this host: the counts span all open workspaces, the same
+    // numbers the sidebar row carries.
+    const label = pillLabel(pillCounts(workspaces));
+    const title = label === undefined ? "Workspace board" : `Workspace board · ${label}`;
     const wanted = new Set(buttonWorkspaces(workspaces));
     for (const [workspaceId, button] of buttons) {
       if (wanted.has(workspaceId)) continue;
@@ -51,7 +98,11 @@ export function registerBoardHeaderButtons(client: PluginClientContext): () => v
       buttons.delete(workspaceId);
     }
     for (const workspaceId of wanted) {
-      if (buttons.has(workspaceId)) continue;
+      const existing = buttons.get(workspaceId);
+      if (existing !== undefined) {
+        existing.update({ label, title });
+        continue;
+      }
       try {
         buttons.set(
           workspaceId,
@@ -59,7 +110,8 @@ export function registerBoardHeaderButtons(client: PluginClientContext): () => v
             id: boardButtonId(workspaceId),
             workspaceId,
             button: {
-              title: "Workspace board",
+              title,
+              label,
               icon: "LayoutGrid",
               behavior: {
                 kind: "action",
