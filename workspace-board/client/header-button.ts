@@ -25,13 +25,21 @@ export function buttonWorkspaces(rows: readonly WorkspaceRow[]): string[] {
   return rows.filter((row) => row.background !== true).map((row) => row.id);
 }
 
+/** How many times a host that was not reachable at load is asked again before giving up. */
+const LIST_ATTEMPTS = 3;
+const LIST_RETRY_MS = 2_000;
+
 export function registerBoardHeaderButtons(client: PluginClientContext): () => void {
-  // An older app has no header buttons at all; the sidebar row still works there.
+  // An older app has no header buttons at all, and an older one has no paseo handle; the
+  // sidebar row still works on both.
   if (typeof client.addHeaderButton !== "function") return () => undefined;
+  const actions = client.paseo?.workspaces;
+  if (typeof actions?.list !== "function") return () => undefined;
 
   let disposed = false;
   let stop: (() => void) | undefined;
   let release: (() => Promise<void>) | undefined;
+  let retry: ReturnType<typeof setTimeout> | null = null;
   const buttons = new Map<string, { remove(): void }>();
 
   const sync = (workspaces: readonly WorkspaceRow[]) => {
@@ -69,35 +77,47 @@ export function registerBoardHeaderButtons(client: PluginClientContext): () => v
   const byId = new Map<string, WorkspaceRow>();
   const republish = () => sync([...byId.values()]);
 
-  client.paseo.workspaces
-    .list({ subscribe: {} })
-    .then(({ entries, subscription }) => {
-      if (disposed) {
-        void subscription.release().catch(() => undefined);
-        return;
-      }
-      release = () => subscription.release();
-      for (const entry of entries) byId.set(entry.id, entry);
-      sync(entries);
-      stop = subscription.subscribe({
-        snapshot: ({ entries: next }) => {
-          byId.clear();
-          for (const entry of next) byId.set(entry.id, entry);
-          republish();
-        },
-        update: (message) => {
-          if (message.type !== "workspace_update") return;
-          const update = message.payload;
-          if (update.kind === "upsert") byId.set(update.workspace.id, update.workspace);
-          else byId.delete(update.id);
-          republish();
-        },
+  // The app can load a plugin before its daemon is reachable. Asking again keeps the buttons
+  // from staying missing until the plugin is reloaded by hand.
+  let attempt = 0;
+  const start = () => {
+    if (disposed) return;
+    attempt += 1;
+    actions
+      .list({ subscribe: {} })
+      .then(({ entries, subscription }) => {
+        if (disposed) {
+          void subscription.release().catch(() => undefined);
+          return;
+        }
+        release = () => subscription.release();
+        for (const entry of entries) byId.set(entry.id, entry);
+        sync(entries);
+        stop = subscription.subscribe({
+          snapshot: ({ entries: next }) => {
+            byId.clear();
+            for (const entry of next) byId.set(entry.id, entry);
+            republish();
+          },
+          update: (message) => {
+            if (message.type !== "workspace_update") return;
+            const update = message.payload;
+            if (update.kind === "upsert") byId.set(update.workspace.id, update.workspace);
+            else byId.delete(update.id);
+            republish();
+          },
+        });
+      })
+      .catch(() => {
+        if (disposed || attempt >= LIST_ATTEMPTS) return;
+        retry = setTimeout(start, LIST_RETRY_MS);
       });
-    })
-    .catch(() => undefined);
+  };
+  start();
 
   return () => {
     disposed = true;
+    if (retry !== null) clearTimeout(retry);
     stop?.();
     for (const button of buttons.values()) button.remove();
     buttons.clear();
