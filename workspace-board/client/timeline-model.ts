@@ -3,10 +3,11 @@ import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
 /** A preview row: something said, or a one-line tally of the work behind the conversation. */
 export type TimelineRowKind = "user" | "assistant" | "error" | "activity";
 
-/** What one activity line has counted so far, so a live tool call can grow the same line. */
-export interface ActivityCount {
-  readonly commands: number;
-  readonly tools: number;
+/** One tool call folded into an activity line: what kind it was, and whether it failed. */
+export interface ActivityCall {
+  readonly id: string;
+  readonly kind: "command" | "tool";
+  readonly failed: boolean;
 }
 
 export interface TimelineRow {
@@ -15,8 +16,8 @@ export interface TimelineRow {
   readonly text: string;
   /** The provider's id for a streaming message, so its chunks update one row. */
   readonly streamId?: string;
-  /** On an activity row, its tally; other rows leave it out. */
-  readonly activity?: ActivityCount;
+  /** On an activity row, the calls it stands for; other rows leave it out. */
+  readonly calls?: readonly ActivityCall[];
 }
 
 /** A page of timeline entries, as `timeline.refetch` returns them. */
@@ -47,50 +48,65 @@ function itemRow(item: AgentTimelineItem, key: string): TimelineRow | null {
 }
 
 /**
- * What one item adds to an activity line. Shell calls read as commands and every other tool call
- * as a tool, so a burst of work between two messages folds into one line like
- * "Ran 6 commands and used 2 other tools". Reasoning, todos, and notices add nothing.
+ * The call an item contributes to an activity line, or null for everything else: reasoning, todos,
+ * notices, and subagents (which the preview shows above the reply box instead). A shell call reads
+ * as a command and any other tool as a tool.
  */
-function activityCount(item: AgentTimelineItem): ActivityCount | null {
-  if (item.type !== "tool_call") return null;
-  return item.detail.type === "shell"
-    ? { commands: 1, tools: 0 }
-    : { commands: 0, tools: 1 };
+function activityCall(item: AgentTimelineItem): ActivityCall | null {
+  if (item.type !== "tool_call" || item.detail.type === "sub_agent") return null;
+  return {
+    id: item.callId,
+    kind: item.detail.type === "shell" ? "command" : "tool",
+    failed: item.status === "failed" || item.status === "canceled",
+  };
 }
 
-function addActivity(left: ActivityCount, right: ActivityCount): ActivityCount {
-  return { commands: left.commands + right.commands, tools: left.tools + right.tools };
+/**
+ * One call folded into the calls already counted. A provider may report the same call as running
+ * and then as finished, so the id decides: the later report replaces the earlier one rather than
+ * counting a second time.
+ */
+function foldCall(calls: readonly ActivityCall[], call: ActivityCall): readonly ActivityCall[] {
+  const at = calls.findIndex((existing) => existing.id === call.id);
+  if (at === -1) return [...calls, call];
+  const next = [...calls];
+  next[at] = call;
+  return next;
 }
 
 function plural(count: number, one: string, many: string): string {
   return count === 1 ? one : many;
 }
 
-/** The one line that stands in for a run of tool calls, counting each kind only when it has one. */
-export function activityText(count: ActivityCount): string {
-  const commands =
-    count.commands === 0
-      ? null
-      : `Ran ${count.commands} ${plural(count.commands, "command", "commands")}`;
-  const tools =
-    count.tools === 0
-      ? null
-      : `${count.commands === 0 ? "Used" : "used"} ${count.tools} ${plural(
-          count.tools,
-          count.commands === 0 ? "tool" : "other tool",
-          count.commands === 0 ? "tools" : "other tools",
-        )}`;
-  return [commands, tools].filter((part) => part !== null).join(" and ");
+/** The one line that stands in for a run of tool calls, naming each kind only when it has one. */
+export function activityText(calls: readonly ActivityCall[]): string {
+  const commands = calls.filter((call) => call.kind === "command").length;
+  const tools = calls.length - commands;
+  const failed = calls.filter((call) => call.failed).length;
+  const parts: string[] = [];
+  if (commands > 0) parts.push(`Ran ${commands} ${plural(commands, "command", "commands")}`);
+  if (tools > 0) {
+    const verb = commands === 0 ? "Used" : "used";
+    parts.push(
+      `${verb} ${tools} ${plural(
+        tools,
+        commands === 0 ? "tool" : "other tool",
+        commands === 0 ? "tools" : "other tools",
+      )}`,
+    );
+  }
+  const text = parts.join(" and ");
+  return failed === 0 ? text : `${text} · ${failed} failed`;
 }
 
-/** An activity row grown by one more call; its key stays so the line does not flicker. */
-function grownActivity(row: TimelineRow, count: ActivityCount): TimelineRow {
-  const activity = addActivity(row.activity ?? { commands: 0, tools: 0 }, count);
-  return { ...row, text: activityText(activity), activity };
+/** An activity row for a fresh run of calls. */
+function newActivity(key: string, call: ActivityCall): TimelineRow {
+  return { key, kind: "activity", text: activityText([call]), calls: [call] };
 }
 
-function newActivity(key: string, count: ActivityCount): TimelineRow {
-  return { key, kind: "activity", text: activityText(count), activity: count };
+/** An activity row rebuilt from the calls it holds; its key stays so the line does not flicker. */
+function activityRow(row: TimelineRow, calls: readonly ActivityCall[]): TimelineRow {
+  return { ...row, text: activityText(calls), calls };
 }
 
 /** Every conversation row from a fetched page, oldest first, with work folded into activity rows. */
@@ -106,14 +122,14 @@ export function rowsFromEntries(entries: readonly TimelineEntry[]): TimelineRow[
       open = -1;
       continue;
     }
-    const count = activityCount(entry.item);
-    if (count === null) continue;
+    const call = activityCall(entry.item);
+    if (call === null) continue;
     if (open >= 0 && rows[open]?.kind === "activity") {
-      rows[open] = grownActivity(rows[open], count);
+      rows[open] = activityRow(rows[open], foldCall(rows[open].calls ?? [], call));
       continue;
     }
     open = rows.length;
-    rows.push(newActivity(key, count));
+    rows.push(newActivity(key, call));
   }
   return rows.slice(-ROW_LIMIT);
 }
@@ -138,15 +154,15 @@ export function appendLiveItem(
 ): readonly TimelineRow[] {
   const row = itemRow(item, key);
   if (row === null) {
-    const count = activityCount(item);
-    if (count === null) return rows;
+    const call = activityCall(item);
+    if (call === null) return rows;
     const last = rows[rows.length - 1];
-    if (last?.kind === "activity") {
-      const next = [...rows];
-      next[next.length - 1] = grownActivity(last, count);
-      return next;
+    if (last?.kind !== "activity") {
+      return [...rows, newActivity(key, call)].slice(-ROW_LIMIT);
     }
-    return [...rows, newActivity(key, count)].slice(-ROW_LIMIT);
+    const next = [...rows];
+    next[next.length - 1] = activityRow(last, foldCall(last.calls ?? [], call));
+    return next;
   }
   if (row.kind !== "assistant") return [...rows, row].slice(-ROW_LIMIT);
 

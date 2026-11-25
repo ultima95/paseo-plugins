@@ -40,6 +40,18 @@ function command(callId: string): AgentTimelineItem {
   };
 }
 
+/** The same call while it is still running, as a provider reports it before it finishes. */
+function runningCommand(callId: string): AgentTimelineItem {
+  return {
+    type: "tool_call",
+    callId,
+    name: "Bash",
+    status: "running",
+    error: null,
+    detail: { type: "shell", command: "npm test" },
+  };
+}
+
 function read(callId: string): AgentTimelineItem {
   return {
     type: "tool_call",
@@ -48,6 +60,17 @@ function read(callId: string): AgentTimelineItem {
     status: "completed",
     error: null,
     detail: { type: "read", filePath: "/tmp/a.ts" },
+  };
+}
+
+function failedCommand(callId: string): AgentTimelineItem {
+  return {
+    type: "tool_call",
+    callId,
+    name: "Bash",
+    status: "failed",
+    error: "exit 1",
+    detail: { type: "shell", command: "npm test" },
   };
 }
 
@@ -100,6 +123,41 @@ describe("rowsFromEntries", () => {
     ]);
     expect(rows.map((row) => row.kind)).toEqual(["activity", "assistant", "activity"]);
     expect(rows.map((row) => row.text)).toEqual(["Ran 1 command", "first", "Ran 1 command"]);
+  });
+
+  it("counts a call once when the provider reports it running then finished", () => {
+    const rows = rowsFromEntries([
+      entry(runningCommand("c1"), 1),
+      entry(command("c1"), 2),
+    ]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.text).toBe("Ran 1 command");
+  });
+
+  it("says on the line when a call failed, without hiding the rest", () => {
+    const rows = rowsFromEntries([
+      entry(command("c1"), 1),
+      entry(failedCommand("c2"), 2),
+      entry(read("r1"), 3),
+    ]);
+    expect(rows[0]?.text).toBe("Ran 2 commands and used 1 other tool · 1 failed");
+  });
+
+  it("leaves subagents out of the activity line", () => {
+    const rows = rowsFromEntries([
+      entry(
+        {
+          type: "tool_call",
+          callId: "task-1",
+          name: "Task",
+          status: "completed",
+          error: null,
+          detail: { type: "sub_agent", description: "audit" },
+        },
+        1,
+      ),
+    ]);
+    expect(rows).toEqual([]);
   });
 
   it("carries the provider message id so its chunks merge", () => {

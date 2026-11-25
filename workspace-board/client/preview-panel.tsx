@@ -130,7 +130,7 @@ function ChatRow({
       <View style={[styles.row, styles.activityRow]}>
         <View style={styles.activityLine}>
           <Icon name="Wrench" size={11} color={theme.colors.foregroundMuted} />
-          <Text style={styles.activityText}>{text}</Text>
+          <Text style={styles.activityText}>{streaming ? `${text}…` : text}</Text>
         </View>
       </View>
     );
@@ -646,12 +646,13 @@ export function PreviewPanel({
                   theme={theme}
                   head={index === 0 || rows[index - 1]?.kind !== row.kind}
                   streaming={
-                    busy !== null && index === rows.length - 1 && row.kind === "assistant"
+                    busy !== null && index === rows.length - 1 && row.kind !== "user"
                   }
                 />
               ))
             )}
-            {busy === null ? null : (
+            {/* A trailing activity line already reads as live, so this row would say it twice. */}
+            {busy === null || rows[rows.length - 1]?.kind === "activity" ? null : (
               <View
                 accessible
                 accessibilityLabel={`Agent is ${busy.toLowerCase()}`}
