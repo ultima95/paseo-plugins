@@ -3,18 +3,17 @@ import {
   boardButtonId,
   buttonWorkspaces,
   pillCounts,
-  pillLabel,
+  pillSpecs,
 } from "./header-button";
 
 describe("boardButtonId", () => {
-  it("prefixes the workspace id with a letter", () => {
-    expect(boardButtonId("0f3a1c2e-9b7d-4a11-8c3e-2d5f6a7b8c9d")).toBe(
-      "board-0f3a1c2e-9b7d-4a11-8c3e-2d5f6a7b8c9d",
-    );
+  it("prefixes the workspace id with the pill kind", () => {
+    expect(boardButtonId("0f3a1c2e-9b7d-4a11", "need")).toBe("board-need-0f3a1c2e-9b7d-4a11");
+    expect(boardButtonId("0f3a1c2e-9b7d-4a11", "board")).toBe("board-board-0f3a1c2e-9b7d-4a11");
   });
 
   it("lowercases and replaces anything a button id cannot hold", () => {
-    expect(boardButtonId("A/B_C.D")).toBe("board-a-b-c-d");
+    expect(boardButtonId("A/B_C.D", "run")).toBe("board-run-a-b-c-d");
   });
 });
 
@@ -77,17 +76,29 @@ describe("pillCounts", () => {
   });
 });
 
-describe("pillLabel", () => {
-  it("says both counts when there are both", () => {
-    expect(pillLabel({ needYou: 2, running: 3 })).toBe("2 need you · 3 running");
+describe("pillSpecs", () => {
+  function shown(specs: ReturnType<typeof pillSpecs>) {
+    return specs.filter((spec) => spec.visible).map((spec) => `${spec.kind}:${spec.label ?? ""}`);
+  }
+
+  it("shows the two counts as their own pills", () => {
+    expect(shown(pillSpecs({ needYou: 2, running: 3 }))).toEqual(["need:2", "run:3"]);
   });
 
-  it("reads right for one", () => {
-    expect(pillLabel({ needYou: 1, running: 0 })).toBe("1 needs you");
-    expect(pillLabel({ needYou: 0, running: 1 })).toBe("1 running");
+  it("hides a pill whose count is zero", () => {
+    expect(shown(pillSpecs({ needYou: 0, running: 3 }))).toEqual(["run:3"]);
+    expect(shown(pillSpecs({ needYou: 1, running: 0 }))).toEqual(["need:1"]);
   });
 
-  it("says nothing when the board is quiet", () => {
-    expect(pillLabel({ needYou: 0, running: 0 })).toBeUndefined();
+  it("falls back to the board button when nothing is happening", () => {
+    expect(shown(pillSpecs({ needYou: 0, running: 0 }))).toEqual(["board:"]);
+  });
+
+  it("names the counts in each pill's title", () => {
+    expect(pillSpecs({ needYou: 1, running: 2 }).map((spec) => spec.title)).toEqual([
+      "Workspace board · 1 workspace needs you",
+      "Workspace board · 2 workspaces are running",
+      "Workspace board",
+    ]);
   });
 });

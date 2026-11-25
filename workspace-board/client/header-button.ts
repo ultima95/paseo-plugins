@@ -2,12 +2,12 @@ import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { classify, isChildWorkspace, isOnBoard, type BoardWorkspace } from "./board-model";
 
 /**
- * A header pill for the board, on every open workspace.
+ * The board's status pills in the workspace header.
  *
  * The sidebar row is the board's usual way in, but it lives in the sidebar, so closing the
- * sidebar hides the only way back. Header buttons are per workspace, so this keeps one for
- * each open workspace on the host, drops it when that workspace closes, and keeps its label
- * showing how many workspaces still need the user or are running.
+ * sidebar hides the only way back. Header buttons are per workspace, so this keeps three per
+ * open workspace on the host: one pill for the workspaces that need the user, one for the ones
+ * still running, and a plain board button while both counts are zero. Every one opens the board.
  */
 
 /** What this module reads from a workspace on the host's list. */
@@ -20,26 +20,35 @@ interface WorkspaceRow {
   readonly parentWorkspaceId?: string | null;
 }
 
-/** Header button ids must be lowercase letters, numbers, and hyphens, starting with a letter. */
-export function boardButtonId(workspaceId: string): string {
-  const safe = workspaceId.toLowerCase().replace(/[^a-z0-9-]/g, "-");
-  return `board-${safe}`;
-}
-
-/** The workspaces that carry a pill: every open one, not a background workspace. */
-export function buttonWorkspaces(rows: readonly WorkspaceRow[]): string[] {
-  return rows.filter((row) => row.background !== true).map((row) => row.id);
-}
-
-/** What the pill says: the board's two attention columns, plus the ones still working. */
+/** What the pills show: the board's two attention columns, plus the ones still working. */
 export interface BoardPillCounts {
   readonly needYou: number;
   readonly running: number;
 }
 
+/** One pill a workspace header carries. */
+export interface PillSpec {
+  readonly kind: "need" | "run" | "board";
+  readonly icon: string;
+  readonly label: string | undefined;
+  readonly visible: boolean;
+  readonly title: string;
+}
+
+/** Header button ids must be lowercase letters, numbers, and hyphens, starting with a letter. */
+export function boardButtonId(workspaceId: string, kind: PillSpec["kind"]): string {
+  const safe = workspaceId.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+  return `board-${kind}-${safe}`;
+}
+
+/** The workspaces that carry pills: every open one, not a background workspace. */
+export function buttonWorkspaces(rows: readonly WorkspaceRow[]): string[] {
+  return rows.filter((row) => row.background !== true).map((row) => row.id);
+}
+
 /**
- * The counts the pill shows, over every open workspace on the host. They follow the board's
- * own classification, so the pill and the sidebar never disagree about what needs the user.
+ * The counts the pills show, over every open workspace on the host. They follow the board's
+ * own classification, so the pills and the sidebar never disagree about what needs the user.
  */
 export function pillCounts(rows: readonly WorkspaceRow[]): BoardPillCounts {
   let needYou = 0;
@@ -62,19 +71,52 @@ export function pillCounts(rows: readonly WorkspaceRow[]): BoardPillCounts {
   return { needYou, running };
 }
 
-/** The pill's text, or undefined to leave it an icon when nothing is happening. */
-export function pillLabel(counts: BoardPillCounts): string | undefined {
-  const needs = counts.needYou === 1 ? "1 needs you" : `${counts.needYou} need you`;
-  const runs = counts.running === 1 ? "1 running" : `${counts.running} running`;
-  if (counts.needYou > 0 && counts.running > 0) return `${needs} · ${runs}`;
-  if (counts.needYou > 0) return needs;
-  if (counts.running > 0) return runs;
-  return undefined;
+function countTitle(count: number, one: string, many: string): string {
+  return count === 1 ? `1 ${one}` : `${count} ${many}`;
+}
+
+/**
+ * The pills a header carries. A count pill shows its number and hides at zero; when both
+ * counts are zero the plain board button takes their place, so the board is always reachable.
+ */
+export function pillSpecs(counts: BoardPillCounts): readonly PillSpec[] {
+  const needTitle = countTitle(counts.needYou, "workspace needs you", "workspaces need you");
+  const runTitle = countTitle(counts.running, "workspace is running", "workspaces are running");
+  const quiet = counts.needYou === 0 && counts.running === 0;
+  return [
+    {
+      kind: "need",
+      icon: "AlertCircle",
+      label: counts.needYou === 0 ? undefined : `${counts.needYou}`,
+      visible: counts.needYou > 0,
+      title: `Workspace board · ${needTitle}`,
+    },
+    {
+      kind: "run",
+      icon: "Play",
+      label: counts.running === 0 ? undefined : `${counts.running}`,
+      visible: counts.running > 0,
+      title: `Workspace board · ${runTitle}`,
+    },
+    {
+      kind: "board",
+      icon: "LayoutGrid",
+      label: undefined,
+      visible: quiet,
+      title: "Workspace board",
+    },
+  ];
 }
 
 /** How many times a host that was not reachable at load is asked again before giving up. */
 const LIST_ATTEMPTS = 3;
 const LIST_RETRY_MS = 2_000;
+
+interface LiveButton {
+  readonly registration: ReturnType<PluginClientContext["addHeaderButton"]>;
+  readonly workspaceId: string;
+  spec: PillSpec;
+}
 
 export function registerBoardHeaderButtons(client: PluginClientContext): () => void {
   // An older app has no header buttons at all, and an older one has no paseo handle; the
@@ -87,50 +129,52 @@ export function registerBoardHeaderButtons(client: PluginClientContext): () => v
   let stop: (() => void) | undefined;
   let release: (() => Promise<void>) | undefined;
   let retry: ReturnType<typeof setTimeout> | null = null;
-  const buttons = new Map<string, ReturnType<PluginClientContext["addHeaderButton"]>>();
-  // The last text handed to the host, so an unrelated workspace update does not re-render
-  // every pill for a label that did not move.
-  let shownLabel: string | undefined;
+  const buttons = new Map<string, LiveButton>();
 
   const sync = (workspaces: readonly WorkspaceRow[]) => {
     if (disposed) return;
-    // One label for every pill on this host: the counts span all open workspaces, the same
-    // numbers the sidebar row carries.
-    const label = pillLabel(pillCounts(workspaces));
-    const labelChanged = label !== shownLabel;
-    shownLabel = label;
-    const title = label === undefined ? "Workspace board" : `Workspace board · ${label}`;
+    const specs = pillSpecs(pillCounts(workspaces));
     const wanted = new Set(buttonWorkspaces(workspaces));
-    for (const [workspaceId, button] of buttons) {
-      if (wanted.has(workspaceId)) continue;
-      button.remove();
-      buttons.delete(workspaceId);
+    for (const [id, live] of buttons) {
+      if (wanted.has(live.workspaceId)) continue;
+      live.registration.remove();
+      buttons.delete(id);
     }
     for (const workspaceId of wanted) {
-      const existing = buttons.get(workspaceId);
-      if (existing !== undefined) {
-        if (labelChanged) existing.update({ label, title });
-        continue;
-      }
-      try {
-        buttons.set(
-          workspaceId,
-          client.addHeaderButton({
-            id: boardButtonId(workspaceId),
+      for (const spec of specs) {
+        const id = boardButtonId(workspaceId, spec.kind);
+        const existing = buttons.get(id);
+        if (existing !== undefined) {
+          // Only touch the host when this pill's own text or visibility moved.
+          if (!sameSpec(existing.spec, spec)) {
+            existing.registration.update({
+              label: spec.label,
+              visible: spec.visible,
+              title: spec.title,
+            });
+            existing.spec = spec;
+          }
+          continue;
+        }
+        try {
+          const registration = client.addHeaderButton({
+            id,
             workspaceId,
             button: {
-              title,
-              label,
-              icon: "LayoutGrid",
+              title: spec.title,
+              label: spec.label,
+              icon: spec.icon,
+              visible: spec.visible,
               behavior: {
                 kind: "action",
                 onPress: () => client.openScreen({ screenId: "board" }),
               },
             },
-          }),
-        );
-      } catch {
-        // A host that refuses this workspace's button must not stop the others.
+          });
+          buttons.set(id, { registration, workspaceId, spec });
+        } catch {
+          // A host that refuses this workspace's pill must not stop the others.
+        }
       }
     }
   };
@@ -138,7 +182,7 @@ export function registerBoardHeaderButtons(client: PluginClientContext): () => v
   const byId = new Map<string, WorkspaceRow>();
   const republish = () => sync([...byId.values()]);
 
-  // The app can load a plugin before its daemon is reachable. Asking again keeps the buttons
+  // The app can load a plugin before its daemon is reachable. Asking again keeps the pills
   // from staying missing until the plugin is reloaded by hand.
   let attempt = 0;
   const start = () => {
@@ -180,8 +224,12 @@ export function registerBoardHeaderButtons(client: PluginClientContext): () => v
     disposed = true;
     if (retry !== null) clearTimeout(retry);
     stop?.();
-    for (const button of buttons.values()) button.remove();
+    for (const live of buttons.values()) live.registration.remove();
     buttons.clear();
     void release?.().catch(() => undefined);
   };
+}
+
+function sameSpec(left: PillSpec, right: PillSpec): boolean {
+  return left.label === right.label && left.visible === right.visible && left.title === right.title;
 }
