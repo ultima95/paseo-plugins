@@ -6,7 +6,13 @@ import type {
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { getPaseoClient } from "@getpaseo/plugin/client";
 import { useEffect, useState } from "react";
-import { appendLiveItem, rowsFromEntries, type TimelineRow } from "./timeline-model";
+import {
+  appendLiveItem,
+  rowsFromEntries,
+  subagentFromItem,
+  type SubagentRow,
+  type TimelineRow,
+} from "./timeline-model";
 
 type AgentEntry = PaseoAgent;
 
@@ -27,7 +33,11 @@ export type AgentLookup =
 export type TimelineState =
   | { readonly status: "loading" }
   | { readonly status: "error"; readonly message: string }
-  | { readonly status: "ready"; readonly rows: readonly TimelineRow[] };
+  | {
+      readonly status: "ready";
+      readonly rows: readonly TimelineRow[];
+      readonly subagents: readonly SubagentRow[];
+    };
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -151,7 +161,9 @@ export function useWorkspaceAgents(
 
 /**
  * One agent's chat, live: its recent history once, then every stream event. A reconnect or a
- * replacement epoch refetches, because live delivery alone may have missed rows.
+ * replacement epoch refetches, because live delivery alone may have missed rows. Subagents the
+ * agent delegates to come from both the timeline's Task calls and the host's subagent session
+ * events, because a host may report one and not the other.
  */
 export function useAgentTimeline(
   serverId: string | undefined,
@@ -162,15 +174,24 @@ export function useAgentTimeline(
 
   useEffect(() => {
     if (agentId === null) {
-      setState({ status: "ready", rows: [] });
+      setState({ status: "ready", rows: [], subagents: [] });
       return;
     }
     let disposed = false;
     let subscription: { release(): Promise<void> } | undefined;
+    let observation: ReturnType<PaseoApi["observeEvents"]> | undefined;
     let live = 0;
+    let loaded = false;
+    let rows: readonly TimelineRow[] = [];
+    const subagents = new Map<string, SubagentRow>();
+    // A host may key a session by its own id while the timeline names the tool call.
+    const providerKeys = new Map<string, string>();
+    // A Task call reports completed as soon as an async subagent launches; the host's state wins.
+    const providerManaged = new Set<string>();
     setState({ status: "loading" });
 
-    const handle = previewApi(serverId, fallback).agents.ref(agentId);
+    const api = previewApi(serverId, fallback);
+    const handle = api.agents.ref(agentId);
     const timeline = handle.timeline;
     // A host older than the agent timeline API has nothing to show; say so instead of throwing.
     if (typeof timeline?.subscribe !== "function") {
@@ -178,12 +199,31 @@ export function useAgentTimeline(
       return;
     }
 
+    const publish = () => {
+      if (disposed) return;
+      // Running subagents first: the ones doing work now are the ones to watch.
+      const ordered = [...subagents.values()].sort(
+        (a, b) => Number(b.state === "running") - Number(a.state === "running"),
+      );
+      setState({ status: "ready", rows, subagents: ordered });
+    };
+
+    const rememberFromTimeline = (subagent: SubagentRow) => {
+      if (!providerManaged.has(subagent.id)) subagents.set(subagent.id, subagent);
+    };
+
     const load = () => {
       timeline
         .refetch({ direction: "tail", limit: 60 })
         .then((page) => {
           if (disposed) return;
-          setState({ status: "ready", rows: rowsFromEntries(page.entries) });
+          rows = rowsFromEntries(page.entries);
+          for (const entry of page.entries) {
+            const subagent = subagentFromItem(entry.item);
+            if (subagent !== null) rememberFromTimeline(subagent);
+          }
+          loaded = true;
+          publish();
           return undefined;
         })
         .catch((error: unknown) => {
@@ -203,19 +243,65 @@ export function useAgentTimeline(
       }
       const stream = event.event;
       if (stream.type !== "timeline") return;
-      const item: AgentTimelineItem = stream.item;
+      // Without a provider message id, its turn keeps the chunk from merging into an older reply.
+      const item: AgentTimelineItem =
+        stream.item.type === "assistant_message" &&
+        stream.item.messageId === undefined &&
+        stream.turnId !== undefined
+          ? { ...stream.item, messageId: `turn:${stream.turnId}` }
+          : stream.item;
       live += 1;
-      setState((current) =>
-        current.status === "ready"
-          ? { status: "ready", rows: appendLiveItem(current.rows, item, `live:${live}`) }
-          : current,
-      );
+      rows = appendLiveItem(rows, item, `live:${live}`);
+      const subagent = subagentFromItem(item);
+      if (subagent !== null) rememberFromTimeline(subagent);
+      if (loaded) publish();
     });
+
+    // Session events carry status the timeline only shows while the Task call is running.
+    try {
+      observation = api.observeEvents(["agent.provider_subagents.update"], {});
+      observation.subscribe({
+        snapshot: () => {},
+        update: (message) => {
+          if (disposed || message.type !== "agent.provider_subagents.update") return;
+          const payload = message.payload;
+          if (payload.kind === "upsert") {
+            const subagent = payload.subagent;
+            if (subagent.parentAgentId !== agentId) return;
+            const key =
+              providerKeys.get(subagent.id) ?? subagent.toolCallId ?? subagent.id;
+            providerKeys.set(subagent.id, key);
+            providerManaged.add(key);
+            subagents.set(key, {
+              id: key,
+              label: subagent.title ?? subagent.description ?? "Subagent",
+              state: subagent.status,
+            });
+          } else if (payload.kind === "remove") {
+            if (payload.parentAgentId !== agentId) return;
+            const key = providerKeys.get(payload.subagentId) ?? payload.subagentId;
+            providerKeys.delete(payload.subagentId);
+            providerManaged.delete(key);
+            subagents.delete(key);
+          } else {
+            return;
+          }
+          if (loaded) publish();
+        },
+        error: () => undefined,
+      });
+      void observation.ready.catch(() => undefined);
+    } catch {
+      // A host without subagent events still shows the timeline's own Task calls.
+      observation = undefined;
+    }
+
     load();
 
     return () => {
       disposed = true;
       void subscription?.release().catch(() => undefined);
+      void observation?.release().catch(() => undefined);
     };
   }, [serverId, agentId, fallback]);
 
@@ -225,6 +311,12 @@ export function useAgentTimeline(
 /** Sends a prompt into the agent the preview shows. */
 export async function sendPrompt(api: PaseoApi, agentId: string, text: string): Promise<void> {
   await api.agents.ref(agentId).send(text);
+}
+
+/** Archives the workspace the preview shows, closing it off the board. */
+export async function archiveWorkspace(api: PaseoApi, workspaceId: string): Promise<void> {
+  const result = await api.workspaces.ref(workspaceId).archive();
+  if (result.error) throw new Error(result.error);
 }
 
 /** Closes a pending permission or question request on the agent. */

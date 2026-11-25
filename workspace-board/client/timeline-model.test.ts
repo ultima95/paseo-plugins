@@ -5,6 +5,7 @@ import {
   appendLiveItem,
   displayText,
   rowsFromEntries,
+  subagentFromItem,
   type TimelineRow,
 } from "./timeline-model";
 
@@ -101,6 +102,14 @@ describe("appendLiveItem", () => {
     expect(rows[1]).toMatchObject({ kind: "assistant", text: "Hello there", key: "live:1" });
   });
 
+  it("joins the delta chunks a provider streams for one message", () => {
+    let rows = appendLiveItem(base, assistant("1. Five", "m1"), "live:1");
+    rows = appendLiveItem(rows, assistant(" lines printed", "m1"), "live:2");
+    rows = appendLiveItem(rows, assistant(", strict order.", "m1"), "live:3");
+    expect(rows).toHaveLength(2);
+    expect(rows[1]?.text).toBe("1. Five lines printed, strict order.");
+  });
+
   it("starts a new row when the id changes", () => {
     let rows = appendLiveItem(base, assistant("first", "m1"), "live:1");
     rows = appendLiveItem(rows, assistant("second", "m2"), "live:2");
@@ -141,6 +150,38 @@ describe("appendLiveItem", () => {
     }
     expect(rows).toHaveLength(ROW_LIMIT);
     expect(rows.at(-1)?.text).toBe(`m${ROW_LIMIT + 9}`);
+  });
+});
+
+describe("subagentFromItem", () => {
+  const task = (status: "running" | "completed", subAgentType?: string): AgentTimelineItem => ({
+    type: "tool_call",
+    callId: "toolu_1",
+    name: "Task",
+    status,
+    error: null,
+    detail: { type: "sub_agent", subAgentType, description: "audit the login flow" },
+  });
+
+  it("names a running Task subagent by its type", () => {
+    expect(subagentFromItem(task("running", "general-purpose"))).toEqual({
+      id: "toolu_1",
+      label: "general-purpose",
+      state: "running",
+    });
+  });
+
+  it("falls back to the task description when the provider has no type", () => {
+    expect(subagentFromItem(task("completed"))).toMatchObject({
+      label: "audit the login flow",
+      state: "completed",
+    });
+  });
+
+  it("leaves every other tool call and item alone", () => {
+    expect(subagentFromItem(toolCall)).toBeNull();
+    expect(subagentFromItem(user("hi"))).toBeNull();
+    expect(subagentFromItem({ type: "reasoning", text: "hmm" })).toBeNull();
   });
 });
 

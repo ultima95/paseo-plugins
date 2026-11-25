@@ -42,78 +42,51 @@ export function BoardSection({
 }: BoardSectionProps) {
   const [collapsed, setCollapsed] = useState(false);
   const accent = columnAccent(id, theme.colors);
-  const empty = items.length === 0;
 
   const styles = useMemo(
     () => ({
-      section: { gap: 10 },
+      section: { gap: 8 },
       header: {
         flexDirection: "row" as const,
         alignItems: "center" as const,
-        gap: 8,
-        minHeight: 24,
-        opacity: empty ? 0.5 : 1,
+        gap: 6,
+        minHeight: 22,
       },
-      chevron: { width: 14, alignItems: "center" as const },
+      chevron: { width: 12, alignItems: "center" as const },
       title: {
-        color: empty ? theme.colors.foregroundMuted : theme.colors.foreground,
-        fontSize: 14,
+        color: theme.colors.foreground,
+        fontSize: 12.5,
         fontWeight: "600" as const,
+        letterSpacing: 0.2,
       },
-      count: {
-        minWidth: 20,
-        alignItems: "center" as const,
-        backgroundColor: theme.colors.surface2,
-        borderColor: theme.colors.border,
-        borderWidth: 1,
-        borderRadius: 999,
-        paddingHorizontal: 6,
-        paddingVertical: 1,
-      },
-      countText: { color: theme.colors.foregroundMuted, fontSize: 11, fontWeight: "600" as const },
-      rule: { flex: 1, height: 1, backgroundColor: theme.colors.border },
-      grid: { flexDirection: "row" as const, flexWrap: "wrap" as const, gap: 10 },
+      count: { color: theme.colors.foregroundMuted, fontSize: 11.5, fontWeight: "500" as const },
+      grid: { flexDirection: "row" as const, flexWrap: "wrap" as const, gap: 8 },
       pressed: { opacity: 0.6 },
     }),
-    [theme, accent, empty],
-  );
-
-  const header = (
-    <>
-      <View style={styles.chevron}>
-        {empty ? null : (
-          <Icon
-            name={collapsed ? "ChevronRight" : "ChevronDown"}
-            size={14}
-            color={theme.colors.foregroundMuted}
-          />
-        )}
-      </View>
-      <Icon name={columnIcon(id)} size={13} color={accent} />
-      <Text style={styles.title}>{title}</Text>
-      <View style={styles.count}>
-        <Text style={styles.countText}>{items.length}</Text>
-      </View>
-      <View style={styles.rule} />
-    </>
+    [theme],
   );
 
   return (
     <View style={styles.section}>
-      {empty ? (
-        <View style={styles.header}>{header}</View>
-      ) : (
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={`${collapsed ? "Expand" : "Collapse"} ${title}, ${items.length}`}
-          accessibilityState={{ expanded: !collapsed }}
-          onPress={() => setCollapsed((value) => !value)}
-          style={({ pressed }) => [styles.header, pressed && styles.pressed]}
-        >
-          {header}
-        </Pressable>
-      )}
-      {empty || collapsed ? null : (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${collapsed ? "Expand" : "Collapse"} ${title}, ${items.length}`}
+        accessibilityState={{ expanded: !collapsed }}
+        onPress={() => setCollapsed((value) => !value)}
+        style={({ pressed }) => [styles.header, pressed && styles.pressed]}
+      >
+        <View style={styles.chevron}>
+          <Icon
+            name={collapsed ? "ChevronRight" : "ChevronDown"}
+            size={13}
+            color={theme.colors.foregroundMuted}
+          />
+        </View>
+        <Icon name={columnIcon(id)} size={12} color={accent} />
+        <Text style={styles.title}>{title}</Text>
+        <Text style={styles.count}>{items.length}</Text>
+      </Pressable>
+      {collapsed ? null : (
         <View style={styles.grid}>
           {items.map((workspace) => (
             <WorkspaceCard

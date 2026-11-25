@@ -25,14 +25,6 @@ interface WorkspaceCardProps {
   selected?: boolean;
 }
 
-/** What the card says about a workspace that is waiting on the user. */
-function attentionLabel(column: ColumnId, indicator: string): string | null {
-  if (column === "needs-you") return indicator === "failed" ? "Failed" : "Waiting";
-  if (column === "review") return "Review";
-  if (column === "running") return "Running";
-  return null;
-}
-
 export const WorkspaceCard = memo(function WorkspaceCard({
   workspace,
   column,
@@ -57,62 +49,34 @@ export const WorkspaceCard = memo(function WorkspaceCard({
       card: {
         flexDirection: "row" as const,
         alignItems: "center" as const,
-        gap: 10,
+        gap: 8,
         width: width ?? ("100%" as const),
-        minHeight: 58,
         backgroundColor: surface,
         borderColor: selected ? accent : theme.colors.border,
         borderWidth: 1,
-        borderRadius: 10,
-        paddingVertical: 10,
-        paddingLeft: 10,
-        paddingRight: 10,
+        borderRadius: 9,
+        paddingVertical: 8,
+        paddingLeft: 9,
+        paddingRight: 7,
       },
-      accentBar: { width: 3, alignSelf: "stretch" as const, borderRadius: 2, backgroundColor: accent },
-      body: { flex: 1, gap: 4, minWidth: 0 },
-      titleRow: { flexDirection: "row" as const, alignItems: "flex-start" as const, gap: 8 },
+      accentBar: { width: 2, alignSelf: "stretch" as const, borderRadius: 1, backgroundColor: accent },
+      body: { flex: 1, gap: 2, minWidth: 0 },
       title: {
-        flex: 1,
         color: theme.colors.foreground,
-        fontSize: 14,
+        fontSize: 13.5,
         fontWeight: "600" as const,
         lineHeight: 18,
       },
-      ageBadge: {
-        backgroundColor: theme.colors.surface2,
-        borderRadius: 999,
-        paddingHorizontal: 7,
-        paddingVertical: 1,
-      },
-      age: { color: theme.colors.foregroundMuted, fontSize: 11, fontWeight: "600" as const },
-      metaRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 6 },
-      statusChip: {
-        backgroundColor: theme.colors.surface2,
-        borderRadius: 999,
-        paddingHorizontal: 6,
-        paddingVertical: 1,
-      },
-      statusText: { color: accent, fontSize: 10.5, fontWeight: "600" as const },
+      metaRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 5 },
+      failed: { color: theme.colors.statusDanger, fontSize: 11, fontWeight: "600" as const },
       meta: { flexShrink: 1, color: theme.colors.foregroundMuted, fontSize: 11.5 },
-      parkButton: {
-        flexDirection: "row" as const,
-        alignItems: "center" as const,
-        gap: 4,
-        borderColor: theme.colors.border,
-        borderWidth: 1,
-        borderRadius: 7,
-        paddingHorizontal: 8,
-        paddingVertical: 5,
-      },
-      parkLabel: { color: theme.colors.foregroundMuted, fontSize: 11.5 },
-      openButton: {
+      age: { color: theme.colors.foregroundMuted, fontSize: 11.5, flexShrink: 0 },
+      action: {
         alignItems: "center" as const,
         justifyContent: "center" as const,
-        width: 26,
-        height: 26,
-        borderColor: theme.colors.border,
-        borderWidth: 1,
-        borderRadius: 7,
+        width: 24,
+        height: 24,
+        borderRadius: 6,
       },
       pressed: { opacity: 0.7 },
     }),
@@ -124,7 +88,6 @@ export const WorkspaceCard = memo(function WorkspaceCard({
   const meta = showHost
     ? `${workspace.projectDisplayName} · ${workspace.hostLabel}`
     : workspace.projectDisplayName;
-  const chip = attentionLabel(column, workspace.indicator);
   const isParked = workspace.labels.some(
     (label) => label.toLowerCase() === PARKED_LABEL.toLowerCase(),
   );
@@ -152,31 +115,6 @@ export const WorkspaceCard = memo(function WorkspaceCard({
     navigation?.openWorkspace({ workspaceId: workspace.id, serverId: workspace.serverId });
   }
 
-  const body = (
-    <>
-      <View style={styles.titleRow}>
-        <Text style={styles.title} numberOfLines={2}>
-          {title}
-        </Text>
-        {age ? (
-          <View style={styles.ageBadge}>
-            <Text style={styles.age}>{age}</Text>
-          </View>
-        ) : null}
-      </View>
-      <View style={styles.metaRow}>
-        {chip ? (
-          <View style={styles.statusChip}>
-            <Text style={styles.statusText}>{chip}</Text>
-          </View>
-        ) : null}
-        <Text style={styles.meta} numberOfLines={1}>
-          {meta}
-        </Text>
-      </View>
-    </>
-  );
-
   // The open area, the preview and the Park button are siblings: nesting one Pressable in
   // another hides the inner one from screen readers and breaks button semantics on web.
   return (
@@ -189,29 +127,43 @@ export const WorkspaceCard = memo(function WorkspaceCard({
         onPress={() => (onPreview === undefined ? openWorkspace() : onPreview(workspace))}
         style={({ pressed }) => [styles.body, pressed && styles.pressed]}
       >
-        {body}
+        <Text style={styles.title} numberOfLines={2}>
+          {title}
+        </Text>
+        <View style={styles.metaRow}>
+          {workspace.indicator === "failed" ? (
+            <Text style={styles.failed}>Failed</Text>
+          ) : null}
+          <Text style={styles.meta} numberOfLines={1}>
+            {meta}
+          </Text>
+          {age === null ? null : <Text style={styles.age}>· {age}</Text>}
+        </View>
       </Pressable>
-      {onPreview === undefined || navigation === undefined ? null : (
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={`Open ${title} in its project`}
-          onPress={openWorkspace}
-          style={({ pressed }) => [styles.openButton, pressed && styles.pressed]}
-        >
-          <Icon name="ExternalLink" size={12} color={theme.colors.foregroundMuted} />
-        </Pressable>
-      )}
       {canPark ? (
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={`${isParked ? "Unpark" : "Park"} ${title}`}
           onPress={togglePark}
-          style={({ pressed }) => [styles.parkButton, pressed && styles.pressed]}
+          style={({ pressed }) => [styles.action, pressed && styles.pressed]}
         >
-          <Icon name={isParked ? "ArchiveRestore" : "Archive"} size={12} color={theme.colors.foregroundMuted} />
-          <Text style={styles.parkLabel}>{isParked ? "Unpark" : "Park"}</Text>
+          <Icon
+            name={isParked ? "ArchiveRestore" : "Archive"}
+            size={13}
+            color={theme.colors.foregroundMuted}
+          />
         </Pressable>
       ) : null}
+      {onPreview === undefined || navigation === undefined ? null : (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`Open ${title} in its project`}
+          onPress={openWorkspace}
+          style={({ pressed }) => [styles.action, pressed && styles.pressed]}
+        >
+          <Icon name="ExternalLink" size={13} color={theme.colors.foregroundMuted} />
+        </Pressable>
+      )}
     </View>
   );
 });

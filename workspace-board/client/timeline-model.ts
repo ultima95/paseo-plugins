@@ -49,10 +49,17 @@ export function rowsFromEntries(entries: readonly TimelineEntry[]): TimelineRow[
 }
 
 /**
+ * One assistant chunk joined with what the row already shows. Providers stream deltas, so a chunk
+ * is usually only the new text; some resend the whole message so far, which is already contained.
+ */
+function mergeStreamText(shown: string, chunk: string): string {
+  return chunk.startsWith(shown) ? chunk : shown + chunk;
+}
+
+/**
  * One live timeline item merged into the rows on screen. Only assistant text streams: providers
- * send its full accumulated text on each update, under a message id when they have one, so a
- * chunk grows the row it belongs to. User prompts and errors always append, and an item the
- * preview leaves out changes nothing.
+ * send chunks of the same message under a message id, so a chunk grows the row it belongs to.
+ * User prompts and errors always append, and an item the preview leaves out changes nothing.
  */
 export function appendLiveItem(
   rows: readonly TimelineRow[],
@@ -72,8 +79,29 @@ export function appendLiveItem(
     return [...rows, row].slice(-ROW_LIMIT);
   }
   const next = [...rows];
-  next[at] = { ...row, key: target.key };
+  next[at] = { ...row, key: target.key, text: mergeStreamText(target.text, row.text) };
   return next;
+}
+
+/** The state a provider reports for a subagent session it runs on the agent's behalf. */
+export type SubagentState = "running" | "completed" | "failed" | "canceled";
+
+/** One subagent the previewed agent delegated work to. */
+export interface SubagentRow {
+  readonly id: string;
+  readonly label: string;
+  readonly state: SubagentState;
+}
+
+/** The subagent a timeline item is about, or null for everything else the agent did itself. */
+export function subagentFromItem(item: AgentTimelineItem): SubagentRow | null {
+  if (item.type !== "tool_call" || item.detail.type !== "sub_agent") return null;
+  const detail = item.detail;
+  return {
+    id: item.callId,
+    label: detail.subAgentType ?? detail.description ?? item.name,
+    state: item.status,
+  };
 }
 
 /** A chat bubble's text, trimmed of the blank lines providers pad their output with. */

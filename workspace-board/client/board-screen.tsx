@@ -20,7 +20,7 @@ import { usePreviewWidth } from "./preview-width-store";
 import { useBoardWorkspaces, type BoardWorkspaceCard } from "./use-board-workspaces";
 
 const AGE_TICK_MS = 30_000;
-const GRID_GAP = 10;
+const GRID_GAP = 8;
 /** Below this the board cannot spare a column for the preview, so the preview covers it. */
 const SIDE_BY_SIDE_MIN = 900;
 /** The board keeps at least this much width, so the preview cannot squeeze it away. */
@@ -65,7 +65,7 @@ export function BoardScreen({ theme, layout, host, navigation }: PluginScreenPro
       root: { flex: 1, backgroundColor: theme.colors.surface0 },
       shell: { flex: 1, flexDirection: "row" as const, minHeight: 0, minWidth: 0 },
       content: { padding: pad, paddingBottom: 48 },
-      stack: { gap: 18 },
+      stack: { gap: 16 },
       overlay: {
         position: "absolute" as const,
         top: 0,
@@ -85,29 +85,22 @@ export function BoardScreen({ theme, layout, host, navigation }: PluginScreenPro
         left: 0,
         backgroundColor: "rgba(0,0,0,0.28)",
       },
-      hero: {
-        backgroundColor: theme.colors.surface1,
-        borderColor: theme.colors.border,
-        borderWidth: 1,
-        borderRadius: 12,
-        padding: 16,
-        gap: 10,
-      },
-      heroLead: { flexDirection: "row" as const, alignItems: "center" as const, gap: 10 },
-      summaryDot: { width: 10, height: 10, borderRadius: 5 },
-      headline: { color: theme.colors.foreground, fontSize: 18, fontWeight: "600" as const },
-      chips: { flexDirection: "row" as const, alignItems: "center" as const, gap: 6, flexWrap: "wrap" as const },
-      chip: {
+      header: { gap: 10 },
+      headerRow: {
         flexDirection: "row" as const,
         alignItems: "center" as const,
-        gap: 6,
-        backgroundColor: theme.colors.surface2,
-        borderColor: theme.colors.border,
-        borderWidth: 1,
-        borderRadius: 999,
-        paddingHorizontal: 9,
-        paddingVertical: 3,
+        gap: 10,
+        flexWrap: "wrap" as const,
       },
+      summaryDot: { width: 9, height: 9, borderRadius: 5 },
+      headline: { color: theme.colors.foreground, fontSize: 16, fontWeight: "600" as const },
+      chips: {
+        flexDirection: "row" as const,
+        alignItems: "center" as const,
+        gap: 12,
+        flexWrap: "wrap" as const,
+      },
+      chip: { flexDirection: "row" as const, alignItems: "center" as const, gap: 5 },
       chipCount: { color: theme.colors.foreground, fontSize: 12, fontWeight: "600" as const },
       chipLabel: { color: theme.colors.foregroundMuted, fontSize: 12 },
       search: {
@@ -117,37 +110,26 @@ export function BoardScreen({ theme, layout, host, navigation }: PluginScreenPro
         backgroundColor: theme.colors.surface1,
         borderColor: focused ? theme.colors.accent : theme.colors.border,
         borderWidth: 1,
-        borderRadius: 10,
-        paddingHorizontal: 12,
-        flexGrow: 1,
-        minWidth: 220,
-        maxWidth: layout.compact ? undefined : 420,
+        borderRadius: 9,
+        paddingHorizontal: 10,
+        marginLeft: "auto" as const,
+        width: layout.compact ? ("100%" as const) : 280,
       },
       filter: {
         flex: 1,
         color: theme.colors.foreground,
-        paddingVertical: 9,
-        fontSize: 14,
+        paddingVertical: 7,
+        fontSize: 13,
       },
       clear: { padding: 4 },
-      toolbar: {
+      notes: {
         flexDirection: "row" as const,
         alignItems: "center" as const,
-        gap: 10,
+        gap: 14,
         flexWrap: "wrap" as const,
       },
-      toggle: {
-        flexDirection: "row" as const,
-        alignItems: "center" as const,
-        gap: 6,
-        backgroundColor: theme.colors.surface1,
-        borderColor: theme.colors.border,
-        borderWidth: 1,
-        borderRadius: 10,
-        paddingHorizontal: 10,
-        paddingVertical: 8,
-      },
-      toggleText: { color: theme.colors.foregroundMuted, fontSize: 12 },
+      note: { flexDirection: "row" as const, alignItems: "center" as const, gap: 5 },
+      noteText: { color: theme.colors.foregroundMuted, fontSize: 11.5 },
       message: { color: theme.colors.foregroundMuted, fontSize: 13 },
       error: { color: theme.colors.statusDanger, fontSize: 13 },
       placeholder: {
@@ -267,66 +249,69 @@ export function BoardScreen({ theme, layout, host, navigation }: PluginScreenPro
         style={styles.stack}
         onLayout={(event) => setContentWidth(Math.round(event.nativeEvent.layout.width))}
       >
-        <View style={styles.hero}>
-          <View style={styles.heroLead}>
+        <View style={styles.header}>
+          <View style={styles.headerRow}>
             <View style={[styles.summaryDot, { backgroundColor: dotColor }]} />
             <Text style={styles.headline}>{headline}</Text>
-          </View>
-          <View style={styles.chips}>
-            {chips
-              .filter((chip) => chip.count > 0 || chip.id === "idle")
-              .map((chip) => (
-                <View key={chip.id} style={styles.chip}>
-                  <Icon
-                    name={columnIcon(chip.id)}
-                    size={11}
-                    color={columnAccent(chip.id, theme.colors)}
-                  />
-                  <Text style={styles.chipCount}>{chip.count}</Text>
-                  <Text style={styles.chipLabel}>{chip.label}</Text>
-                </View>
-              ))}
-          </View>
-        </View>
-
-        <View style={styles.toolbar}>
-          <View style={styles.search}>
-            <Icon name="Search" size={15} color={theme.colors.foregroundMuted} />
-            <TextInput
-              value={query}
-              onChangeText={setQuery}
-              onFocus={() => setFocused(true)}
-              onBlur={() => setFocused(false)}
-              placeholder="Filter by title or project"
-              placeholderTextColor={theme.colors.foregroundMuted}
-              accessibilityLabel="Filter workspaces"
-              autoCapitalize="none"
-              autoCorrect={false}
-              style={styles.filter}
-            />
-            {query === "" ? null : (
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Clear filter"
-                onPress={() => setQuery("")}
-                style={({ pressed }) => [styles.clear, pressed && styles.pressed]}
-              >
-                <Icon name="X" size={14} color={theme.colors.foregroundMuted} />
-              </Pressable>
-            )}
-          </View>
-          {unavailable.length === 0 ? null : (
-            <View style={styles.toggle}>
-              <Icon name="CloudOff" size={13} color={theme.colors.foregroundMuted} />
-              <Text style={styles.toggleText}>Not showing {unavailable.join(", ")}</Text>
+            <View style={styles.chips}>
+              {chips
+                .filter((chip) => chip.count > 0)
+                .map((chip) => (
+                  <View key={chip.id} style={styles.chip}>
+                    <Icon
+                      name={columnIcon(chip.id)}
+                      size={11}
+                      color={columnAccent(chip.id, theme.colors)}
+                    />
+                    <Text style={styles.chipCount}>{chip.count}</Text>
+                    <Text style={styles.chipLabel}>{chip.label}</Text>
+                  </View>
+                ))}
             </View>
-          )}
-          {children.length === 0 ? null : (
-            <View style={styles.toggle}>
-              <Icon name="CornerDownRight" size={13} color={theme.colors.foregroundMuted} />
-              <Text style={styles.toggleText}>
-                {children.length} child {children.length === 1 ? "workspace" : "workspaces"} hidden
-              </Text>
+            <View style={styles.search}>
+              <Icon name="Search" size={14} color={theme.colors.foregroundMuted} />
+              <TextInput
+                value={query}
+                onChangeText={setQuery}
+                onFocus={() => setFocused(true)}
+                onBlur={() => setFocused(false)}
+                placeholder="Filter"
+                placeholderTextColor={theme.colors.foregroundMuted}
+                accessibilityLabel="Filter workspaces"
+                autoCapitalize="none"
+                autoCorrect={false}
+                style={styles.filter}
+              />
+              {query === "" ? null : (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Clear filter"
+                  onPress={() => setQuery("")}
+                  style={({ pressed }) => [styles.clear, pressed && styles.pressed]}
+                >
+                  <Icon name="X" size={13} color={theme.colors.foregroundMuted} />
+                </Pressable>
+              )}
+            </View>
+          </View>
+
+          {unavailable.length === 0 && children.length === 0 ? null : (
+            <View style={styles.notes}>
+              {unavailable.length === 0 ? null : (
+                <View style={styles.note}>
+                  <Icon name="CloudOff" size={12} color={theme.colors.foregroundMuted} />
+                  <Text style={styles.noteText}>Not showing {unavailable.join(", ")}</Text>
+                </View>
+              )}
+              {children.length === 0 ? null : (
+                <View style={styles.note}>
+                  <Icon name="CornerDownRight" size={12} color={theme.colors.foregroundMuted} />
+                  <Text style={styles.noteText}>
+                    {children.length} child {children.length === 1 ? "workspace" : "workspaces"}{" "}
+                    hidden
+                  </Text>
+                </View>
+              )}
             </View>
           )}
         </View>
@@ -335,8 +320,8 @@ export function BoardScreen({ theme, layout, host, navigation }: PluginScreenPro
           <Text style={styles.message}>No workspace matches “{query.trim()}”</Text>
         ) : (
           COLUMNS.map((column) =>
-            // While filtering, hide sections with no match instead of listing five empty headers.
-            filtering && shown[column.id].length === 0 ? null : (
+            // The header chips already carry the counts, so an empty state needs no rows at all.
+            shown[column.id].length === 0 ? null : (
               <BoardSection
                 key={column.id}
                 id={column.id}
