@@ -4,6 +4,7 @@ import { Icon, Markdown, useToast } from "@getpaseo/plugin/client/ui";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Image,
   Pressable,
   ScrollView,
   Text,
@@ -33,6 +34,11 @@ import { isSendKey } from "./composer-key";
 import { displayText, type SubagentRow, type TimelineRow } from "./timeline-model";
 import { isNearBottom } from "./scroll-pin";
 import { QuestionForm, actionResponse, answerResponse } from "./question-form";
+import {
+  listenForPastedImages,
+  type PasteTarget,
+  type PastedImage,
+} from "./paste-image";
 import type { AgentPermissionAction, AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 
 interface PreviewPanelProps {
@@ -189,6 +195,14 @@ export function PreviewPanel({
   const [showSubagents, setShowSubagents] = useState(false);
   // Same for a workspace with several agents: one line names the shown one, the rest hide.
   const [showAgents, setShowAgents] = useState(false);
+  // Images pasted into the reply box, sent with the next prompt.
+  const [pasted, setPasted] = useState<readonly PastedImage[]>([]);
+  // The reply box's node, once it exists; only a browser node has paste events.
+  const [inputNode, setInputNode] = useState<PasteTarget | null>(null);
+  const attachInput = useRef((node: unknown) => {
+    const target = node as PasteTarget | null;
+    setInputNode(target !== null && typeof target.addEventListener === "function" ? target : null);
+  }).current;
 
   const accent = columnAccent(column, theme.colors);
   const api = useMemo(
@@ -214,6 +228,7 @@ export function PreviewPanel({
   useEffect(() => {
     setAgentId(null);
     setDraft("");
+    setPasted([]);
     setArchiving(false);
     setConfirmingArchive(false);
     setAnswered({});
@@ -228,6 +243,14 @@ export function PreviewPanel({
     setShowSubagents(false);
     setShowAgents(false);
   }, [chosen]);
+
+  // A screenshot pasted into the reply box rides along with the next prompt.
+  useEffect(() => {
+    if (inputNode === null) return undefined;
+    return listenForPastedImages(inputNode, (images) => {
+      setPasted((current) => [...current, ...images]);
+    });
+  }, [inputNode]);
 
   const rows = timeline.status === "ready" ? timeline.rows : [];
   const subagents = timeline.status === "ready" ? timeline.subagents : [];
@@ -353,6 +376,25 @@ export function PreviewPanel({
         gap: 8,
         flexWrap: "wrap" as const,
       },
+      pastedRow: {
+        flexDirection: "row" as const,
+        alignItems: "center" as const,
+        gap: 6,
+        flexWrap: "wrap" as const,
+      },
+      pastedTile: { width: 44, height: 44, borderRadius: 7, overflow: "hidden" as const },
+      pastedImage: { width: 44, height: 44, backgroundColor: theme.colors.surface2 },
+      pastedRemove: {
+        position: "absolute" as const,
+        top: 2,
+        right: 2,
+        width: 15,
+        height: 15,
+        borderRadius: 8,
+        alignItems: "center" as const,
+        justifyContent: "center" as const,
+        backgroundColor: colorWithAlpha(theme.colors.foreground, 0.75),
+      },
       summaryRow: {
         flexDirection: "row" as const,
         alignItems: "center" as const,
@@ -406,11 +448,18 @@ export function PreviewPanel({
 
   async function submit() {
     const text = draft.trim();
-    if (text === "" || chosen === null || sending) return;
+    // A pasted image alone is a complete reply; a prompt with neither is not.
+    if ((text === "" && pasted.length === 0) || chosen === null || sending) return;
     setSending(true);
     try {
-      await sendPrompt(api, chosen, text);
+      await sendPrompt(
+        api,
+        chosen,
+        text,
+        pasted.map((image) => ({ data: image.data, mimeType: image.mimeType })),
+      );
       setDraft("");
+      setPasted([]);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
     } finally {
@@ -480,7 +529,7 @@ export function PreviewPanel({
   const pending = agent?.pending ?? [];
   const title = workspace.title ?? workspace.name;
   const meta = `${workspace.projectDisplayName} · ${workspace.hostLabel}`;
-  const canSend = chosen !== null && draft.trim() !== "" && !sending;
+  const canSend = chosen !== null && (draft.trim() !== "" || pasted.length > 0) && !sending;
   const summary = subagentSummary(subagents);
   const summaryTone = subagentSummaryTone(subagents);
   const currentLabel =
@@ -801,8 +850,27 @@ export function PreviewPanel({
             ) : null}
           </>
         ) : null}
+        {pasted.length === 0 ? null : (
+          <View style={styles.pastedRow}>
+            {pasted.map((image, index) => (
+              <View key={`${image.name}:${index}`} style={styles.pastedTile}>
+                <Image source={{ uri: image.preview }} style={styles.pastedImage} />
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Remove ${image.name}`}
+                  hitSlop={6}
+                  onPress={() => setPasted((current) => current.filter((_, at) => at !== index))}
+                  style={({ pressed }) => [styles.pastedRemove, pressed && styles.pressed]}
+                >
+                  <Icon name="X" size={9} color={theme.colors.accentForeground} />
+                </Pressable>
+              </View>
+            ))}
+          </View>
+        )}
         <View style={styles.composerRow}>
           <TextInput
+            ref={attachInput}
             value={draft}
             onChangeText={setDraft}
             onKeyPress={onKeyPress}

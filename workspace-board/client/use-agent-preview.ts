@@ -308,9 +308,23 @@ export function useAgentTimeline(
   return state;
 }
 
-/** Sends a prompt into the agent the preview shows. */
-export async function sendPrompt(api: PaseoApi, agentId: string, text: string): Promise<void> {
-  await api.agents.ref(agentId).send(text);
+/** One image a reply carries, as `send` takes it. */
+export interface ReplyImage {
+  readonly data: string;
+  readonly mimeType: string;
+}
+
+/**
+ * Sends a prompt into the agent the preview shows. Images pasted into the reply box ride with
+ * it; `send` takes them as base64 bytes and hands them to the provider.
+ */
+export async function sendPrompt(
+  api: PaseoApi,
+  agentId: string,
+  text: string,
+  images: readonly ReplyImage[] = [],
+): Promise<void> {
+  await api.agents.ref(agentId).send(text, images.length === 0 ? undefined : { images: [...images] });
 }
 
 /** Archives the workspace the preview shows, closing it off the board. */
