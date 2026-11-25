@@ -17,16 +17,19 @@ export interface PillWorkspace {
   readonly parentWorkspaceId?: string | null;
 }
 
-/** What the pills show: the board's two attention columns, plus the ones still working. */
+/** What the pills show: the board's three working columns. */
 export interface BoardPillCounts {
   readonly needYou: number;
   readonly running: number;
+  readonly finished: number;
 }
 
 /** One pill a workspace header carries. `count` is zero for the plain board button. */
 export interface PillSpec {
-  readonly kind: "need" | "run" | "board";
+  readonly kind: "need" | "run" | "done" | "board";
   readonly count: number;
+  /** The number the host draws beside the badge; undefined for the plain board button. */
+  readonly label: string | undefined;
   readonly visible: boolean;
   readonly title: string;
 }
@@ -42,13 +45,15 @@ export function buttonWorkspaces(rows: readonly PillWorkspace[]): string[] {
   return rows.filter((row) => row.background !== true).map((row) => row.id);
 }
 
-/** The two counts over every open workspace on the host. */
+/**
+ * The counts over every open workspace of every host. A workspace the board never draws, a
+ * child or a background one, is left out, so a pill cannot promise a card that is missing.
+ */
 export function pillCounts(rows: readonly PillWorkspace[]): BoardPillCounts {
   let needYou = 0;
   let running = 0;
+  let finished = 0;
   for (const row of rows) {
-    // The board never draws a child workspace, so counting one here would promise a card
-    // the reader cannot find.
     if (isChildWorkspace({ parentWorkspaceId: row.parentWorkspaceId ?? null })) continue;
     const workspace = {
       indicator: row.status ?? "done",
@@ -60,8 +65,9 @@ export function pillCounts(rows: readonly PillWorkspace[]): BoardPillCounts {
     const column = classify(workspace);
     if (column === "needs-you" || column === "review") needYou += 1;
     else if (column === "running") running += 1;
+    else if (column === "idle") finished += 1;
   }
-  return { needYou, running };
+  return { needYou, running, finished };
 }
 
 function countTitle(count: number, one: string, many: string): string {
@@ -69,29 +75,45 @@ function countTitle(count: number, one: string, many: string): string {
 }
 
 /**
- * The pills a header carries. A count pill hides at zero; when both counts are zero the plain
+ * The pills a header carries. A count pill hides at zero; when every count is zero the plain
  * board button takes their place, so the board is always one press away.
  */
 export function pillSpecs(counts: BoardPillCounts): readonly PillSpec[] {
   const needTitle = countTitle(counts.needYou, "workspace needs you", "workspaces need you");
   const runTitle = countTitle(counts.running, "workspace is running", "workspaces are running");
+  const doneTitle = countTitle(
+    counts.finished,
+    "workspace finished",
+    "workspaces finished",
+  );
+  const quiet = counts.needYou === 0 && counts.running === 0 && counts.finished === 0;
   return [
     {
       kind: "need",
       count: counts.needYou,
+      label: counts.needYou === 0 ? undefined : `${counts.needYou}`,
       visible: counts.needYou > 0,
       title: `Workspace board · ${needTitle}`,
     },
     {
       kind: "run",
       count: counts.running,
+      label: counts.running === 0 ? undefined : `${counts.running}`,
       visible: counts.running > 0,
       title: `Workspace board · ${runTitle}`,
     },
     {
+      kind: "done",
+      count: counts.finished,
+      label: counts.finished === 0 ? undefined : `${counts.finished}`,
+      visible: counts.finished > 0,
+      title: `Workspace board · ${doneTitle}`,
+    },
+    {
       kind: "board",
       count: 0,
-      visible: counts.needYou === 0 && counts.running === 0,
+      label: undefined,
+      visible: quiet,
       title: "Workspace board",
     },
   ];
