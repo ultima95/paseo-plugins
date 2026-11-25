@@ -29,8 +29,30 @@ const toolCall: AgentTimelineItem = {
   detail: { type: "shell", command: "npm test" },
 };
 
+function command(callId: string): AgentTimelineItem {
+  return {
+    type: "tool_call",
+    callId,
+    name: "Bash",
+    status: "completed",
+    error: null,
+    detail: { type: "shell", command: "npm test" },
+  };
+}
+
+function read(callId: string): AgentTimelineItem {
+  return {
+    type: "tool_call",
+    callId,
+    name: "Read",
+    status: "completed",
+    error: null,
+    detail: { type: "read", filePath: "/tmp/a.ts" },
+  };
+}
+
 describe("rowsFromEntries", () => {
-  it("keeps only the conversation, oldest first", () => {
+  it("keeps the conversation and folds the work between messages into one line", () => {
     const rows = rowsFromEntries([
       entry(user("fix the login bug"), 1),
       entry({ type: "reasoning", text: "checking middleware" }, 2),
@@ -41,16 +63,43 @@ describe("rowsFromEntries", () => {
       entry({ type: "compaction", status: "completed" }, 7),
       entry({ type: "error", message: "boom" }, 8),
     ]);
-    expect(rows.map((row) => row.kind)).toEqual(["user", "assistant", "error"]);
-    expect(rows.map((row) => row.text)).toEqual(["fix the login bug", "Looking at it.", "boom"]);
+    expect(rows.map((row) => row.kind)).toEqual(["user", "activity", "assistant", "error"]);
+    expect(rows.map((row) => row.text)).toEqual([
+      "fix the login bug",
+      "Ran 1 command",
+      "Looking at it.",
+      "boom",
+    ]);
   });
 
-  it("leaves out reasoning and tool calls entirely", () => {
-    const rows = rowsFromEntries([
-      entry(toolCall, 1),
-      entry({ type: "reasoning", text: "hmm" }, 2),
-    ]);
+  it("leaves reasoning out entirely", () => {
+    const rows = rowsFromEntries([entry({ type: "reasoning", text: "hmm" }, 2)]);
     expect(rows).toEqual([]);
+  });
+
+  it("counts a run of commands and tools into one line", () => {
+    const entries = [
+      entry(user("check the build"), 1),
+      entry(command("c1"), 2),
+      entry(command("c2"), 3),
+      entry(command("c3"), 4),
+      entry(read("r1"), 5),
+      entry(read("r2"), 6),
+      entry(assistant("checks pass"), 7),
+    ];
+    const rows = rowsFromEntries(entries);
+    expect(rows.map((row) => row.kind)).toEqual(["user", "activity", "assistant"]);
+    expect(rows[1]?.text).toBe("Ran 3 commands and used 2 other tools");
+  });
+
+  it("starts a new activity line after each spoken row", () => {
+    const rows = rowsFromEntries([
+      entry(command("c1"), 1),
+      entry(assistant("first"), 2),
+      entry(command("c2"), 3),
+    ]);
+    expect(rows.map((row) => row.kind)).toEqual(["activity", "assistant", "activity"]);
+    expect(rows.map((row) => row.text)).toEqual(["Ran 1 command", "first", "Ran 1 command"]);
   });
 
   it("carries the provider message id so its chunks merge", () => {
@@ -129,13 +178,30 @@ describe("appendLiveItem", () => {
     expect(rows[0].text).toBe("start");
   });
 
-  it("ignores reasoning, tool calls and notes", () => {
+  it("ignores reasoning and notes but counts tool calls", () => {
     expect(appendLiveItem(base, { type: "reasoning", text: "hmm" }, "live:1")).toBe(base);
-    expect(appendLiveItem(base, toolCall, "live:2")).toBe(base);
     expect(
       appendLiveItem(base, { type: "notification", level: "info", message: "note" }, "live:3"),
     ).toBe(base);
+    const rows = appendLiveItem(base, toolCall, "live:2");
+    expect(rows.at(-1)).toMatchObject({ kind: "activity", text: "Ran 1 command" });
     expect(base).toHaveLength(1);
+  });
+
+  it("grows the activity line while a run of tools streams in", () => {
+    let rows = appendLiveItem(base, command("c1"), "live:1");
+    rows = appendLiveItem(rows, command("c2"), "live:2");
+    rows = appendLiveItem(rows, read("r1"), "live:3");
+    expect(rows.map((row) => row.kind)).toEqual(["user", "activity"]);
+    expect(rows.at(-1)?.text).toBe("Ran 2 commands and used 1 other tool");
+  });
+
+  it("starts a new activity line after a reply", () => {
+    let rows = appendLiveItem(base, command("c1"), "live:1");
+    rows = appendLiveItem(rows, assistant("one moment"), "live:2");
+    rows = appendLiveItem(rows, read("r1"), "live:3");
+    expect(rows.map((row) => row.kind)).toEqual(["user", "activity", "assistant", "activity"]);
+    expect(rows.at(-1)?.text).toBe("Used 1 tool");
   });
 
   it("appends an error even when it arrives mid-stream", () => {

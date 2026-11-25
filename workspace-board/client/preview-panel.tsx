@@ -55,6 +55,8 @@ function rowStyle(row: TimelineRow, theme: PluginTheme) {
       return { label: "You", icon: "User", color: theme.colors.accent };
     case "assistant":
       return { label: "Agent", icon: "Bot", color: theme.colors.foreground };
+    case "activity":
+      return { label: "Work", icon: "Wrench", color: theme.colors.foregroundMuted };
     default:
       return { label: "Error", icon: "AlertCircle", color: theme.colors.statusDanger };
   }
@@ -115,9 +117,24 @@ function ChatRow({
         fontSize: 12.5,
         lineHeight: 18,
       },
+      activityRow: { paddingVertical: 5 },
+      activityLine: { flexDirection: "row" as const, alignItems: "center" as const, gap: 6 },
+      activityText: { color: theme.colors.foregroundMuted, fontSize: 11.5 },
     }),
     [theme, tone.color],
   );
+
+  // The work behind a turn reads as one muted line: enough to see it happened, no list to scan.
+  if (row.kind === "activity") {
+    return (
+      <View style={[styles.row, styles.activityRow]}>
+        <View style={styles.activityLine}>
+          <Icon name="Wrench" size={11} color={theme.colors.foregroundMuted} />
+          <Text style={styles.activityText}>{text}</Text>
+        </View>
+      </View>
+    );
+  }
 
   return (
     <View
