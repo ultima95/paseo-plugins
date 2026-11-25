@@ -4,7 +4,7 @@ import {
   buttonWorkspaces,
   pillCounts,
   pillSpecs,
-} from "./header-button";
+} from "./header-pills";
 
 describe("boardButtonId", () => {
   it("prefixes the workspace id with the pill kind", () => {
@@ -78,7 +78,7 @@ describe("pillCounts", () => {
 
 describe("pillSpecs", () => {
   function shown(specs: ReturnType<typeof pillSpecs>) {
-    return specs.filter((spec) => spec.visible).map((spec) => `${spec.kind}:${spec.label ?? ""}`);
+    return specs.filter((spec) => spec.visible).map((spec) => `${spec.kind}:${spec.count}`);
   }
 
   it("shows the two counts as their own pills", () => {
@@ -86,12 +86,12 @@ describe("pillSpecs", () => {
   });
 
   it("hides a pill whose count is zero", () => {
-    expect(shown(pillSpecs({ needYou: 0, running: 3 }))).toEqual(["run:3"]);
     expect(shown(pillSpecs({ needYou: 1, running: 0 }))).toEqual(["need:1"]);
+    expect(shown(pillSpecs({ needYou: 0, running: 3 }))).toEqual(["run:3"]);
   });
 
   it("falls back to the board button when nothing is happening", () => {
-    expect(shown(pillSpecs({ needYou: 0, running: 0 }))).toEqual(["board:"]);
+    expect(shown(pillSpecs({ needYou: 0, running: 0 }))).toEqual(["board:0"]);
   });
 
   it("names the counts in each pill's title", () => {
@@ -100,5 +100,9 @@ describe("pillSpecs", () => {
       "Workspace board · 2 workspaces are running",
       "Workspace board",
     ]);
+  });
+
+  it("carries the count each pill shows", () => {
+    expect(pillSpecs({ needYou: 2, running: 1 }).map((spec) => spec.count)).toEqual([2, 1, 0]);
   });
 });
